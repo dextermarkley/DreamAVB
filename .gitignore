@@ -1,0 +1,17 @@
+# Rust
+target/
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Xcode / DriverKit
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.dext
+*.app
+*.dSYM/
+*.ipa
+*.xcarchive
