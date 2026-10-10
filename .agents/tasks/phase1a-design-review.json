@@ -1,0 +1,62 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "id": 1,
+      "severity": "MEDIUM",
+      "title": "2 ms step-ambiguity window depends on timer latency; justification (2048-descriptor backlog) is wrong",
+      "where": "§7.3 Step bookkeeping, RX generation rule",
+      "fix": "Dext-side classification: AvbRxSlot.clock_gen (u32 at 40, from pad1) + AVB_RXF_TS_STEP_AMBIG (bit 3) on slots harvested from the step through the first tick starting >= 100 us after the SYSTIM write; AvbShmHeader.clock_gen (u32 at 896, from reserved) incremented by SetClock/StepClock; daemon uses slot.clock_gen/AMBIG instead of harvest_mach windows; update static_asserts, Rust mirror and tests (simulated 5 ms tick delay). Alternative: adaptive window from observed worst tick gap plus wait for last_tick_mach > step_end + window."
+    },
+    {
+      "id": 2,
+      "severity": "MEDIUM",
+      "title": "ACMP listener SM: Talker Failed already registered on entry to SETTLED_NO_RSV declares nothing; TA change in SETTLED_RSV_OK conflicts with §8.2",
+      "where": "§9.4 state list and transition table; §8.2; §14.1",
+      "fix": "Talker Failed row event becomes 'registered (or already registered on entry, no TA)' with the same action (Asking Failed + A-5 classification); add row SETTLED_RSV_OK | TA attributes changed | SETTLED_RSV_OK | apply §8.2 comparison/effective values/SetStreamFilter, Ready stays declared; tests per row."
+    },
+    {
+      "id": 3,
+      "severity": "NIT",
+      "title": "ACQUIRE SetClock drops asCapable and bounces servo through HOLDOVER because the pre-SetClock NRR is not held",
+      "where": "§7.3 NRR window",
+      "fix": "Hold the last same-generation NRR across SetClock exactly as across StepClock (NRR is offset-invariant); test asCapable stays true across ACQUIRE."
+    },
+    {
+      "id": 4,
+      "severity": "NIT",
+      "title": "syncEvent correctionField source unspecified",
+      "where": "§7.3 offset formula",
+      "fix": "syncEvent = preciseOriginTimestamp + (FU.correctionField + Sync.correctionField)·2^-16 ns + delay_comp·rateRatio/NRR_systim; vector with non-zero Sync correction."
+    },
+    {
+      "id": 5,
+      "severity": "NIT",
+      "title": "Held step can delay Pdelay_Resp up to 20 ms, past the stated 3 ms worst case / 10 ms bound",
+      "where": "§7.3 TX generation, §7.2 responder turnaround",
+      "fix": "Drop a held Pdelay_Resp if now − t2 > 8 ms (count pdelay_resp_late_drop), or let Pdelay_Resp go out before the held step (its Follow_Up is skipped by the existing rule)."
+    },
+    {
+      "id": 6,
+      "severity": "NIT",
+      "title": "Shared-memory seqlock clock block not specified as atomic fields (Rust data race)",
+      "where": "§10.6 clock block, §5.1 SeqLock",
+      "fix": "Fields as AtomicU64 (f64 bits)/AtomicU32 with seq odd → fence(Release) → relaxed stores → seq even (Release); reader Acquire seq → relaxed loads → fence(Acquire) → re-check."
+    },
+    {
+      "id": 7,
+      "severity": "NIT",
+      "title": "No writer named for AVB_FLAG_OWNED / AVB_FLAG_RINGS_ATTACHED",
+      "where": "§3.1, §3.4 writer table, §3.6",
+      "fix": "RingAttach setFlags(set both); RingDetach/ClientGone setFlags(clear both) before releasing rxMem."
+    },
+    {
+      "id": 8,
+      "severity": "NIT",
+      "title": "last_available_index update rule missing",
+      "where": "§9.4 per-binding state, reboot row",
+      "fix": "Update last_available_index on every ENTITY_AVAILABLE from the talker in every state; initialize from the ADP table at BIND_RX."
+    }
+  ],
+  "reviewDoc": "/Users/dexter/AVB-Audio/.agents/tasks/phase1a-design-review.md"
+}
