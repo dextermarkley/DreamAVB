@@ -61,7 +61,17 @@ echo "== build dext"
 echo "== build Rust (release)"
 cargo build --manifest-path "$ROOT/Cargo.toml" --workspace --release --locked
 
-VERSION="$(/bin/date -u +%Y%m%d%H%M)"
+# kernelmanagerd requires a kext-style version (major <= 4 digits, minor and
+# revision <= 2 digits), so a raw YYYYMMDDHHMM stamp is rejected. Use
+# <days since 2026-01-01>.<UTC hour>.<UTC minute>: valid, and increasing with
+# every rebuild made at least a minute after the previous one.
+EPOCH="$(/bin/date -u -j -f %Y-%m-%d 2026-01-01 +%s)"
+NOW="$(/bin/date -u +%s)"
+VERSION="$(( (NOW - EPOCH) / 86400 )).$(( 10#$(/bin/date -u -r "$NOW" +%H) )).$(( 10#$(/bin/date -u -r "$NOW" +%M) ))"
+if ! printf '%s\n' "$VERSION" | /usr/bin/grep -Eq '^[0-9]{1,4}\.[0-9]{1,2}\.[0-9]{1,2}$'; then
+    echo "computed version '$VERSION' is not a valid kext version" >&2
+    exit 1
+fi
 echo "== assemble $APP (CFBundleVersion $VERSION)"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Library/SystemExtensions"
@@ -74,6 +84,8 @@ cp -R "$DEXT_BUILT" "$DEXT"
 # sysextd only replaces an installed extension when the version increases.
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$DEXT/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$DEXT/Info.plist"
 
 for p in "$APP/Contents/Info.plist" "$DEXT/Info.plist" \
          "$ROOT/packaging/installer.entitlements" "$ROOT/packaging/probe.entitlements" \
