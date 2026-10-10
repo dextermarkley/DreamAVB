@@ -1,0 +1,1763 @@
+{
+  "host": "Mac16,8 macOS 26.5.2 SIP off amfi_get_out_of_my_way=1 devmode on",
+  "nic": "Intel I210 8086:1533 subsys 1ab6:0214 rev 3, MAC 64:4b:f0:12:73:b8, behind Thunderbolt",
+  "peer": "PreSonus StudioLive 16R Milan fw 3.3.0.109659, direct cable, port 00:0a:92:ff:fe:03:3b:a9/1",
+  "dext": "com.avbaudio.installer.i210 282.7.31 arm64e team 8NG8NMGYVF",
+  "g1": {
+    "systemextensionsctl": "8NG8NMGYVF com.avbaudio.installer.i210 (282.7.31/282.7.31) AVBI210Driver [activated enabled]",
+    "ioreg_i210": "ethernet@0 <IOPCIDevice id 0x10000475e> -> AVBI210Driver <IOUserService id 0x100004781>; DriverKit_AppleEthernetE1000 absent; en7 does not exist",
+    "ioreg_bcm": "ethernet@0 <IOPCIDevice id 0x100001b06> -> BCM5701Enet <id 0x100001c0b> (+BCM5701EnetClock); com.avbaudio.installer.bcm57762 no longer listed",
+    "kernel_log": [
+      "AVBI210: start: 15338086 subsys 02141ab6 rev 3",
+      "AVBI210: stage A: STATUS 0x00380780 CTRL 0x081c0241 TSAUXC 0x40000000 TIMINCA 0x00000000",
+      "DK: AVBI210Driver-0x100004781::start(ethernet-0x10000475e) ok"
+    ],
+    "kernelmanagerd": "DextValidation: Validating/Realize dext com.avbaudio.installer.i210; category validating result (nil, nil); no errors"
+  },
+  "g3_derived": {
+    "pdelay_req": 35,
+    "with_ts": 35,
+    "seq_contiguous": true,
+    "hw_interval_ns": {
+      "mean": 1000283234.5882353,
+      "sd": 906.5862080269422,
+      "min": 1000282200,
+      "max": 1000284640
+    },
+    "harvest_interval_ns": {
+      "mean": 1000211088.2352941,
+      "sd": 1036794.4921215663,
+      "min": 998283416.6666666,
+      "max": 1002481875.0
+    },
+    "max_abs_interval_mismatch_ns": 2199491.0,
+    "repeated_hw_ts": 0
+  },
+  "probe_runs": {
+    "adjfreq": [
+      [
+        {
+          "delta_vs_baseline_ppb": 0.0,
+          "expected_ppb": 0.0,
+          "label": "baseline-0",
+          "measured_ppb_vs_mach": 74846.27954856826,
+          "register": "0x00000000",
+          "requested_ppb": 0,
+          "scale_factor": null,
+          "stats": {
+            "bracket_max_ns": 11000.0,
+            "bracket_median_ns": 10291.666666666666,
+            "fit": {
+              "intercept": -2657887330.5234375,
+              "n": 99,
+              "residual_rms": 86.33999160365582,
+              "slope": 1.0000748462795486
+            },
+            "monotonic": true,
+            "ppm_vs_mach": 74.84627954856826,
+            "samples": 99,
+            "wraps32": 0
+          }
+        },
+        {
+          "delta_vs_baseline_ppb": 99988.75800754094,
+          "expected_ppb": 100000.00474974512,
+          "label": "plus",
+          "measured_ppb_vs_mach": 174835.0375561092,
+          "register": "0x00346dc6",
+          "requested_ppb": 100000,
+          "scale_factor": 0.9998875325833,
+          "stats": {
+            "bracket_max_ns": 12500.0,
+            "bracket_median_ns": 10333.333333333334,
+            "fit": {
+              "intercept": -6214380329.625,
+              "n": 99,
+              "residual_rms": 106.65168277228872,
+              "slope": 1.000174835037556
+            },
+            "monotonic": true,
+            "ppm_vs_mach": 174.83503755610917,
+            "samples": 99,
+            "wraps32": 0
+          }
+        },
+        {
+          "delta_vs_baseline_ppb": -100042.33349358848,
+          "expected_ppb": -100000.00474974512,
+          "label": "minus",
+          "measured_ppb_vs_mach": -25196.053945020223,
+          "register": "0x80346dc6",
+          "requested_ppb": -100000,
+          "scale_factor": 1.0004232874183283,
+          "stats": {
+            "bracket_max_ns": 11041.666666666666,
+            "bracket_median_ns": 10291.666666666666,
+            "fit": {
+              "intercept": 902515983.3046876,
+              "n": 99,
+              "residual_rms": 92.9542845623878,
+              "slope": 0.999974803946055
+            },
+            "monotonic": true,
+            "ppm_vs_mach": -25.196053945020225,
+            "samples": 99,
+            "wraps32": 0
+          }
+        },
+        {
+          "delta_vs_baseline_ppb": -59.59492432871775,
+          "expected_ppb": 0.0,
+          "label": "baseline-1",
+          "measured_ppb_vs_mach": 74786.68462423954,
+          "register": "0x00000000",
+          "requested_ppb": 0,
+          "scale_factor": null,
+          "stats": {
+            "bracket_max_ns": 15833.333333333334,
+            "bracket_median_ns": 10333.333333333334,
+            "fit": {
+              "intercept": -2655769049.109375,
+              "n": 99,
+              "residual_rms": 129.0825438129877,
+              "slope": 1.0000747866846242
+            },
+            "monotonic": true,
+            "ppm_vs_mach": 74.78668462423954,
+            "samples": 99,
+            "wraps32": 0
+          }
+        }
+      ]
+    ],
+    "clock": [
+      {
+        "first": {
+          "eav_ns": 35548858976319,
+          "mach_after": 853172548063,
+          "mach_before": 853172547817
+        },
+        "interval_ms": 100,
+        "last": {
+          "eav_ns": 35558788888287,
+          "mach_after": 853410848110,
+          "mach_before": 853410847866
+        },
+        "raw": [
+          {
+            "eav_ns": 35548858976319,
+            "mach_after": 853172548063,
+            "mach_before": 853172547817
+          },
+          {
+            "eav_ns": 35548959125615,
+            "mach_after": 853174951466,
+            "mach_before": 853174951223
+          },
+          {
+            "eav_ns": 35549059271519,
+            "mach_after": 853177354790,
+            "mach_before": 853177354546
+          },
+          {
+            "eav_ns": 35549160622047,
+            "mach_after": 853179787021,
+            "mach_before": 853179786776
+          },
+          {
+            "eav_ns": 35549261627535,
+            "mach_after": 853182210982,
+            "mach_before": 853182210724
+          },
+          {
+            "eav_ns": 35549362171711,
+            "mach_after": 853184623850,
+            "mach_before": 853184623606
+          },
+          {
+            "eav_ns": 35549462331807,
+            "mach_after": 853187027512,
+            "mach_before": 853187027266
+          },
+          {
+            "eav_ns": 35549563439551,
+            "mach_after": 853189453915,
+            "mach_before": 853189453672
+          },
+          {
+            "eav_ns": 35549664277359,
+            "mach_after": 853191873843,
+            "mach_before": 853191873598
+          },
+          {
+            "eav_ns": 35549765532191,
+            "mach_after": 853194303775,
+            "mach_before": 853194303531
+          },
+          {
+            "eav_ns": 35549866704223,
+            "mach_after": 853196731724,
+            "mach_before": 853196731477
+          },
+          {
+            "eav_ns": 35549968925791,
+            "mach_after": 853199184858,
+            "mach_before": 853199184614
+          },
+          {
+            "eav_ns": 35550069540447,
+            "mach_after": 853201599427,
+            "mach_before": 853201599180
+          },
+          {
+            "eav_ns": 35550170514975,
+            "mach_after": 853204022635,
+            "mach_before": 853204022389
+          },
+          {
+            "eav_ns": 35550272197999,
+            "mach_after": 853206462845,
+            "mach_before": 853206462599
+          },
+          {
+            "eav_ns": 35550373832927,
+            "mach_after": 853208901906,
+            "mach_before": 853208901654
+          },
+          {
+            "eav_ns": 35550475631935,
+            "mach_after": 853211344895,
+            "mach_before": 853211344650
+          },
+          {
+            "eav_ns": 35550578495103,
+            "mach_after": 853213813426,
+            "mach_before": 853213813181
+          },
+          {
+            "eav_ns": 35550678692287,
+            "mach_after": 853216217982,
+            "mach_before": 853216217731
+          },
+          {
+            "eav_ns": 35550778934319,
+            "mach_after": 853218623617,
+            "mach_before": 853218623358
+          },
+          {
+            "eav_ns": 35550879932655,
+            "mach_after": 853221047386,
+            "mach_before": 853221047140
+          },
+          {
+            "eav_ns": 35550980883343,
+            "mach_after": 853223470020,
+            "mach_before": 853223469776
+          },
+          {
+            "eav_ns": 35551081786623,
+            "mach_after": 853225891516,
+            "mach_before": 853225891272
+          },
+          {
+            "eav_ns": 35551183341007,
+            "mach_after": 853228328642,
+            "mach_before": 853228328396
+          },
+          {
+            "eav_ns": 35551284721967,
+            "mach_after": 853230761605,
+            "mach_before": 853230761357
+          },
+          {
+            "eav_ns": 35551386335295,
+            "mach_after": 853233200139,
+            "mach_before": 853233199893
+          },
+          {
+            "eav_ns": 35551487369167,
+            "mach_after": 853235624771,
+            "mach_before": 853235624524
+          },
+          {
+            "eav_ns": 35551588120767,
+            "mach_after": 853238042628,
+            "mach_before": 853238042382
+          },
+          {
+            "eav_ns": 35551688773231,
+            "mach_after": 853240458104,
+            "mach_before": 853240457861
+          },
+          {
+            "eav_ns": 35551790573695,
+            "mach_after": 853242901134,
+            "mach_before": 853242900887
+          },
+          {
+            "eav_ns": 35551891804831,
+            "mach_after": 853245330497,
+            "mach_before": 853245330255
+          },
+          {
+            "eav_ns": 35551992964175,
+            "mach_after": 853247758143,
+            "mach_before": 853247757897
+          },
+          {
+            "eav_ns": 35552094624031,
+            "mach_after": 853250197791,
+            "mach_before": 853250197550
+          },
+          {
+            "eav_ns": 35552195626239,
+            "mach_after": 853252621667,
+            "mach_before": 853252621421
+          },
+          {
+            "eav_ns": 35552296773183,
+            "mach_after": 853255049011,
+            "mach_before": 853255048767
+          },
+          {
+            "eav_ns": 35552397859903,
+            "mach_after": 853257474911,
+            "mach_before": 853257474666
+          },
+          {
+            "eav_ns": 35552499345423,
+            "mach_after": 853259910380,
+            "mach_before": 853259910137
+          },
+          {
+            "eav_ns": 35552600381775,
+            "mach_after": 853262335083,
+            "mach_before": 853262334825
+          },
+          {
+            "eav_ns": 35552702023855,
+            "mach_after": 853264774302,
+            "mach_before": 853264774054
+          },
+          {
+            "eav_ns": 35552803821519,
+            "mach_after": 853267217271,
+            "mach_before": 853267217013
+          },
+          {
+            "eav_ns": 35552904837551,
+            "mach_after": 853269641467,
+            "mach_before": 853269641218
+          },
+          {
+            "eav_ns": 35553006390863,
+            "mach_after": 853272078572,
+            "mach_before": 853272078314
+          },
+          {
+            "eav_ns": 35553107875567,
+            "mach_after": 853274514009,
+            "mach_before": 853274513767
+          },
+          {
+            "eav_ns": 35553210212575,
+            "mach_after": 853276969917,
+            "mach_before": 853276969669
+          },
+          {
+            "eav_ns": 35553311788463,
+            "mach_after": 853279407556,
+            "mach_before": 853279407310
+          },
+          {
+            "eav_ns": 35553413143871,
+            "mach_after": 853281839905,
+            "mach_before": 853281839657
+          },
+          {
+            "eav_ns": 35553514073055,
+            "mach_after": 853284262025,
+            "mach_before": 853284261775
+          },
+          {
+            "eav_ns": 35553614562735,
+            "mach_after": 853286673594,
+            "mach_before": 853286673346
+          },
+          {
+            "eav_ns": 35553715226271,
+            "mach_after": 853289089337,
+            "mach_before": 853289089092
+          },
+          {
+            "eav_ns": 35553815483391,
+            "mach_after": 853291495327,
+            "mach_before": 853291495081
+          },
+          {
+            "eav_ns": 35553916231871,
+            "mach_after": 853293913111,
+            "mach_before": 853293912862
+          },
+          {
+            "eav_ns": 35554018687103,
+            "mach_after": 853296371852,
+            "mach_before": 853296371604
+          },
+          {
+            "eav_ns": 35554122152479,
+            "mach_after": 853298854838,
+            "mach_before": 853298854590
+          },
+          {
+            "eav_ns": 35554223412527,
+            "mach_after": 853301284896,
+            "mach_before": 853301284650
+          },
+          {
+            "eav_ns": 35554324387423,
+            "mach_after": 853303708110,
+            "mach_before": 853303707866
+          },
+          {
+            "eav_ns": 35554426591471,
+            "mach_after": 853306160823,
+            "mach_before": 853306160578
+          },
+          {
+            "eav_ns": 35554527484879,
+            "mach_after": 853308582086,
+            "mach_before": 853308581839
+          },
+          {
+            "eav_ns": 35554628838527,
+            "mach_after": 853311014401,
+            "mach_before": 853311014143
+          },
+          {
+            "eav_ns": 35554729182319,
+            "mach_after": 853313422473,
+            "mach_before": 853313422211
+          },
+          {
+            "eav_ns": 35554830053855,
+            "mach_after": 853315843207,
+            "mach_before": 853315842948
+          },
+          {
+            "eav_ns": 35554932644255,
+            "mach_after": 853318305192,
+            "mach_before": 853318304933
+          },
+          {
+            "eav_ns": 35555034499727,
+            "mach_after": 853320749543,
+            "mach_before": 853320749281
+          },
+          {
+            "eav_ns": 35555135514175,
+            "mach_after": 853323173705,
+            "mach_before": 853323173448
+          },
+          {
+            "eav_ns": 35555239265903,
+            "mach_after": 853325663566,
+            "mach_before": 853325663302
+          },
+          {
+            "eav_ns": 35555341061999,
+            "mach_after": 853328106472,
+            "mach_before": 853328106229
+          },
+          {
+            "eav_ns": 35555441564223,
+            "mach_after": 853330518349,
+            "mach_before": 853330518100
+          },
+          {
+            "eav_ns": 35555542906351,
+            "mach_after": 853332950380,
+            "mach_before": 853332950131
+          },
+          {
+            "eav_ns": 35555645833855,
+            "mach_after": 853335420456,
+            "mach_before": 853335420204
+          },
+          {
+            "eav_ns": 35555746810623,
+            "mach_after": 853337843711,
+            "mach_before": 853337843464
+          },
+          {
+            "eav_ns": 35555848066095,
+            "mach_after": 853340273661,
+            "mach_before": 853340273415
+          },
+          {
+            "eav_ns": 35555949095007,
+            "mach_after": 853342698175,
+            "mach_before": 853342697928
+          },
+          {
+            "eav_ns": 35556049892015,
+            "mach_after": 853345117124,
+            "mach_before": 853345116876
+          },
+          {
+            "eav_ns": 35556152610559,
+            "mach_after": 853347582274,
+            "mach_before": 853347581918
+          },
+          {
+            "eav_ns": 35556255124703,
+            "mach_after": 853350042337,
+            "mach_before": 853350042092
+          },
+          {
+            "eav_ns": 35556357240655,
+            "mach_after": 853352492937,
+            "mach_before": 853352492691
+          },
+          {
+            "eav_ns": 35556460416671,
+            "mach_after": 853354968977,
+            "mach_before": 853354968730
+          },
+          {
+            "eav_ns": 35556562526847,
+            "mach_after": 853357419436,
+            "mach_before": 853357419190
+          },
+          {
+            "eav_ns": 35556663567967,
+            "mach_after": 853359844242,
+            "mach_before": 853359843997
+          },
+          {
+            "eav_ns": 35556765017679,
+            "mach_after": 853362278863,
+            "mach_before": 853362278604
+          },
+          {
+            "eav_ns": 35556866144143,
+            "mach_after": 853364705708,
+            "mach_before": 853364705460
+          },
+          {
+            "eav_ns": 35556966648799,
+            "mach_after": 853367117637,
+            "mach_before": 853367117391
+          },
+          {
+            "eav_ns": 35557066949071,
+            "mach_after": 853369524673,
+            "mach_before": 853369524415
+          },
+          {
+            "eav_ns": 35557167403951,
+            "mach_after": 853371935411,
+            "mach_before": 853371935153
+          },
+          {
+            "eav_ns": 35557268427039,
+            "mach_after": 853374359774,
+            "mach_before": 853374359527
+          },
+          {
+            "eav_ns": 35557370102639,
+            "mach_after": 853376799804,
+            "mach_before": 853376799560
+          },
+          {
+            "eav_ns": 35557471162927,
+            "mach_after": 853379225072,
+            "mach_before": 853379224822
+          },
+          {
+            "eav_ns": 35557572582815,
+            "mach_after": 853381658969,
+            "mach_before": 853381658719
+          },
+          {
+            "eav_ns": 35557673781327,
+            "mach_after": 853384087549,
+            "mach_before": 853384087303
+          },
+          {
+            "eav_ns": 35557775012863,
+            "mach_after": 853386516926,
+            "mach_before": 853386516676
+          },
+          {
+            "eav_ns": 35557875349599,
+            "mach_after": 853388924833,
+            "mach_before": 853388924576
+          },
+          {
+            "eav_ns": 35557976462655,
+            "mach_after": 853391351356,
+            "mach_before": 853391351109
+          },
+          {
+            "eav_ns": 35558079075727,
+            "mach_after": 853393813886,
+            "mach_before": 853393813640
+          },
+          {
+            "eav_ns": 35558180648639,
+            "mach_after": 853396251452,
+            "mach_before": 853396251207
+          },
+          {
+            "eav_ns": 35558282635503,
+            "mach_after": 853398698953,
+            "mach_before": 853398698707
+          },
+          {
+            "eav_ns": 35558384017503,
+            "mach_after": 853401131939,
+            "mach_before": 853401131695
+          },
+          {
+            "eav_ns": 35558485770351,
+            "mach_after": 853403573825,
+            "mach_before": 853403573581
+          },
+          {
+            "eav_ns": 35558587952479,
+            "mach_after": 853406026013,
+            "mach_before": 853406025768
+          },
+          {
+            "eav_ns": 35558688319807,
+            "mach_after": 853408434649,
+            "mach_before": 853408434403
+          },
+          {
+            "eav_ns": 35558788888287,
+            "mach_after": 853410848110,
+            "mach_before": 853410847866
+          }
+        ],
+        "seconds": 10.0,
+        "stats": {
+          "bracket_max_ns": 14833.333333333334,
+          "bracket_median_ns": 10250.0,
+          "fit": {
+            "intercept": -2658325521.3359375,
+            "n": 99,
+            "residual_rms": 167.99148457254876,
+            "slope": 1.0000748586003372
+          },
+          "monotonic": true,
+          "ppm_vs_mach": 74.85860033717984,
+          "samples": 99,
+          "wraps32": 0
+        }
+      }
+    ],
+    "datapath": [
+      {
+        "flags": 12,
+        "stage": 2,
+        "state": "up"
+      },
+      {
+        "state": "down"
+      }
+    ],
+    "info": [
+      {
+        "ape": null,
+        "asf": null,
+        "clock_ctl": "0x00000000",
+        "clock_ctl_name": "TIMINCA",
+        "ctrl_a": "0x081c0241",
+        "ctrl_a_name": "CTRL",
+        "ctrl_b": "0x00380783",
+        "ctrl_b_name": "STATUS",
+        "fault": "0 (none)",
+        "flags": 0,
+        "gbe_full_duplex": false,
+        "hw_rev": "0x00000003",
+        "link_up": false,
+        "mac": "64:4b:f0:12:73:b8",
+        "nic": "Intel I210",
+        "nic_kind": 2,
+        "service": "AVBI210Driver",
+        "sram_signature_ok": null,
+        "stage": "timesync",
+        "status_full_duplex": true,
+        "status_link_up": true,
+        "status_speed_mbps": 1000,
+        "subsys": "0x02141ab6",
+        "time_sync_enable": null,
+        "timebase": {
+          "denom": 3,
+          "numer": 125
+        },
+        "vendor_device": "0x15338086"
+      }
+    ],
+    "pdelay": [
+      {
+        "complete": 40,
+        "exchanges": [
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35659731732118,
+            "eav_next_sample": 35659731783091,
+            "link_delay_comp_ns": 141.0,
+            "link_delay_ns": 454.0,
+            "neighbor_rate_ratio": null,
+            "seq": 16384,
+            "t1": 35659731756083,
+            "t1_bracketed": true,
+            "t2": 61610237200360,
+            "t3": 61610237225740,
+            "t4": 35659731782371,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35660738538078,
+            "eav_next_sample": 35660738710707,
+            "link_delay_comp_ns": 139.0,
+            "link_delay_ns": 452.0,
+            "neighbor_rate_ratio": 0.9999168179744944,
+            "seq": 16385,
+            "t1": 35660738561715,
+            "t1_bracketed": true,
+            "t2": 61611243922240,
+            "t3": 61611243946040,
+            "t4": 35660738586419,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35661747054350,
+            "eav_next_sample": 35661747251235,
+            "link_delay_comp_ns": 144.0,
+            "link_delay_ns": 457.0,
+            "neighbor_rate_ratio": 0.9999168186320552,
+            "seq": 16386,
+            "t1": 35661747080435,
+            "t1_bracketed": true,
+            "t2": 61612252357080,
+            "t3": 61612252381270,
+            "t4": 35661747105539,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35662750635239,
+            "eav_next_sample": 35662750726899,
+            "link_delay_comp_ns": 142.0,
+            "link_delay_ns": 455.0,
+            "neighbor_rate_ratio": 0.9999168216500652,
+            "seq": 16387,
+            "t1": 35662750658675,
+            "t1_bracketed": true,
+            "t2": 61613255851840,
+            "t3": 61613255876250,
+            "t4": 35662750683995,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35663754633694,
+            "eav_next_sample": 35663754804451,
+            "link_delay_comp_ns": 140.0,
+            "link_delay_ns": 453.0,
+            "neighbor_rate_ratio": 0.9999168206899574,
+            "seq": 16388,
+            "t1": 35663754659251,
+            "t1_bracketed": true,
+            "t2": 61614259768900,
+            "t3": 61614259792410,
+            "t4": 35663754683667,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35664759824032,
+            "eav_next_sample": 35664759907555,
+            "link_delay_comp_ns": 140.0,
+            "link_delay_ns": 453.0,
+            "neighbor_rate_ratio": 0.99991680970042,
+            "seq": 16389,
+            "t1": 35664759847683,
+            "t1_bracketed": true,
+            "t2": 61615264873710,
+            "t3": 61615264898100,
+            "t4": 35664759872979,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35665766124175,
+            "eav_next_sample": 35665766310355,
+            "link_delay_comp_ns": 143.0,
+            "link_delay_ns": 456.0,
+            "neighbor_rate_ratio": 0.9999168280213916,
+            "seq": 16390,
+            "t1": 35665766148723,
+            "t1_bracketed": true,
+            "t2": 61616271091060,
+            "t3": 61616271114860,
+            "t4": 35665766173435,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35666770453612,
+            "eav_next_sample": 35666770537923,
+            "link_delay_comp_ns": 139.0,
+            "link_delay_ns": 452.0,
+            "neighbor_rate_ratio": 0.9999168141196618,
+            "seq": 16391,
+            "t1": 35666770476867,
+            "t1_bracketed": true,
+            "t2": 61617275335650,
+            "t3": 61617275360410,
+            "t4": 35666770502531,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35667775862426,
+            "eav_next_sample": 35667775978883,
+            "link_delay_comp_ns": 142.0,
+            "link_delay_ns": 455.0,
+            "neighbor_rate_ratio": 0.9999168140175316,
+            "seq": 16392,
+            "t1": 35667775886787,
+            "t1_bracketed": true,
+            "t2": 61618280661940,
+            "t3": 61618280686550,
+            "t4": 35667775912307,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35668782864202,
+            "eav_next_sample": 35668783038275,
+            "link_delay_comp_ns": 145.0,
+            "link_delay_ns": 458.0,
+            "neighbor_rate_ratio": 0.9999168125583264,
+            "seq": 16393,
+            "t1": 35668782889891,
+            "t1_bracketed": true,
+            "t2": 61619287581280,
+            "t3": 61619287605740,
+            "t4": 35668782915267,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35669786509396,
+            "eav_next_sample": 35669786616611,
+            "link_delay_comp_ns": 141.0,
+            "link_delay_ns": 454.0,
+            "neighbor_rate_ratio": 0.9999168110301312,
+            "seq": 16394,
+            "t1": 35669786532851,
+            "t1_bracketed": true,
+            "t2": 61620291140740,
+            "t3": 61620291164920,
+            "t4": 35669786557939,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35670790000184,
+            "eav_next_sample": 35670790163907,
+            "link_delay_comp_ns": 142.0,
+            "link_delay_ns": 455.0,
+            "neighbor_rate_ratio": 0.9999168184990812,
+            "seq": 16395,
+            "t1": 35670790024531,
+            "t1_bracketed": true,
+            "t2": 61621294548950,
+            "t3": 61621294573800,
+            "t4": 35670790050291,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35671793951919,
+            "eav_next_sample": 35671794032099,
+            "link_delay_comp_ns": 144.0,
+            "link_delay_ns": 457.0,
+            "neighbor_rate_ratio": 0.9999168166799236,
+            "seq": 16396,
+            "t1": 35671793975699,
+            "t1_bracketed": true,
+            "t2": 61622298416610,
+            "t3": 61622298441560,
+            "t4": 35671794001563,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35672800706282,
+            "eav_next_sample": 35672800874995,
+            "link_delay_comp_ns": 140.0,
+            "link_delay_ns": 453.0,
+            "neighbor_rate_ratio": 0.9999168240571088,
+            "seq": 16397,
+            "t1": 35672800732595,
+            "t1_bracketed": true,
+            "t2": 61623305089760,
+            "t3": 61623305115270,
+            "t4": 35672800759011,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35673804669346,
+            "eav_next_sample": 35673804731731,
+            "link_delay_comp_ns": 143.0,
+            "link_delay_ns": 456.0,
+            "neighbor_rate_ratio": 0.9999168233708012,
+            "seq": 16398,
+            "t1": 35673804694435,
+            "t1_bracketed": true,
+            "t2": 61624308968100,
+            "t3": 61624308991660,
+            "t4": 35673804718907,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35674810127107,
+            "eav_next_sample": 35674810320787,
+            "link_delay_comp_ns": 141.0,
+            "link_delay_ns": 454.0,
+            "neighbor_rate_ratio": 0.999916820153974,
+            "seq": 16399,
+            "t1": 35674810152323,
+            "t1_bracketed": true,
+            "t2": 61625314342350,
+            "t3": 61625314367930,
+            "t4": 35674810178811,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35675816682823,
+            "eav_next_sample": 35675816771187,
+            "link_delay_comp_ns": 141.0,
+            "link_delay_ns": 454.0,
+            "neighbor_rate_ratio": 0.9999168250586984,
+            "seq": 16400,
+            "t1": 35675816706163,
+            "t1_bracketed": true,
+            "t2": 61626320812470,
+            "t3": 61626320837370,
+            "t4": 35675816731971,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35676821633263,
+            "eav_next_sample": 35676821817139,
+            "link_delay_comp_ns": 146.0,
+            "link_delay_ns": 459.0,
+            "neighbor_rate_ratio": 0.9999168118479034,
+            "seq": 16401,
+            "t1": 35676821658243,
+            "t1_bracketed": true,
+            "t2": 61627325680960,
+            "t3": 61627325704570,
+            "t4": 35676821682771,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35677826449251,
+            "eav_next_sample": 35677826509523,
+            "link_delay_comp_ns": 147.0,
+            "link_delay_ns": 460.0,
+            "neighbor_rate_ratio": 0.9999168246172254,
+            "seq": 16402,
+            "t1": 35677826473427,
+            "t1_bracketed": true,
+            "t2": 61628330412570,
+            "t3": 61628330437530,
+            "t4": 35677826499307,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35678829820835,
+            "eav_next_sample": 35678829995363,
+            "link_delay_comp_ns": 144.0,
+            "link_delay_ns": 457.0,
+            "neighbor_rate_ratio": 0.9999168226841813,
+            "seq": 16403,
+            "t1": 35678829848771,
+            "t1_bracketed": true,
+            "t2": 61629333704450,
+            "t3": 61629333728600,
+            "t4": 35678829873835,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35679833716890,
+            "eav_next_sample": 35679833807267,
+            "link_delay_comp_ns": 145.0,
+            "link_delay_ns": 458.0,
+            "neighbor_rate_ratio": 0.9999168256950982,
+            "seq": 16404,
+            "t1": 35679833740387,
+            "t1_bracketed": true,
+            "t2": 61630337512570,
+            "t3": 61630337536870,
+            "t4": 35679833765603,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35680837719401,
+            "eav_next_sample": 35680837915251,
+            "link_delay_comp_ns": 137.0,
+            "link_delay_ns": 450.0,
+            "neighbor_rate_ratio": 0.9999168350496784,
+            "seq": 16405,
+            "t1": 35680837745251,
+            "t1_bracketed": true,
+            "t2": 61631341433920,
+            "t3": 61631341458060,
+            "t4": 35680837770291,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35681841678294,
+            "eav_next_sample": 35681841742531,
+            "link_delay_comp_ns": 146.0,
+            "link_delay_ns": 459.0,
+            "neighbor_rate_ratio": 0.999916813410244,
+            "seq": 16406,
+            "t1": 35681841703699,
+            "t1_bracketed": true,
+            "t2": 61632345308870,
+            "t3": 61632345334440,
+            "t4": 35681841730187,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35682849482313,
+            "eav_next_sample": 35682849570035,
+            "link_delay_comp_ns": 147.0,
+            "link_delay_ns": 460.0,
+            "neighbor_rate_ratio": 0.9999168229684932,
+            "seq": 16407,
+            "t1": 35682849507603,
+            "t1_bracketed": true,
+            "t2": 61633353028950,
+            "t3": 61633353052870,
+            "t4": 35682849532443,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35683854307427,
+            "eav_next_sample": 35683854473027,
+            "link_delay_comp_ns": 147.0,
+            "link_delay_ns": 460.0,
+            "neighbor_rate_ratio": 0.9999168173979788,
+            "seq": 16408,
+            "t1": 35683854331827,
+            "t1_bracketed": true,
+            "t2": 61634357769590,
+            "t3": 61634357794790,
+            "t4": 35683854357947,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35684860641752,
+            "eav_next_sample": 35684860735891,
+            "link_delay_comp_ns": 139.0,
+            "link_delay_ns": 452.0,
+            "neighbor_rate_ratio": 0.9999168247250616,
+            "seq": 16409,
+            "t1": 35684860665235,
+            "t1_bracketed": true,
+            "t2": 61635364019280,
+            "t3": 61635364043800,
+            "t4": 35684860690659,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35685866074004,
+            "eav_next_sample": 35685868632339,
+            "link_delay_comp_ns": 142.0,
+            "link_delay_ns": 455.0,
+            "neighbor_rate_ratio": 0.9999168237508368,
+            "seq": 16410,
+            "t1": 35685866097347,
+            "t1_bracketed": true,
+            "t2": 61636369367770,
+            "t3": 61636369391420,
+            "t4": 35685866121907,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35686875998040,
+            "eav_next_sample": 35686876081107,
+            "link_delay_comp_ns": 140.0,
+            "link_delay_ns": 453.0,
+            "neighbor_rate_ratio": 0.9999168176915502,
+            "seq": 16411,
+            "t1": 35686876022259,
+            "t1_bracketed": true,
+            "t2": 61637379208670,
+            "t3": 61637379233700,
+            "t4": 35686876048195,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35687879707353,
+            "eav_next_sample": 35687879919139,
+            "link_delay_comp_ns": 144.0,
+            "link_delay_ns": 457.0,
+            "neighbor_rate_ratio": 0.9999168205133812,
+            "seq": 16412,
+            "t1": 35687879731859,
+            "t1_bracketed": true,
+            "t2": 61638382834790,
+            "t3": 61638382859220,
+            "t4": 35687879757203,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35688884435416,
+            "eav_next_sample": 35688884529587,
+            "link_delay_comp_ns": 141.0,
+            "link_delay_ns": 454.0,
+            "neighbor_rate_ratio": 0.9999168291439788,
+            "seq": 16413,
+            "t1": 35688884458819,
+            "t1_bracketed": true,
+            "t2": 61639387478180,
+            "t3": 61639387502600,
+            "t4": 35688884484147,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35689890057858,
+            "eav_next_sample": 35689890126947,
+            "link_delay_comp_ns": 142.0,
+            "link_delay_ns": 455.0,
+            "neighbor_rate_ratio": 0.999916817717339,
+            "seq": 16414,
+            "t1": 35689890082947,
+            "t1_bracketed": true,
+            "t2": 61640393018660,
+            "t3": 61640393041750,
+            "t4": 35689890106947,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35690893464867,
+            "eav_next_sample": 35690893575907,
+            "link_delay_comp_ns": 142.0,
+            "link_delay_ns": 455.0,
+            "neighbor_rate_ratio": 0.9999168255987578,
+            "seq": 16415,
+            "t1": 35690893490115,
+            "t1_bracketed": true,
+            "t2": 61641396342370,
+            "t3": 61641396367980,
+            "t4": 35690893516635,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35691897056047,
+            "eav_next_sample": 35691897222819,
+            "link_delay_comp_ns": 144.0,
+            "link_delay_ns": 457.0,
+            "neighbor_rate_ratio": 0.9999168145313516,
+            "seq": 16416,
+            "t1": 35691897080355,
+            "t1_bracketed": true,
+            "t2": 61642399849130,
+            "t3": 61642399873240,
+            "t4": 35691897105379,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35692901723426,
+            "eav_next_sample": 35692901814835,
+            "link_delay_comp_ns": 143.0,
+            "link_delay_ns": 456.0,
+            "neighbor_rate_ratio": 0.9999168162842828,
+            "seq": 16417,
+            "t1": 35692901746979,
+            "t1_bracketed": true,
+            "t2": 61643404432180,
+            "t3": 61643404457460,
+            "t4": 35692901773171,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35693906232155,
+            "eav_next_sample": 35693906347939,
+            "link_delay_comp_ns": 141.0,
+            "link_delay_ns": 454.0,
+            "neighbor_rate_ratio": 0.9999168288437514,
+            "seq": 16418,
+            "t1": 35693906255619,
+            "t1_bracketed": true,
+            "t2": 61644408857270,
+            "t3": 61644408880810,
+            "t4": 35693906280067,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35694912160331,
+            "eav_next_sample": 35694912226899,
+            "link_delay_comp_ns": 143.0,
+            "link_delay_ns": 456.0,
+            "neighbor_rate_ratio": 0.999916823049672,
+            "seq": 16419,
+            "t1": 35694912183715,
+            "t1_bracketed": true,
+            "t2": 61645414701700,
+            "t3": 61645414724860,
+            "t4": 35694912207787,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35695916156440,
+            "eav_next_sample": 35695916253939,
+            "link_delay_comp_ns": 142.0,
+            "link_delay_ns": 455.0,
+            "neighbor_rate_ratio": 0.999916814562734,
+            "seq": 16420,
+            "t1": 35695916179955,
+            "t1_bracketed": true,
+            "t2": 61646418614420,
+            "t3": 61646418639190,
+            "t4": 35695916205635,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35696920299551,
+            "eav_next_sample": 35696920361059,
+            "link_delay_comp_ns": 143.0,
+            "link_delay_ns": 456.0,
+            "neighbor_rate_ratio": 0.9999168247182916,
+            "seq": 16421,
+            "t1": 35696920323923,
+            "t1_bracketed": true,
+            "t2": 61647422674870,
+            "t3": 61647422700150,
+            "t4": 35696920350115,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35697924178963,
+            "eav_next_sample": 35697924263715,
+            "link_delay_comp_ns": 143.0,
+            "link_delay_ns": 456.0,
+            "neighbor_rate_ratio": 0.9999168185298288,
+            "seq": 16422,
+            "t1": 35697924202387,
+            "t1_bracketed": true,
+            "t2": 61648426469830,
+            "t3": 61648426494070,
+            "t4": 35697924227539,
+            "tx_status": "ok"
+          },
+          {
+            "corr_fu_ns": 0.0,
+            "corr_resp_ns": 0.0,
+            "eav_at_doorbell": 35698928247964,
+            "eav_next_sample": 35698928318483,
+            "link_delay_comp_ns": 148.0,
+            "link_delay_ns": 461.0,
+            "neighbor_rate_ratio": 0.9999168224673468,
+            "seq": 16423,
+            "t1": 35698928271043,
+            "t1_bracketed": true,
+            "t2": 61649430454980,
+            "t3": 61649430479770,
+            "t4": 35698928296755,
+            "tx_status": "ok"
+          }
+        ],
+        "link_delay_compensated": {
+          "max": 148.0,
+          "mean": 142.575,
+          "median": 142.0,
+          "min": 137.0,
+          "n": 40,
+          "stddev": 2.5205565116071353
+        },
+        "link_delay_raw": {
+          "max": 461.0,
+          "mean": 455.575,
+          "median": 455.0,
+          "min": 450.0,
+          "n": 40,
+          "stddev": 2.5205565116071353
+        },
+        "median_link_delay_ns": 455.0,
+        "nic": "Intel I210",
+        "nrr_mean": 0.9999168203080152,
+        "nrr_stddev": 5.654960150604974e-09,
+        "rx_latency_ns": 448,
+        "tx_latency_ns": 178,
+        "tx_ok": 40
+      }
+    ],
+    "regs": [
+      {
+        "CTRL": "0x081c0241",
+        "CTRL_EXT": "0x001400c0",
+        "EEMNGCTL": "0x80048000",
+        "ETQF3": "0x440088f7",
+        "PHPM": "0x0000008d",
+        "RCTL": "0x0440801a",
+        "RDH0": "0x00000065",
+        "RDT0": "0x00000064",
+        "RXDCTL0": "0x02010a0c",
+        "RXPBS": "0x800000a2",
+        "SRRCTL0": "0xc2000402",
+        "STATUS": "0x00380783",
+        "SYSTIMH": "0x00008b72",
+        "SYSTIML": "0x37550413",
+        "TCTL": "0x000400fa",
+        "TDH0": "0x00000028",
+        "TDT0": "0x00000028",
+        "TIMINCA": "0x00000000",
+        "TSAUXC": "0x40000000",
+        "TSYNCRXCTL": "0x00000019",
+        "TSYNCTXCTL": "0x00000010",
+        "TXDCTL0": "0x02010000"
+      }
+    ],
+    "rx_ptp": [
+      {
+        "dropped": 0,
+        "frames": [
+          {
+            "harvest_mach": 854564727851,
+            "has_ts": true,
+            "hw_ts": 35606863598691,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20605,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854588731742,
+            "has_ts": true,
+            "hw_ts": 35607863882851,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20606,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854612791307,
+            "has_ts": true,
+            "hw_ts": 35608864165235,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20607,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854636784862,
+            "has_ts": true,
+            "hw_ts": 35609864449603,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20608,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854660758235,
+            "has_ts": true,
+            "hw_ts": 35610864731963,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20609,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854684782876,
+            "has_ts": true,
+            "hw_ts": 35611865014347,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20610,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854708782837,
+            "has_ts": true,
+            "hw_ts": 35612865298507,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20611,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854732771108,
+            "has_ts": true,
+            "hw_ts": 35613865580883,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20612,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854756772949,
+            "has_ts": true,
+            "hw_ts": 35614865865395,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20613,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854780780231,
+            "has_ts": true,
+            "hw_ts": 35615866147771,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20614,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854804822246,
+            "has_ts": true,
+            "hw_ts": 35616866431763,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20615,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854828829737,
+            "has_ts": true,
+            "hw_ts": 35617866714139,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20616,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854852788539,
+            "has_ts": true,
+            "hw_ts": 35618866996851,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20617,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854876790771,
+            "has_ts": true,
+            "hw_ts": 35619867281043,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20618,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854900842724,
+            "has_ts": true,
+            "hw_ts": 35620867563419,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20619,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854924833925,
+            "has_ts": true,
+            "hw_ts": 35621867847595,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20620,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854948826180,
+            "has_ts": true,
+            "hw_ts": 35622868130291,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20621,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854972840192,
+            "has_ts": true,
+            "hw_ts": 35623868412699,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20622,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 854996855741,
+            "has_ts": true,
+            "hw_ts": 35624868696875,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20623,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855020831393,
+            "has_ts": true,
+            "hw_ts": 35625868979259,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20624,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855044826502,
+            "has_ts": true,
+            "hw_ts": 35626869263435,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20625,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855068861373,
+            "has_ts": true,
+            "hw_ts": 35627869545819,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20626,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855092889945,
+            "has_ts": true,
+            "hw_ts": 35628869829971,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20627,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855116877133,
+            "has_ts": true,
+            "hw_ts": 35629870112707,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20628,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855140869825,
+            "has_ts": true,
+            "hw_ts": 35630870395083,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20629,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855164899314,
+            "has_ts": true,
+            "hw_ts": 35631870679259,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20630,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855188864610,
+            "has_ts": true,
+            "hw_ts": 35632870961459,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20631,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855212886827,
+            "has_ts": true,
+            "hw_ts": 35633871246099,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20632,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855236871466,
+            "has_ts": true,
+            "hw_ts": 35634871528491,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20633,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855260871948,
+            "has_ts": true,
+            "hw_ts": 35635871812667,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20634,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855284889940,
+            "has_ts": true,
+            "hw_ts": 35636872095387,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20635,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855308886325,
+            "has_ts": true,
+            "hw_ts": 35637872377771,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20636,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855332937463,
+            "has_ts": true,
+            "hw_ts": 35638872661939,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20637,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855356912792,
+            "has_ts": true,
+            "hw_ts": 35639872944515,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20638,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          },
+          {
+            "harvest_mach": 855380900099,
+            "has_ts": true,
+            "hw_ts": 35640873228667,
+            "len": 68,
+            "msg_type": "PdelayReq",
+            "seq": 20639,
+            "source": "00:0a:92:ff:fe:03:3b:a9/1"
+          }
+        ],
+        "interval_mismatch_ns": [
+          122035.0,
+          2199491.0,
+          552909.6666666269,
+          1391818.333333373,
+          744324.3333333731,
+          285785.0,
+          771084.3333333731,
+          207803.66666662693,
+          21040.66666662693,
+          1466633.0,
+          29749.0,
+          1999295.333333373,
+          191192.0,
+          1882332.333333373,
+          650801.0,
+          605404.3333333731,
+          301425.33333337307,
+          363699.0,
+          1296884.0,
+          487967.666666627,
+          1170574.333333373,
+          906348.0,
+          816569.3333333731,
+          586876.0,
+          944532.3333333732,
+          1728200.0,
+          641068.3333333731,
+          922433.6666666268,
+          264092.66666662693,
+          466946.666666627,
+          433009.0,
+          1846582.0,
+          1310534.333333373,
+          813027.0
+        ],
+        "max_interval_mismatch_ns": 2199491.0,
+        "pdelay_req_count": 35,
+        "pdelay_req_with_ts": 35,
+        "repeated_hw_ts": 0,
+        "seconds": 30.0
+      }
+    ]
+  }
+}
