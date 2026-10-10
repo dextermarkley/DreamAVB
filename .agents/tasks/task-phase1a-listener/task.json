@@ -1,0 +1,7 @@
+{
+  "task_id": "task-phase1a-listener",
+  "task_description": "Implement the approved Phase 1a design (/Users/dexter/AVB-Audio/.agents/tasks/phase1a-design.md rev 5): ABI v3 I210 dext with shared RX rings, and the Rust listener stack (avb-core, avb-dext, avb-gptp, avb-srp, avb-avtp, avb-avdecc, avb-mediaclock, avb-audioring, avb-daemon) that makes the Mac a Milan listener (and its own AVDECC controller) for every 16R AAF STREAM_OUTPUT, software-verified on the host. Real-hardware milestones run in later workflow steps.",
+  "status": "pending",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005"],
+  "blocked_reason": null
+}

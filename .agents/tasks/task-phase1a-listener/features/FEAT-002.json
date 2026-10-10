@@ -1,0 +1,29 @@
+{
+  "id": "FEAT-002",
+  "type": "feat",
+  "description": "Rust foundation crates: avb-core (std-only primitives, design §6.1/§5.1) and avb-dext (ABI v3 mirror + IOKit Device moved from avb-probe + shared-memory ring consumer), and migrate avb-probe to re-export them with ABI v3. Depends on FEAT-001 (the Rust literals must equal the C++ static_asserts).",
+  "status": "pending",
+  "steps": [
+    "Create crates/avb-core (lib avb_core, no third-party deps, #![deny(clippy::indexing_slicing)]): MacAddr, Eui64 (from MAC with FF:FE inserted), StreamId, EthFrame/VLAN parse+build (at most one tag; Result<_, DropReason>), MachTicks(u64) newtype, Timebase{numer,denom} conversions (no mach calls), GptpNs, ext32 (32->64 extension within +-2^31 of a reference), SeqLock<T: SeqWords<N>, N> over seq: AtomicU32 + [AtomicU64; N] with the §5.1 writer/reader protocol and 1000-retry Err(Contended), Outbox<const N> (push -> Result<(), TxFull>, drop-new), is_avdecc_dest(mac, our_mac), Now{mach, gptp: Option}, RxMeta, DropReason, counter helpers. Tests: ext32 wrap, EUI-64, VLAN parse, SeqLock concurrent no-tear + Contended against a writer held odd, is_avdecc_dest with the exact boundary MACs from the dext test, Timebase 125/3 and 1/1.",
+    "Create crates/avb-dext (lib avb_dext; deps anyhow =1.0.104, io-kit-sys =0.5.0, core-foundation-sys =0.8.7, mach2 =0.7.0): git mv crates/avb-probe/src/{abi.rs,iokit.rs,nic.rs,freq.rs} into crates/avb-dext/src/ (nic.rs depends on freq.rs and iokit.rs depends on nic.rs, so they move together). abi.rs: ABI_VERSION 3, sel 10-14 + COUNT 15 + BASE_COUNT 10, mem types, new flags, all SHM/RX constants, RxClass, RXF_* (TS_STEP_AMBIG = 8), STEP_SETTLE_NS 1_000_000, #[repr(C)] RxSlot, Counters, ShmHeader, ShmConsumer, StreamFilter(Entry), counter index consts + names, fn class_counter_index(cls) -> usize { cls as usize } with const asserts Gptp->1, Stream->6; offset_of!/size_of tests for every §3.1 literal (slot clock_gen 40, pad1 44, header clock_gen 896, reserved 900, ctl_head 128, audio_head 256, counters 384, RX mem 17_842_176).",
+    "avb-dext iokit.rs: add Device::open_i210(), step_clock(delta)->(before,after,mach_mid), get_counters(), set_stream_filter(&StreamFilter), ring_attach(flags)->(generation, rx_size, consumer_size), ring_detach(), map_memory(type)/unmap via IOConnectMapMemory64/IOConnectUnmapMemory64 with kIOMapAnywhere, and a classify helper for device-removed IOReturns (kIOReturnNoDevice/NotResponding/NotAttached/MACH_SEND_INVALID_DEST) used by the daemon for exit 7. Keep the ABI check on open (now v3).",
+    "avb-dext shm.rs: RxRings over a raw mapping (and over a heap buffer for tests): validate_header(hdr, generation) -> Result<(), LayoutMismatch> (every field vs compiled constants), acquire loads of heads/live fields via &*(p as *const AtomicU64/AtomicU32), RxSlotRef (bounds-checked view: len<=1984, cls in range, not both VLAN flags, clock_gen not ahead of hdr.clock_gen -> slot_gen_invalid), ConsumerTails with release stores, consumer loop helper that checks slot.index == tail and on mismatch reports desync and jumps tail to head. Tests over a heap buffer: header accept/reject per field, wrap at the ring size, desync jump, slot validation rejects.",
+    "crates/avb-probe: Cargo.toml adds avb-dext path dep; src/lib.rs replaces `pub mod abi; pub mod iokit; pub mod nic; pub mod freq;` with `pub use avb_dext::{abi, freq, iokit, nic};` so main.rs/ptp.rs/stats.rs paths are unchanged. Probe commands keep working via legacy PollRx; no command is retired (DP-12). Add a `counters` subcommand (GetCounters, read-only) used by M0, printing names from avb_dext counter names.",
+    "Add both crates to Cargo.toml [workspace].members; update Cargo.lock offline (cargo build --offline once), then everything uses --locked.",
+    "Append FEAT-002 to /Users/dexter/AVB-Audio/.agents/tasks/phase1a-impl-verification.md; commit 'feat(rust): avb-core, avb-dext ABI v3 mirror, probe migration (phase1a FEAT-002)'."
+  ],
+  "acceptance_criteria": [
+    "cargo test -p avb-core -p avb-dext -p avb-probe --locked passes, including every ABI offset/size literal from design §3.1",
+    "avb-probe builds with its existing commands unchanged plus `counters`; its existing 27 tests still pass (they move with their modules if abi/freq/nic tests lived there)",
+    "avb-core has no third-party dependency (cargo tree -p avb-core shows only itself)",
+    "Cargo.lock changes only add internal crates/edges; no new external versions"
+  ],
+  "verification": [
+    "TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ cargo test --manifest-path /Users/dexter/AVB-Audio/Cargo.toml -p avb-core -p avb-dext -p avb-probe --locked",
+    "TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ cargo clippy --manifest-path /Users/dexter/AVB-Audio/Cargo.toml --workspace --all-targets --locked -- -D warnings",
+    "TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ cargo fmt --manifest-path /Users/dexter/AVB-Audio/Cargo.toml --all --check",
+    "TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ cargo tree --manifest-path /Users/dexter/AVB-Audio/Cargo.toml -p avb-core --offline"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}
