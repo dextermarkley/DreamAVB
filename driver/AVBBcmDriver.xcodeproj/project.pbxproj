@@ -1,0 +1,285 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		7A0000000000000000000030 /* AVBBcmDriver.iig in Sources */ = {isa = PBXBuildFile; fileRef = 7A0000000000000000000020 /* AVBBcmDriver.iig */; };
+		7A0000000000000000000031 /* AVBBcmDriver.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 7A0000000000000000000021 /* AVBBcmDriver.cpp */; };
+		7A0000000000000000000032 /* AVBBcmUserClient.iig in Sources */ = {isa = PBXBuildFile; fileRef = 7A0000000000000000000022 /* AVBBcmUserClient.iig */; };
+		7A0000000000000000000033 /* AVBBcmUserClient.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 7A0000000000000000000023 /* AVBBcmUserClient.cpp */; };
+		7A0000000000000000000034 /* DriverKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7A0000000000000000000029 /* DriverKit.framework */; };
+		7A0000000000000000000035 /* PCIDriverKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7A000000000000000000002A /* PCIDriverKit.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		7A0000000000000000000006 /* com.avbaudio.installer.bcm57762.dext */ = {isa = PBXFileReference; explicitFileType = "wrapper.driver-extension"; includeInIndex = 0; path = com.avbaudio.installer.bcm57762.dext; sourceTree = BUILT_PRODUCTS_DIR; };
+		7A0000000000000000000020 /* AVBBcmDriver.iig */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.iig; path = AVBBcmDriver.iig; sourceTree = "<group>"; };
+		7A0000000000000000000021 /* AVBBcmDriver.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = AVBBcmDriver.cpp; sourceTree = "<group>"; };
+		7A0000000000000000000022 /* AVBBcmUserClient.iig */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.iig; path = AVBBcmUserClient.iig; sourceTree = "<group>"; };
+		7A0000000000000000000023 /* AVBBcmUserClient.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = AVBBcmUserClient.cpp; sourceTree = "<group>"; };
+		7A0000000000000000000024 /* Bcm57762Regs.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = Bcm57762Regs.h; sourceTree = "<group>"; };
+		7A0000000000000000000025 /* Tg3Logic.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = Tg3Logic.hpp; sourceTree = "<group>"; };
+		7A0000000000000000000026 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		7A0000000000000000000027 /* AVBBcmDriver.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = AVBBcmDriver.entitlements; sourceTree = "<group>"; };
+		7A0000000000000000000028 /* AVBBcmShared.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AVBBcmShared.h; sourceTree = "<group>"; };
+		7A0000000000000000000029 /* DriverKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = DriverKit.framework; path = System/DriverKit/System/Library/Frameworks/DriverKit.framework; sourceTree = SDKROOT; };
+		7A000000000000000000002A /* PCIDriverKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = PCIDriverKit.framework; path = System/DriverKit/System/Library/Frameworks/PCIDriverKit.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		7A000000000000000000000F /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7A0000000000000000000034 /* DriverKit.framework in Frameworks */,
+				7A0000000000000000000035 /* PCIDriverKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		7A0000000000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				7A0000000000000000000028 /* AVBBcmShared.h */,
+				7A0000000000000000000004 /* AVBBcmDriver */,
+				7A0000000000000000000005 /* Frameworks */,
+				7A0000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		7A0000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				7A0000000000000000000006 /* com.avbaudio.installer.bcm57762.dext */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		7A0000000000000000000004 /* AVBBcmDriver */ = {
+			isa = PBXGroup;
+			children = (
+				7A0000000000000000000020 /* AVBBcmDriver.iig */,
+				7A0000000000000000000021 /* AVBBcmDriver.cpp */,
+				7A0000000000000000000022 /* AVBBcmUserClient.iig */,
+				7A0000000000000000000023 /* AVBBcmUserClient.cpp */,
+				7A0000000000000000000024 /* Bcm57762Regs.h */,
+				7A0000000000000000000025 /* Tg3Logic.hpp */,
+				7A0000000000000000000026 /* Info.plist */,
+				7A0000000000000000000027 /* AVBBcmDriver.entitlements */,
+			);
+			path = AVBBcmDriver;
+			sourceTree = "<group>";
+		};
+		7A0000000000000000000005 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				7A0000000000000000000029 /* DriverKit.framework */,
+				7A000000000000000000002A /* PCIDriverKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXHeadersBuildPhase section */
+		7A0000000000000000000010 /* Headers */ = {
+			isa = PBXHeadersBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXHeadersBuildPhase section */
+
+/* Begin PBXNativeTarget section */
+		7A0000000000000000000007 /* AVBBcmDriver */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7A0000000000000000000009 /* Build configuration list for PBXNativeTarget "AVBBcmDriver" */;
+			buildPhases = (
+				7A0000000000000000000010 /* Headers */,
+				7A000000000000000000000E /* Sources */,
+				7A000000000000000000000F /* Frameworks */,
+				7A0000000000000000000011 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AVBBcmDriver;
+			productName = AVBBcmDriver;
+			productReference = 7A0000000000000000000006 /* com.avbaudio.installer.bcm57762.dext */;
+			productType = "com.apple.product-type.driver-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		7A0000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 2600;
+			};
+			buildConfigurationList = 7A0000000000000000000008 /* Build configuration list for PBXProject "AVBBcmDriver" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 7A0000000000000000000002;
+			productRefGroup = 7A0000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				7A0000000000000000000007 /* AVBBcmDriver */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		7A0000000000000000000011 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		7A000000000000000000000E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7A0000000000000000000030 /* AVBBcmDriver.iig in Sources */,
+				7A0000000000000000000032 /* AVBBcmUserClient.iig in Sources */,
+				7A0000000000000000000031 /* AVBBcmDriver.cpp in Sources */,
+				7A0000000000000000000033 /* AVBBcmUserClient.cpp in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		7A000000000000000000000A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_OBJC_ARC = NO;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DRIVERKIT_DEPLOYMENT_TARGET = 25.0;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = driverkit;
+			};
+			name = Debug;
+		};
+		7A000000000000000000000B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_OBJC_ARC = NO;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DRIVERKIT_DEPLOYMENT_TARGET = 25.0;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				SDKROOT = driverkit;
+			};
+			name = Release;
+		};
+		7A000000000000000000000C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_ENTITLEMENTS = AVBBcmDriver/AVBBcmDriver.entitlements;
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = AVBBcmDriver/Info.plist;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.avbaudio.installer.bcm57762;
+				PRODUCT_NAME = "$(PRODUCT_BUNDLE_IDENTIFIER)";
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		7A000000000000000000000D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_ENTITLEMENTS = AVBBcmDriver/AVBBcmDriver.entitlements;
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = AVBBcmDriver/Info.plist;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.avbaudio.installer.bcm57762;
+				PRODUCT_NAME = "$(PRODUCT_BUNDLE_IDENTIFIER)";
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		7A0000000000000000000008 /* Build configuration list for PBXProject "AVBBcmDriver" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7A000000000000000000000A /* Debug */,
+				7A000000000000000000000B /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		7A0000000000000000000009 /* Build configuration list for PBXNativeTarget "AVBBcmDriver" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7A000000000000000000000C /* Debug */,
+				7A000000000000000000000D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 7A0000000000000000000001 /* Project object */;
+}

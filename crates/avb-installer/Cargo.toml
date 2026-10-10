@@ -1,0 +1,19 @@
+[package]
+name = "avb-installer"
+description = "Host app that activates/deactivates the AVBBcmDriver system extension (OSSystemExtensionRequest)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "avb-installer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "=1.0.104"
+block2 = "=0.6.2"
+dispatch2 = "=0.3.1"
+objc2 = "=0.6.5"
+objc2-foundation = "=0.3.2"
+objc2-system-extensions = "=0.3.2"

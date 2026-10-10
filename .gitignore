@@ -15,3 +15,6 @@ xcuserdata/
 *.dSYM/
 *.ipa
 *.xcarchive
+
+# Agent scratch space (replaces /tmp)
+.agents/tmp/

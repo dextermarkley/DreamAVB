@@ -1,0 +1,8 @@
+# Pinned toolchain. The host-qualified name is deliberate: the rustup proxy on
+# this machine runs under Rosetta (default host x86_64-apple-darwin), so a bare
+# "1.99.0" would resolve to an x86_64 toolchain. The probe and installer must be
+# native arm64 binaries.
+[toolchain]
+channel = "1.99.0-aarch64-apple-darwin"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
