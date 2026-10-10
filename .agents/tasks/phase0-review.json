@@ -1,0 +1,34 @@
+{
+  "verdict": "APPROVED",
+  "findings": [
+    {
+      "id": 1,
+      "severity": "non-blocking",
+      "confidence": "confirmed",
+      "title": "Open user client with dev entitlement",
+      "detail": "com.apple.developer.driverkit.allow-any-userclient-access is set and NewUserClient performs no caller check, so once loaded any local process can call InitDatapath (chip reset), SendFrame, SetClock and AdjFreq. Accepted for Phase 0 per plan; remove the entitlement before any distribution and consider a single-client guard."
+    },
+    {
+      "id": 2,
+      "severity": "non-blocking",
+      "confidence": "likely",
+      "title": "Timer not cancelled on Stop",
+      "detail": "AVBBcmDriver::Stop only calls timer->SetEnable(false), and free() releases the IOTimerDispatchSource and OSAction without Cancel(). Call Cancel in Stop before releasing."
+    },
+    {
+      "id": 3,
+      "severity": "non-blocking",
+      "confidence": "confirmed",
+      "title": "Start error paths leave Bus Master on",
+      "detail": "Start enables Memory+Bus Master before timer creation and RegisterService; those failure branches Close the device without clearing Bus Master or undoing super::Start. Clear Bus Master on every failure exit after setCommandBits."
+    },
+    {
+      "id": 4,
+      "severity": "minor",
+      "confidence": "confirmed",
+      "title": "IOReturn name table mislabel",
+      "detail": "crates/avb-probe/src/iokit.rs kr_check maps 0xe00002ed to kIOReturnNoDevice; that code is kIOReturnNotResponding, and kIOReturnNoDevice is 0xe00002c0. Fix so hardware-test logs are accurate."
+    }
+  ],
+  "reviewDoc": "/Users/dexter/AVB-Audio/.agents/tasks/phase0-review.md"
+}
