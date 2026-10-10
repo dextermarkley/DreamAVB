@@ -58,8 +58,11 @@ fi
 
 for proj in AVBI210Driver AVBBcmDriver; do
     echo "== build dext $proj"
-    /usr/bin/xcodebuild -project "$ROOT/driver/$proj.xcodeproj" -target "$proj" \
-        -configuration Debug -sdk driverkit \
+    # -derivedDataPath keeps Xcode's scratch out of ~/Library (ENV-1); xcodebuild
+    # rejects it together with -target, hence -scheme. SYMROOT/OBJROOT keep
+    # the products in $BUILD/driver/Debug-driverkit (DEXT_BUILT).
+    /usr/bin/xcodebuild -project "$ROOT/driver/$proj.xcodeproj" -scheme "$proj" \
+        -configuration Debug -sdk driverkit -derivedDataPath "$SCRATCH/DerivedData" \
         SYMROOT="$BUILD/driver" OBJROOT="$BUILD/driver/obj" CODE_SIGNING_ALLOWED=NO build
 done
 

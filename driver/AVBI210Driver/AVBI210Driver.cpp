@@ -21,7 +21,14 @@
 //                    No reset, no DMA, no Bus Master.
 //   Stage B (kAvbSelInitDatapath): software reset, PHY/link, one RX and one TX
 //                    queue with advanced descriptors, RX timestamp in buffer,
-//                    TX timestamp latch, polled by a 2 ms timer.
+//                    TX timestamp latch, polled by a 500 us timer.
+//
+// Phase 1a (ABI v3, design §3): with shared rings attached (kAvbSelRingAttach)
+// the harvester classifies every frame (classifyRx) and copies it into the
+// client-mapped control or audio ring; without rings it keeps filling the
+// Phase 0 software ring for kAvbSelPollRx. The only new register accesses are
+// reads of CRCERRS, MPC, RNBC and RQDPC(0). The live header fields are written
+// only by setStage/setFlags/setFault/setClock and the harvester.
 
 #include <os/log.h>
 
@@ -37,6 +44,7 @@
 #include <PCIDriverKit/PCIDriverKit.h>
 
 #include "AVBI210Driver.h"
+#include "AVBI210UserClient.h"
 #include "../AVBShared.h"
 #include "I210Regs.h"
 #include "I210Logic.hpp"
@@ -47,20 +55,28 @@ using namespace i210logic;
 
 namespace {
 
-constexpr uint32_t kRxRingSize    = 128;    // descriptors (power of two)
+constexpr uint32_t kRxRingSize    = 2048;   // descriptors (power of two); RDLEN 32 KiB
 constexpr uint32_t kRxBufSize     = 2048;   // = SRRCTL.BSIZEPACKET 2 KiB
+constexpr uint32_t kRxBufChunks   = 16;     // RX buffers live in 16 DMA chunks (AS-4)
+constexpr uint64_t kRxBufChunkBytes = 256 * 1024;  // the Phase 0b single-segment size
+constexpr uint32_t kRxBufsPerChunk = static_cast<uint32_t>(kRxBufChunkBytes / kRxBufSize);  // 128
 constexpr uint32_t kTxRingSize    = 64;     // descriptors (power of two)
 constexpr uint32_t kTxSlots       = 16;     // bounce buffers / max in flight
 constexpr uint32_t kTxBufSize     = 2048;
 constexpr uint32_t kSwRingSize    = 256;    // software RX ring (power of two)
-constexpr uint64_t kTimerPeriodNs = 2000000;      // 2 ms
-constexpr uint64_t kTxTsTimeoutNs = 300000000;    // 300 ms
+constexpr uint64_t kTimerPeriodNs = 500000;       // 500 us
+constexpr uint64_t kTimerLeewayNs = 50000;        // 50 us
+constexpr uint64_t kTxTsTimeoutNs = 20000000;     // 20 ms
 constexpr uint64_t kLinkWaitMs    = 10000;
+constexpr uint64_t kLateTickNs    = 2000000;      // HarvestLateTicks: tick-to-tick gap > 2 ms
+constexpr uint32_t kLinkPollTicks = 10;           // STATUS poll every 5 ms
+constexpr uint32_t kStatsTicks    = 200;          // statistics read every 100 ms
 
 static_assert(isPow2(kRxRingSize) && isPow2(kTxRingSize) && isPow2(kSwRingSize), "ring sizes");
 static_assert((kRxRingSize * sizeof(AdvRxDesc)) % 128 == 0, "RDLEN must be a multiple of 128");
 static_assert((kTxRingSize * sizeof(AdvTxDesc)) % 128 == 0, "TDLEN must be a multiple of 128");
 static_assert(kRxBufSize == kRxBufKiB * 1024, "RX buffer size matches SRRCTL");
+static_assert(kRxBufChunks * kRxBufsPerChunk == kRxRingSize, "one RX buffer per descriptor");
 
 struct DmaBuf {
     IOBufferMemoryDescriptor * md;
@@ -93,10 +109,11 @@ struct AVBI210Driver_IVars {
 
     // Datapath (Stage B)
     DmaBuf rxRing;
-    DmaBuf rxBufs;
+    DmaBuf rxBufs[kRxBufChunks]; // descriptor i -> chunk i / 128, offset (i % 128) * 2048
     DmaBuf txRing;
     DmaBuf txBufs;
     uint32_t rxNext;             // next RX descriptor to examine
+    bool rxDiscardToEop;         // inside a multi-descriptor frame (rxHarvestStep)
     uint32_t txProd;             // next TX descriptor to fill
     uint32_t txCons;             // oldest TX descriptor not yet reclaimed
     uint64_t txSeq;              // frames sent since datapath up
@@ -116,9 +133,84 @@ struct AVBI210Driver_IVars {
     uint32_t swDropped;
 
     AvbRxBatch * batch;          // scratch for kAvbSelPollRx
+
+    // ABI v3 shared rings (design §3.2-§3.6). Only rings confer ownership.
+    AVBI210UserClient * owner;   // not retained; cleared by RingDetach/ClientGone
+    IOBufferMemoryDescriptor * rxMem;        // header + control + audio slots
+    IOBufferMemoryDescriptor * consumerMem;  // AvbShmConsumer (client-writable)
+    uint8_t * rxVa;
+    AvbShmHeader * hdr;          // == rxVa while attached, else nullptr
+    AvbShmConsumer * cons;
+    uint32_t generation;         // RingAttach count since Start
+    bool producerRunning;        // producerRunning(hdr != nullptr, stage, fault)
+    uint64_t ctlHead;            // records written (monotonic per attach)
+    uint64_t audioHead;
+    AvbStreamFilter filter;      // applied by classifyRx from the next tick
+
+    // SYSTIM generation and step tagging (§3.6).
+    uint32_t clockGen;           // incremented by every SYSTIM write; never reset
+    uint64_t settleTicks;        // AVB_STEP_SETTLE_NS in mach ticks
+    RxStepAmbig stepAmbig;
+
+    TokenBucket txBucket;        // SAF-6 TX rate bound
+
+    AvbCounters ctr;             // published to hdr->counters every tick
+    uint32_t tickCount;          // harvest ticks since InitDatapath
+    uint64_t lastTickMach;       // start of the previous harvest tick (0: none)
+    uint32_t rqdpcLast;          // last RQDPC(0) value (free-running counter)
 };
 
 using IV = AVBI210Driver_IVars;
+
+// ---------------------------------------------------------------------------
+// Live header fields. Each has exactly one writer path (design §3.4 table),
+// all on the driver queue: setStage, setFlags, setFault, setClock, and the
+// harvester (heads, counters, last_tick_mach).
+
+static void storeRel32(uint32_t * p, uint32_t x) { __atomic_store_n(p, x, __ATOMIC_RELEASE); }
+
+static void updateProducer(IV * v)
+{
+    v->producerRunning = producerRunning(v->hdr != nullptr, v->stage, v->fault);
+    if (v->hdr != nullptr) {
+        storeRel32(&v->hdr->producer_running, v->producerRunning ? 1u : 0u);
+    }
+}
+
+static void stopProducer(IV * v)
+{
+    v->producerRunning = false;
+    if (v->hdr != nullptr) {
+        storeRel32(&v->hdr->producer_running, 0);
+    }
+}
+
+static void setStage(IV * v, uint32_t stage)
+{
+    v->stage = stage;
+    if (v->hdr != nullptr) {
+        storeRel32(&v->hdr->stage, stage);
+    }
+    updateProducer(v);
+}
+
+static void setFlags(IV * v, uint32_t set, uint32_t clear)
+{
+    v->flags = (v->flags | set) & ~clear;
+    if (v->hdr != nullptr) {
+        storeRel32(&v->hdr->flags, v->flags);
+    }
+}
+
+static void publishCounters(IV * v)
+{
+    if (v->hdr == nullptr) {
+        return;
+    }
+    for (uint32_t i = 0; i < kAvbCtrCount; i++) {
+        __atomic_store_n(&v->hdr->counters.c[i], v->ctr.c[i], __ATOMIC_RELAXED);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Hardware access. All of it funnels through these helpers so the fault latch
@@ -128,6 +220,10 @@ static void setFault(IV * v, uint32_t code, const char * why)
 {
     if (v->fault == kAvbFaultNone) {
         v->fault = code;
+        if (v->hdr != nullptr) {
+            storeRel32(&v->hdr->fault, code);
+        }
+        stopProducer(v);
         LOG("FAULT %u: %{public}s; refusing further MMIO until Stop", code, why);
     }
 }
@@ -201,13 +297,14 @@ static uint64_t nsToMach(IV * v, uint64_t ns)
     return v->tb.numer == 0 ? ns : ns * v->tb.denom / v->tb.numer;
 }
 
+static uint64_t machToNs(IV * v, uint64_t t)
+{
+    return v->tb.denom == 0 ? t : t * v->tb.numer / v->tb.denom;
+}
+
 static uint64_t hostNowNs(IV * v)
 {
-    uint64_t t = mach_absolute_time();
-    if (v->tb.denom != 0) {
-        t = t * v->tb.numer / v->tb.denom;
-    }
-    return t;
+    return machToNs(v, mach_absolute_time());
 }
 
 // ---------------------------------------------------------------------------
@@ -278,20 +375,39 @@ static void dmaFree(DmaBuf * b)
 static void dmaFreeAll(IV * v)
 {
     dmaFree(&v->rxRing);
-    dmaFree(&v->rxBufs);
+    for (uint32_t i = 0; i < kRxBufChunks; i++) {
+        dmaFree(&v->rxBufs[i]);
+    }
     dmaFree(&v->txRing);
     dmaFree(&v->txBufs);
+}
+
+static uint8_t * rxBufVa(IV * v, uint32_t idx)
+{
+    return v->rxBufs[idx / kRxBufsPerChunk].va + uint64_t(idx % kRxBufsPerChunk) * kRxBufSize;
+}
+
+static uint64_t rxBufIova(IV * v, uint32_t idx)
+{
+    return v->rxBufs[idx / kRxBufsPerChunk].iova + uint64_t(idx % kRxBufsPerChunk) * kRxBufSize;
 }
 
 // ---------------------------------------------------------------------------
 // SYSTIM clock (7.8.3.2)
 
-// Initial setting: SYSTIML first, then SYSTIMH.
+// The only SYSTIM write sequence (Stage A, SetClock, StepClock, datapath
+// re-arm): SYSTIML first, then SYSTIMH. Every write bumps the clock
+// generation and opens the RX step-ambiguity window (§3.6).
 static void setClock(IV * v, uint64_t ns)
 {
     const Systim s = nsToSystim(ns);
     wr(v, i210::kSystiml, s.ns);
     wrFlush(v, i210::kSystimh, s.sec);
+    v->clockGen += 1;
+    if (v->hdr != nullptr) {
+        storeRel32(&v->hdr->clock_gen, v->clockGen);
+    }
+    rxStepArm(&v->stepAmbig, mach_absolute_time(), v->settleTicks);
 }
 
 // Read sequence: SYSTIMR (latches the set), SYSTIML, SYSTIMH.
@@ -343,7 +459,7 @@ static void stageA(IV * v)
     const uint32_t inca = rd(v, i210::kTiminca);
     LOG("stage A: STATUS 0x%08x CTRL 0x%08x TSAUXC 0x%08x TIMINCA 0x%08x", status, ctrl, aux, inca);
     if (ok(v)) {
-        v->stage = kAvbStageTimeSync;
+        setStage(v, kAvbStageTimeSync);
         LOG("stage A complete (stage 1)");
     }
 }
@@ -449,7 +565,7 @@ static bool phyWrite(IV * v, uint32_t reg, uint16_t val)
 // Copper autoneg through the internal PHY; no PHY reset, advertisements kept.
 static void setupLink(IV * v)
 {
-    v->flags &= ~(AVB_FLAG_LINK_UP | AVB_FLAG_1000FD);
+    setFlags(v, 0, AVB_FLAG_LINK_UP | AVB_FLAG_1000FD);
 
     const uint32_t ctrl = rd(v, i210::kCtrl);
     wr(v, i210::kCtrl, (ctrl | i210::kCtrlSlu) & ~(i210::kCtrlFrcSpd | i210::kCtrlFrcDplx));
@@ -492,10 +608,7 @@ static void setupLink(IV * v)
     });
     const Link l = linkFromStatus(status);
     if (up) {
-        v->flags |= AVB_FLAG_LINK_UP;
-        if (l.mbps == 1000 && l.fd) {
-            v->flags |= AVB_FLAG_1000FD;
-        }
+        setFlags(v, AVB_FLAG_LINK_UP | ((l.mbps == 1000 && l.fd) ? AVB_FLAG_1000FD : 0u), 0);
         LOG("datapath: link up STATUS 0x%08x %u Mb/s %{public}s", status, l.mbps, l.fd ? "full" : "half");
     } else if (ok(v)) {
         LOG("datapath: no link after %llu ms (STATUS 0x%08x); continuing", kLinkWaitMs, status);
@@ -552,7 +665,7 @@ static bool resetDevice(IV * v)
 static void armRxDesc(IV * v, uint32_t idx)
 {
     auto * ring = reinterpret_cast<volatile AdvRxDesc *>(v->rxRing.va);
-    const AdvRxDesc d = makeAdvRxRead(v->rxBufs.iova + uint64_t(idx) * kRxBufSize);
+    const AdvRxDesc d = makeAdvRxRead(rxBufIova(v, idx));
     ring[idx].pktAddr = d.pktAddr;
     ring[idx].hdrAddr = d.hdrAddr;  // clears the write-back DD bit
 }
@@ -563,6 +676,7 @@ static bool setupRx(IV * v, uint64_t initFlags)
         armRxDesc(v, i);
     }
     v->rxNext = 0;
+    v->rxDiscardToEop = false;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
     wr(v, i210::kRxpbs, rd(v, i210::kRxpbs) | i210::kRxpbsCfgTsEn);
@@ -623,54 +737,195 @@ static void swPush(IV * v, const AvbRxEntry & e)
     if (ringDistance(v->swTail, v->swHead, kSwRingSize) == kSwRingSize - 1) {
         v->swTail = ringNext(v->swTail, kSwRingSize);  // overwrite oldest
         v->swDropped++;
+        v->ctr.c[kAvbCtrLegacySwOverrun]++;
     }
     v->sw[v->swHead] = e;
     v->swHead = ringNext(v->swHead, kSwRingSize);
 }
 
-static void harvestRx(IV * v)
+// Legacy (no rings attached): Phase 0 software ring for kAvbSelPollRx.
+// flen <= AVB_RX_SLOT_DATA_MAX (rxFrameBounds), copy <= AVB_RX_COPY_BYTES.
+static void deliverLegacy(IV * v, uint32_t statusError, bool tsip, const uint8_t * buf, const uint8_t * frame,
+                          uint32_t flen, uint64_t now)
+{
+    AvbRxEntry e{};
+    e.harvest_mach = now;
+    e.type_flags = static_cast<uint16_t>(statusError & 0xffffu);
+    if (tsip) {
+        e.hw_ts = parseRxTsHeader(buf);
+        e.has_ts = 1;
+    }
+    e.len = flen;
+    const uint32_t c = flen < AVB_RX_COPY_BYTES ? flen : AVB_RX_COPY_BYTES;
+    memcpy(e.data, frame, c);
+    swPush(v, e);
+}
+
+struct RingTick {
+    uint64_t ctlFree;    // slots the producer may still fill this tick
+    uint64_t audioFree;
+    bool ambig;          // AVB_RXF_TS_STEP_AMBIG for every slot of this tick
+};
+
+// Ring mode: classify, then copy into the control or audio ring
+// (drop-newest on overrun). The caller has applied both length guards, so
+// flen <= AVB_RX_SLOT_DATA_MAX and the copy stays inside the slot.
+static void deliverRing(IV * v, RingTick * t, uint32_t statusError, const RxWb & w, uint16_t vlanField,
+                        const uint8_t * buf, const uint8_t * frame, uint32_t flen, uint64_t now)
+{
+    const bool vp = (statusError & i210::kRxdStaVp) != 0;
+    const RxVerdict verdict = classifyRx(frame, flen, v->mac, v->filter, vp, vlanField);
+    if (!rxDelivered(verdict)) {
+        v->ctr.c[rxVerdictCounter(verdict)]++;
+        return;
+    }
+    const bool audio = verdict == RxVerdict::Stream;
+    uint64_t * freeSlots = audio ? &t->audioFree : &t->ctlFree;
+    uint64_t * head = audio ? &v->audioHead : &v->ctlHead;
+    if (*freeSlots == 0) {
+        v->ctr.c[audio ? kAvbCtrRingOverrunAudio : kAvbCtrRingOverrunCtl]++;
+        return;
+    }
+    const uint64_t base = audio ? AVB_RX_AUDIO_OFFSET : AVB_RX_CTL_OFFSET;
+    const uint64_t mask = (audio ? AVB_RX_AUDIO_SLOTS : AVB_RX_CTL_SLOTS) - 1;
+    auto * slot = reinterpret_cast<AvbRxSlot *>(v->rxVa + base + (*head & mask) * AVB_RX_SLOT_SIZE);
+    slot->hw_ts_ns = w.tsip ? parseRxTsHeader(buf) : 0;
+    slot->harvest_mach = now;
+    slot->index = *head;
+    slot->status_error = statusError;
+    slot->len = static_cast<uint16_t>(flen);
+    slot->vlan_tci = vlanField;
+    slot->flags = static_cast<uint16_t>(rxVlanFlags(vp, frame, flen) | (w.tsip ? AVB_RXF_TS_HW : 0u) |
+                                        (t->ambig ? AVB_RXF_TS_STEP_AMBIG : 0u));
+    slot->cls = static_cast<uint8_t>(verdict);
+    slot->pad0 = 0;
+    slot->desc_len = w.len;
+    slot->clock_gen = v->clockGen;
+    memcpy(slot->data, frame, flen);
+    (*head)++;
+    (*freeSlots)--;
+    v->ctr.c[rxVerdictCounter(verdict)]++;
+}
+
+// One harvest pass (TimerFired, and the start of kAvbSelPollRx in legacy
+// mode). Bounded by kRxRingSize descriptors. Returns descriptors processed.
+static uint32_t harvestRx(IV * v, bool ambig)
 {
     const auto * ring = reinterpret_cast<const volatile uint32_t *>(v->rxRing.va);
+    uint64_t * ctr = v->ctr.c;
+    const bool ringMode = v->producerRunning;
+    RingTick t{0, 0, ambig};
+    if (ringMode) {
+        // The consumer page is client-writable: validate the tails.
+        const uint64_t tailC = __atomic_load_n(&v->cons->ctl_tail, __ATOMIC_ACQUIRE);
+        const uint64_t tailA = __atomic_load_n(&v->cons->audio_tail, __ATOMIC_ACQUIRE);
+        const RingSpace c = ringFree(v->ctlHead, tailC, AVB_RX_CTL_SLOTS);
+        const RingSpace a = ringFree(v->audioHead, tailA, AVB_RX_AUDIO_SLOTS);
+        if (!c.valid) {
+            ctr[kAvbCtrConsumerIndexInvalid]++;
+        }
+        if (!a.valid) {
+            ctr[kAvbCtrConsumerIndexInvalid]++;
+        }
+        t.ctlFree = c.free;  // 0 (full) when invalid
+        t.audioFree = a.free;
+    }
+
     bool rearmed = false;
     uint32_t last = 0;
-    for (uint32_t n = 0; n < kRxRingSize && ok(v); n++) {
+    uint32_t n = 0;
+    for (; n < kRxRingSize && ok(v); n++) {
         const uint32_t idx = v->rxNext;
         const uint32_t statusError = ring[idx * 4 + 2];
         if ((statusError & i210::kRxdStaDd) == 0) {
             break;
         }
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        const uint16_t length = static_cast<uint16_t>(ring[idx * 4 + 3] & 0xffffu);
-        const RxWb w = decodeAdvRxWb(statusError, length);
-        const uint64_t now = mach_absolute_time();
-        const uint8_t * buf = v->rxBufs.va + uint64_t(idx) * kRxBufSize;
+        const uint32_t lenVlan = ring[idx * 4 + 3];
+        const RxWb w = decodeAdvRxWb(statusError, static_cast<uint16_t>(lenVlan & 0xffffu));
+        const uint16_t vlanField = static_cast<uint16_t>(lenVlan >> i210::kRxdVlanShift);
 
-        AvbRxEntry e{};
-        e.harvest_mach = now;
-        e.type_flags = static_cast<uint16_t>(statusError & 0xffffu);
-        const uint8_t * frame = buf;
-        uint32_t len = w.len;
-        if (w.tsip && len >= i210::kRxTsHeaderLen) {
-            e.hw_ts = parseRxTsHeader(buf);
-            e.has_ts = 1;
-            frame = buf + i210::kRxTsHeaderLen;
-            len -= i210::kRxTsHeaderLen;
-        }
-        if (!w.error && w.eop && len <= kRxBufSize) {
-            e.len = len;
-            const uint32_t c = len < AVB_RX_COPY_BYTES ? len : AVB_RX_COPY_BYTES;
-            memcpy(e.data, frame, c);
-            swPush(v, e);
+        const RxStep step = rxHarvestStep(&v->rxDiscardToEop, w.eop);
+        if (step == RxStep::NonEop) {
+            ctr[kAvbCtrRxNonEop]++;
+        } else if (step == RxStep::Frame) {
+            ctr[kAvbCtrRxFrames]++;
+            // Both length guards precede classification and every copy.
+            const RxBounds b = rxFrameBounds(w.len, w.tsip);
+            if (w.error || b.kind == RxBoundsKind::ShortTs) {
+                ctr[kAvbCtrRxErrors]++;
+            } else if (b.kind == RxBoundsKind::Oversize) {
+                ctr[kAvbCtrRxOversize]++;
+            } else {
+                const uint8_t * buf = rxBufVa(v, idx);
+                const uint8_t * frame = w.tsip ? buf + i210::kRxTsHeaderLen : buf;
+                const uint64_t now = mach_absolute_time();
+                if (ringMode) {
+                    deliverRing(v, &t, statusError, w, vlanField, buf, frame, b.flen, now);
+                } else {
+                    deliverLegacy(v, statusError, w.tsip, buf, frame, b.flen, now);
+                }
+            }
         }
         armRxDesc(v, idx);
         last = idx;
         rearmed = true;
         v->rxNext = ringNext(idx, kRxRingSize);
     }
+    if (ringMode) {
+        __atomic_store_n(&v->hdr->ctl_head, v->ctlHead, __ATOMIC_RELEASE);
+        __atomic_store_n(&v->hdr->audio_head, v->audioHead, __ATOMIC_RELEASE);
+    }
     if (rearmed) {
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         OSSynchronizeIO();
         wr(v, i210::kRdt0, last);
+    }
+    return n;
+}
+
+// 5 ms STATUS poll: link transitions go through setFlags (header mirror).
+static void pollLink(IV * v)
+{
+    const uint32_t status = rd(v, i210::kStatus);
+    if (!ok(v)) {
+        return;
+    }
+    const Link l = linkFromStatus(status);
+    const uint32_t mask = AVB_FLAG_LINK_UP | AVB_FLAG_1000FD;
+    const uint32_t want = l.up ? (AVB_FLAG_LINK_UP | ((l.mbps == 1000 && l.fd) ? AVB_FLAG_1000FD : 0u)) : 0u;
+    const bool wasUp = (v->flags & AVB_FLAG_LINK_UP) != 0;
+    if ((v->flags & mask) == want) {
+        return;
+    }
+    setFlags(v, want, mask & ~want);
+    if (l.up && !wasUp) {
+        v->ctr.c[kAvbCtrLinkUpEvents]++;
+    } else if (!l.up && wasUp) {
+        v->ctr.c[kAvbCtrLinkDownEvents]++;
+    }
+    LOG("link %{public}s STATUS 0x%08x %u Mb/s %{public}s", l.up ? "up" : "down", status, l.mbps,
+        l.fd ? "full" : "half");
+}
+
+// Statistics (reads only). CRCERRS/MPC/RNBC are clear-on-read and
+// therefore denied to ReadReg32; RQDPC(0) wraps and is denied as well, so
+// this accumulator is their only reader (DP-8). accumulate == false takes
+// the baseline at InitDatapath.
+static void readHwStats(IV * v, bool accumulate)
+{
+    HwStatsRead r{};
+    r.crcerrs = rd(v, i210::kCrcerrs);
+    r.mpc = rd(v, i210::kMpc);
+    r.rnbc = rd(v, i210::kRnbc);
+    r.rqdpc0 = rdRaw(v, i210::kRqdpc0);  // any value is legal for a wrapping counter
+    if (!ok(v)) {
+        return;
+    }
+    if (accumulate) {
+        statsAccumulate(&v->ctr, &v->rqdpcLast, r);
+    } else {
+        v->rqdpcLast = r.rqdpc0;
     }
 }
 
@@ -709,12 +964,16 @@ static void checkTx(IV * v)
             v->tsMach = mach_absolute_time();
             v->tsStatus = kAvbTxTsOk;
             v->tsPending = false;
+            v->ctr.c[kAvbCtrTxTsOk]++;
             return;
         }
     }
     if (mach_absolute_time() > v->tsDeadline) {
+        // A latch that becomes VALID later is released (and counted stale)
+        // by the pre-doorbell check of the next timestamped send.
         v->tsStatus = kAvbTxTsTimeout;
         v->tsPending = false;
+        v->ctr.c[kAvbCtrTxTsTimeout]++;
         LOG("TX timestamp timeout for seq %llu (TSYNCTXCTL 0x%08x)", v->tsSeq, ctl);
     }
 }
@@ -725,7 +984,8 @@ static void armTimer(IV * v)
         return;
     }
     const uint64_t period = nsToMach(v, kTimerPeriodNs);
-    v->timer->WakeAtTime(kIOTimerClockMachAbsoluteTime, mach_absolute_time() + period, period / 4);
+    v->timer->WakeAtTime(kIOTimerClockMachAbsoluteTime, mach_absolute_time() + period,
+                         nsToMach(v, kTimerLeewayNs));
     v->timerRunning = true;
 }
 
@@ -767,8 +1027,12 @@ static void shutdownDatapath(IV * v)
     setCommandBits(v, 0, i210::kCmdBusMaster);
     dmaFreeAll(v);
     v->tsPending = false;
-    v->flags &= ~(AVB_FLAG_LINK_UP | AVB_FLAG_1000FD);
-    v->stage = kAvbStageTimeSync;
+    v->rxNext = 0;
+    v->rxDiscardToEop = false;
+    v->lastTickMach = 0;
+    setFlags(v, 0, AVB_FLAG_LINK_UP | AVB_FLAG_1000FD);
+    // Rings (if any) stay attached and mapped; producer_running drops to 0.
+    setStage(v, kAvbStageTimeSync);
     LOG("datapath down (stage 1, fault %u)", v->fault);
 }
 
@@ -784,10 +1048,14 @@ static kern_return_t initDatapath(IV * v, uint64_t initFlags)
         return kIOReturnNotReady;
     }
 
-    const bool allocated = dmaAlloc(v, &v->rxRing, kRxRingSize * sizeof(AdvRxDesc)) &&
-                           dmaAlloc(v, &v->rxBufs, uint64_t(kRxRingSize) * kRxBufSize) &&
-                           dmaAlloc(v, &v->txRing, kTxRingSize * sizeof(AdvTxDesc)) &&
-                           dmaAlloc(v, &v->txBufs, uint64_t(kTxSlots) * kTxBufSize);
+    // Each RX chunk must be a single DMA segment (dmaAlloc); no retry with
+    // another size.
+    bool allocated = dmaAlloc(v, &v->rxRing, kRxRingSize * sizeof(AdvRxDesc));
+    for (uint32_t i = 0; allocated && i < kRxBufChunks; i++) {
+        allocated = dmaAlloc(v, &v->rxBufs[i], kRxBufChunkBytes);
+    }
+    allocated = allocated && dmaAlloc(v, &v->txRing, kTxRingSize * sizeof(AdvTxDesc)) &&
+                dmaAlloc(v, &v->txBufs, uint64_t(kTxSlots) * kTxBufSize);
     if (!allocated) {
         dmaFreeAll(v);
         setFault(v, kAvbFaultDma, "DMA buffer setup failed");
@@ -798,19 +1066,29 @@ static kern_return_t initDatapath(IV * v, uint64_t initFlags)
     v->txSeq = 0;
     v->tsPending = false;
     v->tsSeq = 0;
+    // Counters are monotonic for the life of a datapath: reset only here.
+    memset(&v->ctr, 0, sizeof(v->ctr));
+    v->tickCount = 0;
+    v->lastTickMach = 0;
 
     LOG("datapath: reset + init (flags 0x%llx)", initFlags);
     bool good = resetDevice(v);
     if (good) {
         // Bus Master only after the reset, so nothing DMAs with stale IOVAs.
         setCommandBits(v, i210::kCmdMemSpace | i210::kCmdBusMaster, 0);
-        v->stage = kAvbStageDatapath;  // so a failure below runs the shutdown path
+        setStage(v, kAvbStageDatapath);  // so a failure below runs the shutdown path
         setupLink(v);
         good = ok(v) && setupRx(v, initFlags) && setupTx(v);
     }
     if (good) {
         // The reset re-disables SYSTIM: re-arm the clock.
         armClock(v);
+        good = ok(v);
+    }
+    if (good) {
+        // Statistics baseline (reads only): clears the clear-on-read
+        // counters and records RQDPC(0), so this datapath counts from 0.
+        readHwStats(v, false);
         good = ok(v);
     }
     if (!good) {
@@ -844,10 +1122,16 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
     }
     checkTx(v);
     if (wantTs && v->tsPending) {
+        v->ctr.c[kAvbCtrTxTsBusyRejected]++;
         return kIOReturnBusy;
     }
     if (ringDistance(v->txCons, v->txProd, kTxRingSize) >= kTxSlots) {
         return kIOReturnBusy;
+    }
+    // SAF-6: hard TX ceiling independent of the client. Not queued when empty.
+    if (!tokenBucketTake(&v->txBucket, hostNowNs(v))) {
+        v->ctr.c[kAvbCtrTxRateLimited]++;
+        return kIOReturnNoResources;
     }
     // In-flight <= kTxSlots and kTxRingSize is a multiple of kTxSlots, so the
     // bounce slot of descriptor i is free once the descriptors before it are.
@@ -866,6 +1150,7 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
         uint64_t stale = 0;
         if (ok(v) && (ctl & i210::kTsyncTxValid) != 0) {
             (void)readTxStamp(v, &stale);
+            v->ctr.c[kAvbCtrTxStaleLatch]++;
             LOG("TX: released stale timestamp %llu", stale);
         }
         if (!ok(v)) {
@@ -886,7 +1171,9 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
     wrFlush(v, i210::kTdt0, v->txProd);
 
     const uint64_t seq = ++v->txSeq;
+    v->ctr.c[kAvbCtrTxFrames]++;
     if (wantTs) {
+        v->ctr.c[kAvbCtrTxTsRequested]++;
         v->tsPending = true;
         v->tsSeq = seq;
         v->tsDeadline = mach + nsToMach(v, kTxTsTimeoutNs);
@@ -897,6 +1184,141 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
     *seqOut = seq;
     *machOut = mach;
     return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
+}
+
+// ---------------------------------------------------------------------------
+// Shared rings (design §3.2, §3.3, §3.6). Only rings confer ownership.
+
+// Zeroed, client-mappable memory of exactly `len` bytes.
+static uint8_t * allocShared(uint64_t len, IOBufferMemoryDescriptor ** out)
+{
+    *out = nullptr;
+    IOBufferMemoryDescriptor * md = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, len, 16384, &md);
+    if (ret != kIOReturnSuccess || md == nullptr) {
+        LOG("rings: IOBufferMemoryDescriptor::Create(%llu) failed 0x%x", len, ret);
+        return nullptr;
+    }
+    ret = md->SetLength(len);
+    IOAddressSegment range{};
+    if (ret == kIOReturnSuccess) {
+        ret = md->GetAddressRange(&range);
+    }
+    if (ret != kIOReturnSuccess || range.address == 0 || range.length < len) {
+        LOG("rings: shared buffer setup (%llu) failed 0x%x", len, ret);
+        OSSafeReleaseNULL(md);
+        return nullptr;
+    }
+    auto * va = reinterpret_cast<uint8_t *>(range.address);
+    memset(va, 0, len);
+    *out = md;
+    return va;
+}
+
+// Releases rxMem/consumerMem. The caller has already stopped the producer
+// and cleared the flags (while the header was still live). A client's
+// existing mapping holds its own reference.
+static void releaseRings(IV * v)
+{
+    v->hdr = nullptr;
+    v->cons = nullptr;
+    v->rxVa = nullptr;
+    OSSafeReleaseNULL(v->rxMem);
+    OSSafeReleaseNULL(v->consumerMem);
+    v->producerRunning = false;
+}
+
+static kern_return_t ringAttach(IV * v, AVBI210UserClient * client, uint64_t flags, uint64_t * out)
+{
+    if (flags != 0) {
+        return kIOReturnBadArgument;
+    }
+    if (v->stage < kAvbStageTimeSync) {
+        return kIOReturnNotReady;
+    }
+    if (v->owner != nullptr && v->owner != client) {
+        return kIOReturnExclusiveAccess;
+    }
+    if (v->owner == client && v->hdr != nullptr) {  // idempotent for the owner
+        out[0] = v->generation;
+        out[1] = AVB_RX_MEM_SIZE;
+        out[2] = AVB_CONSUMER_MEM_SIZE;
+        return kIOReturnSuccess;
+    }
+    if (client->RingsUsed()) {
+        LOG("rings: reattach on same connection; reopen");
+        return kIOReturnNotPermitted;
+    }
+
+    IOBufferMemoryDescriptor * rxMd = nullptr;
+    IOBufferMemoryDescriptor * consMd = nullptr;
+    uint8_t * rxVa = allocShared(AVB_RX_MEM_SIZE, &rxMd);
+    uint8_t * consVa = rxVa != nullptr ? allocShared(AVB_CONSUMER_MEM_SIZE, &consMd) : nullptr;
+    if (rxVa == nullptr || consVa == nullptr) {
+        OSSafeReleaseNULL(rxMd);
+        OSSafeReleaseNULL(consMd);
+        LOG("rings: attach failed: no memory (nothing latched)");
+        return kIOReturnNoMemory;
+    }
+
+    // Header valid from the first map: constants plus the live fields.
+    auto * h = reinterpret_cast<AvbShmHeader *>(rxVa);
+    h->magic = AVB_SHM_MAGIC;
+    h->abi_version = AVB_ABI_VERSION;
+    h->header_size = AVB_SHM_HEADER_SIZE;
+    h->slot_size = AVB_RX_SLOT_SIZE;
+    h->ctl_slots = AVB_RX_CTL_SLOTS;
+    h->audio_slots = AVB_RX_AUDIO_SLOTS;
+    h->ctl_offset = AVB_RX_CTL_OFFSET;
+    h->audio_offset = AVB_RX_AUDIO_OFFSET;
+    h->total_size = AVB_RX_MEM_SIZE;
+    h->generation = ++v->generation;
+    h->stage = v->stage;
+    h->fault = v->fault;
+    h->flags = v->flags;
+    h->producer_running = 0;
+    memcpy(h->mac, v->mac, sizeof(h->mac));
+    h->counters = v->ctr;
+    h->clock_gen = v->clockGen;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+
+    v->rxMem = rxMd;
+    v->consumerMem = consMd;
+    v->rxVa = rxVa;
+    v->hdr = h;
+    v->cons = reinterpret_cast<AvbShmConsumer *>(consVa);
+    v->ctlHead = 0;
+    v->audioHead = 0;
+    memset(&v->filter, 0, sizeof(v->filter));
+    v->owner = client;
+    client->MarkRingsUsed();
+    setFlags(v, AVB_FLAG_RINGS_ATTACHED | AVB_FLAG_OWNED, 0);
+    updateProducer(v);  // stage 2: the harvester switches to ring mode next tick
+    LOG("rings: attached generation %u (stage %u, producer %d)", v->generation, v->stage, v->producerRunning);
+
+    out[0] = v->generation;
+    out[1] = AVB_RX_MEM_SIZE;
+    out[2] = AVB_CONSUMER_MEM_SIZE;
+    return kIOReturnSuccess;
+}
+
+// RingDetach (§3.6): producer off, filter cleared, flags cleared while the
+// header is live, memory released, ownership released.
+static kern_return_t ringDetach(IV * v, AVBI210UserClient * client)
+{
+    if (v->hdr == nullptr) {
+        return kIOReturnNotReady;
+    }
+    if (client != v->owner) {
+        return kIOReturnExclusiveAccess;
+    }
+    stopProducer(v);
+    memset(&v->filter, 0, sizeof(v->filter));
+    setFlags(v, 0, AVB_FLAG_RINGS_ATTACHED | AVB_FLAG_OWNED);
+    releaseRings(v);
+    v->owner = nullptr;
+    LOG("rings: detached generation %u (stage %u)", v->generation, v->stage);
+    return kIOReturnSuccess;
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +1344,7 @@ AVBI210Driver::free()
 {
     if (ivars != nullptr) {
         dmaFreeAll(ivars);
+        releaseRings(ivars);
         OSSafeReleaseNULL(ivars->timerAction);
         OSSafeReleaseNULL(ivars->timer);
         OSSafeReleaseNULL(ivars->queue);
@@ -977,6 +1400,7 @@ IMPL(AVBI210Driver, Start)
         return ret != kIOReturnSuccess ? ret : kIOReturnNoResources;
     }
     mach_timebase_info(&v->tb);
+    v->settleTicks = nsToMach(v, AVB_STEP_SETTLE_NS);  // 24 000 ticks at 24 MHz
 
     // Memory space only; Bus Master waits for the Stage B reset.
     setCommandBits(v, i210::kCmdMemSpace, 0);
@@ -1026,6 +1450,12 @@ IMPL(AVBI210Driver, Stop)
         v->opened = false;
     }
     dmaFreeAll(v);
+    if (v->hdr != nullptr) {
+        stopProducer(v);
+        setFlags(v, 0, AVB_FLAG_RINGS_ATTACHED | AVB_FLAG_OWNED);
+        releaseRings(v);
+    }
+    v->owner = nullptr;
     return Stop(provider, SUPERDISPATCH);
 }
 
@@ -1052,15 +1482,89 @@ IMPL(AVBI210Driver, TimerFired)
     (void)action;
     (void)time;
     IV * v = ivars;
+    const uint64_t tickStart = mach_absolute_time();
+    if (v->hdr != nullptr) {
+        __atomic_store_n(&v->hdr->last_tick_mach, tickStart, __ATOMIC_RELEASE);  // first, every tick
+    }
     v->timerRunning = false;
     if (v->stage != kAvbStageDatapath || !ok(v)) {
         return;
     }
-    harvestRx(v);
+    const bool ambig = rxStepAmbiguous(&v->stepAmbig, tickStart);  // once per tick
+    uint64_t * ctr = v->ctr.c;
+    if (v->lastTickMach != 0 && tickStart - v->lastTickMach > nsToMach(v, kLateTickNs)) {
+        ctr[kAvbCtrHarvestLateTicks]++;
+    }
+    v->lastTickMach = tickStart;
+    ctr[kAvbCtrHarvestTicks]++;
+
+    const uint32_t batch = harvestRx(v, ambig);
+    if (batch > ctr[kAvbCtrHarvestMaxBatch]) {
+        ctr[kAvbCtrHarvestMaxBatch] = batch;
+    }
+    v->tickCount++;
+    if (ok(v) && v->tickCount % kLinkPollTicks == 0) {
+        pollLink(v);
+    }
+    if (ok(v) && v->tickCount % kStatsTicks == 0) {
+        readHwStats(v, true);
+    }
     checkTx(v);
+    publishCounters(v);
     if (ok(v) && v->stage == kAvbStageDatapath) {
         armTimer(v);
     }
+}
+
+kern_return_t
+AVBI210Driver::CopyRingMemory(AVBI210UserClient * client, uint64_t type, uint64_t * options,
+                              IOMemoryDescriptor ** memory)
+{
+    IV * v = ivars;
+    if (v->hdr == nullptr) {
+        return kIOReturnNotReady;
+    }
+    if (client != v->owner) {
+        return kIOReturnExclusiveAccess;
+    }
+    switch (type) {
+    case kAvbMemRx:
+        v->rxMem->retain();  // one reference is consumed by the caller
+        *memory = v->rxMem;
+        *options = kIOUserClientMemoryReadOnly;
+        return kIOReturnSuccess;
+    case kAvbMemConsumer:
+        v->consumerMem->retain();
+        *memory = v->consumerMem;
+        *options = 0;
+        return kIOReturnSuccess;
+    default:
+        return kIOReturnBadArgument;
+    }
+}
+
+// §3.3 order, serialized with TimerFired on the driver queue.
+void
+AVBI210Driver::ClientGone(AVBI210UserClient * client)
+{
+    IV * v = ivars;
+    if (client == nullptr || client != v->owner) {
+        LOG("uc: closed (not owner)");
+        return;
+    }
+    stopProducer(v);                                              // 1
+    shutdownDatapath(v);                                          // 2
+    memset(&v->filter, 0, sizeof(v->filter));                     // 3
+    v->tsPending = false;
+    v->tsSeq = 0;
+    v->tsStatus = kAvbTxTsPending;
+    v->tsValue = 0;
+    v->tsMach = 0;
+    v->txBucket = TokenBucket{};
+    setFlags(v, 0, AVB_FLAG_RINGS_ATTACHED | AVB_FLAG_OWNED);
+    releaseRings(v);                                              // 4
+    v->owner = nullptr;                                           // 5
+    LOG("uc: closed (owner): datapath down, rings of generation %u released", v->generation);
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,10 +1579,32 @@ static kern_return_t setStructOut(IOUserClientMethodArguments * a, const void * 
     return a->structureOutput != nullptr ? kIOReturnSuccess : kIOReturnNoMemory;
 }
 
+// Selectors 2, 3, 4, 5, 6, 7, 9, 10: refused to non-owners while an owner
+// exists; with no owner anyone may call them (Phase 0b semantics).
+static bool isOwnerOnly(uint64_t selector)
+{
+    switch (selector) {
+    case kAvbSelSetClock:
+    case kAvbSelAdjFreq:
+    case kAvbSelInitDatapath:
+    case kAvbSelPollRx:
+    case kAvbSelSendFrame:
+    case kAvbSelGetTxTimestamp:
+    case kAvbSelShutdownDatapath:
+    case kAvbSelStepClock:
+        return true;
+    default:
+        return false;
+    }
+}
+
 kern_return_t
-AVBI210Driver::HandleUserMethod(uint64_t selector, IOUserClientMethodArguments * a)
+AVBI210Driver::HandleUserMethod(AVBI210UserClient * client, uint64_t selector, IOUserClientMethodArguments * a)
 {
     IV * v = ivars;
+    if (isOwnerOnly(selector) && v->owner != nullptr && client != v->owner) {
+        return kIOReturnExclusiveAccess;
+    }
     switch (selector) {
     case kAvbSelGetInfo: {
         AvbInfo info{};
@@ -1156,11 +1682,11 @@ AVBI210Driver::HandleUserMethod(uint64_t selector, IOUserClientMethodArguments *
     }
 
     case kAvbSelPollRx: {
-        if (v->stage != kAvbStageDatapath) {
-            return kIOReturnNotReady;
+        if (v->stage != kAvbStageDatapath || v->hdr != nullptr) {
+            return kIOReturnNotReady;  // legacy mode only: no PollRx while rings are attached
         }
         if (ok(v)) {
-            harvestRx(v);
+            (void)harvestRx(v, false);
         }
         const uint16_t filter = static_cast<uint16_t>(a->scalarInput[0]);
         uint64_t max = a->scalarInput[1];
@@ -1230,8 +1756,73 @@ AVBI210Driver::HandleUserMethod(uint64_t selector, IOUserClientMethodArguments *
     }
 
     case kAvbSelShutdownDatapath:
+        // Never changes ownership; attached rings stay mapped.
         shutdownDatapath(v);
         return kIOReturnSuccess;
+
+    case kAvbSelStepClock: {
+        if (!ok(v) || v->stage < kAvbStageTimeSync) {
+            return kIOReturnNotReady;
+        }
+        const int64_t delta = static_cast<int64_t>(a->scalarInput[0]);
+        if (delta > AVB_STEP_CLOCK_MAX_NS || delta < -AVB_STEP_CLOCK_MAX_NS) {
+            return kIOReturnBadArgument;
+        }
+        const uint64_t m0 = mach_absolute_time();
+        uint64_t s0 = 0;
+        if (!readClock(v, &s0)) {
+            return kIOReturnIOError;
+        }
+        const uint64_t m1 = mach_absolute_time();
+        const uint64_t mid = m0 + (m1 - m0) / 2;
+        const uint64_t m2 = mach_absolute_time();
+        const StepResult t = stepTarget(s0, delta, machToNs(v, m2 - mid));
+        if (!t.ok) {
+            return kIOReturnBadArgument;
+        }
+        setClock(v, t.target);
+        uint64_t after = 0;
+        if (!readClock(v, &after)) {
+            return kIOReturnIOError;
+        }
+        a->scalarOutput[0] = s0;
+        a->scalarOutput[1] = after;
+        a->scalarOutput[2] = mid;
+        return kIOReturnSuccess;
+    }
+
+    case kAvbSelGetCounters:
+        return setStructOut(a, &v->ctr, sizeof(v->ctr));
+
+    case kAvbSelSetStreamFilter: {
+        if (v->hdr == nullptr) {
+            return kIOReturnNotReady;
+        }
+        if (client != v->owner) {
+            return kIOReturnExclusiveAccess;
+        }
+        if (a->structureInput == nullptr || a->structureInput->getLength() != sizeof(AvbStreamFilter)) {
+            return kIOReturnBadArgument;
+        }
+        const void * bytes = a->structureInput->getBytesNoCopy();
+        if (bytes == nullptr) {
+            return kIOReturnBadArgument;
+        }
+        AvbStreamFilter f{};
+        memcpy(&f, bytes, sizeof(f));
+        if (!streamFilterValid(f)) {
+            return kIOReturnBadArgument;
+        }
+        v->filter = f;  // same queue as the harvester: applied from the next tick
+        LOG("rings: stream filter set (%u entries)", f.count);
+        return kIOReturnSuccess;
+    }
+
+    case kAvbSelRingAttach:
+        return ringAttach(v, client, a->scalarInput[0], a->scalarOutput);
+
+    case kAvbSelRingDetach:
+        return ringDetach(v, client);
 
     default:
         return kIOReturnUnsupported;

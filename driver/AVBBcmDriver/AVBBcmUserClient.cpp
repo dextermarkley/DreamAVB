@@ -51,7 +51,7 @@ constexpr uint32_t kVar = kIOUserClientVariableStructureSize;
 // {function, checkCompletionExists, scalarIn, structIn, scalarOut, structOut}
 // per selector in AVBShared.h. Variable-size structures are range-checked
 // again inside the driver.
-const IOUserClientMethodDispatch kDispatch[kAvbSelCount] = {
+const IOUserClientMethodDispatch kDispatch[kAvbSelBaseCount] = {
     /* 0 GetInfo          */ {dispatchToDriver, 0, 0, 0, 0, kVar},
     /* 1 ReadClock        */ {dispatchToDriver, 0, 1, 0, 0, kVar},
     /* 2 SetClock         */ {dispatchToDriver, 0, 1, 0, 1, 0},
@@ -63,7 +63,7 @@ const IOUserClientMethodDispatch kDispatch[kAvbSelCount] = {
     /* 8 ReadReg32        */ {dispatchToDriver, 0, 1, 0, 1, 0},
     /* 9 ShutdownDatapath */ {dispatchToDriver, 0, 0, 0, 0, 0},
 };
-static_assert(kAvbSelCount == 10, "update kDispatch when adding selectors");
+static_assert(sizeof(kDispatch) / sizeof(kDispatch[0]) == kAvbSelBaseCount, "BCM dispatch covers the base selectors");
 
 }  // namespace
 
@@ -128,8 +128,8 @@ AVBBcmUserClient::ExternalMethod(uint64_t selector,
     (void)dispatch;
     (void)target;
     (void)reference;
-    if (selector >= kAvbSelCount) {
-        // 10..15 unassigned; 16..31 reserved for Phase 1 shared rings.
+    if (selector >= kAvbSelBaseCount) {
+        // 10..14 (shared rings, StepClock, counters) are I210-only.
         return kIOReturnUnsupported;
     }
     return super::ExternalMethod(selector, arguments, &kDispatch[selector], this, nullptr);

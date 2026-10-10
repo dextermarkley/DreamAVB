@@ -2,7 +2,8 @@
 // (PCI 8086:1533, subsystem 1ab6:0214). Phase 0b: SYSTIM clock and TIMINCA
 // frequency adjust, per-packet RX timestamps in the receive buffer, the TX
 // timestamp latch and a minimal one-queue polled datapath, all driven through
-// AVBI210UserClient.
+// AVBI210UserClient. Phase 1a (ABI v3): shared-memory RX rings owned by one
+// client, StepClock, counters and the stream filter.
 
 #ifndef AVBI210Driver_h
 #define AVBI210Driver_h
@@ -10,7 +11,10 @@
 #include <Availability.h>
 #include <DriverKit/IOService.iig>
 #include <DriverKit/IOUserClient.iig>
+#include <DriverKit/IOMemoryDescriptor.iig>
 #include <DriverKit/IOTimerDispatchSource.iig>
+
+class AVBI210UserClient;
 
 class AVBI210Driver : public IOService
 {
@@ -32,10 +36,22 @@ public:
 
     // Entry point for AVBI210UserClient. Always called on this driver's
     // default queue, so it is serialized with TimerFired and Start/Stop.
+    // `client` is the calling connection (ownership checks).
     kern_return_t
-    HandleUserMethod(uint64_t selector, IOUserClientMethodArguments * arguments) LOCALONLY;
+    HandleUserMethod(AVBI210UserClient * client, uint64_t selector,
+                     IOUserClientMethodArguments * arguments) LOCALONLY;
 
-    // 2 ms poll timer: harvests the RX queue and the pending TX timestamp.
+    // CopyClientMemoryForType of `client`, on the driver queue.
+    kern_return_t
+    CopyRingMemory(AVBI210UserClient * client, uint64_t type, uint64_t * options,
+                   IOMemoryDescriptor ** memory) LOCALONLY;
+
+    // The connection `client` is going away (user client Stop), on the
+    // driver queue. Releases the rings and stops the datapath if it owns them.
+    void
+    ClientGone(AVBI210UserClient * client) LOCALONLY;
+
+    // 500 us poll timer: harvests the RX queue and the pending TX timestamp.
     virtual void
     TimerFired(OSAction * action, uint64_t time) TYPE(IOTimerDispatchSource::TimerOccurred);
 };

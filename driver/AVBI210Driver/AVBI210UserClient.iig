@@ -1,12 +1,13 @@
-// AVBI210UserClient.iig - user client for avb-probe. ExternalMethod-only in
-// Phase 0b (selectors in AVBShared.h); CopyClientMemoryForType shared rings
-// are reserved for Phase 1 (selectors 16..31).
+// AVBI210UserClient.iig - user client for avb-probe and avb-daemon.
+// ExternalMethod selectors in AVBShared.h; CopyClientMemoryForType maps the
+// ABI v3 shared RX rings (kAvbMemRx, kAvbMemConsumer) after kAvbSelRingAttach.
 
 #ifndef AVBI210UserClient_h
 #define AVBI210UserClient_h
 
 #include <Availability.h>
 #include <DriverKit/IOUserClient.iig>
+#include <DriverKit/IOMemoryDescriptor.iig>
 
 class AVBI210UserClient : public IOUserClient
 {
@@ -30,9 +31,21 @@ public:
                    OSObject * target,
                    void * reference) override;
 
+    virtual kern_return_t
+    CopyClientMemoryForType(uint64_t type, uint64_t * options, IOMemoryDescriptor ** memory) override;
+
     // Runs the call on the driver's default queue (see AVBI210UserClient.cpp).
     kern_return_t
     Forward(IOUserClientMethodArguments * arguments) LOCALONLY;
+
+    // One RingAttach per connection (CopyClientMemoryForType must return the
+    // same descriptor per type for the life of a user client). Set and read by
+    // the driver on its queue.
+    void
+    MarkRingsUsed() LOCALONLY;
+
+    bool
+    RingsUsed() LOCALONLY;
 };
 
 #endif /* AVBI210UserClient_h */

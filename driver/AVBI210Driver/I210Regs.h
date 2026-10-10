@@ -123,6 +123,10 @@ constexpr uint32_t kSrrctl0 = 0xC00C;
 constexpr uint32_t kRdh0    = 0xC010;
 constexpr uint32_t kRdt0    = 0xC018;
 constexpr uint32_t kRxdctl0 = 0xC028;
+// 333016 §8.10.10 RQDPC[0] (0xC030 + 0x40*n; alias 0x2830) (verify offset).
+// READ ONLY here. The rev 3.7 text lists it RW and wrapping at 0xFFFFFFFF
+// (not clear-on-read), so the accumulator adds the modulo-2^32 delta.
+constexpr uint32_t kRqdpc0  = 0x0C030;
 
 constexpr uint32_t kSrrctlBsizePktShift = 0;       // KiB units, 6:0
 constexpr uint32_t kSrrctlBsizeHdrShift = 8;       // 64 B units, 13:8
@@ -185,6 +189,9 @@ constexpr uint32_t kRxdStaTsip = 1u << 15;
 constexpr uint32_t kRxdStaTs   = 1u << 16;
 constexpr uint32_t kRxdErrRxe  = 1u << 31;      // extended error bit 11 (31:20)
 
+constexpr uint32_t kRxdStaVp   = 1u << 3;       // 7.1.4.2.2 Table 7-13 VP: 802.1Q (matched VET) (verify bit)
+constexpr uint32_t kRxdVlanShift = 16;          // write-back dword 3: VLAN Tag 31:16, PKT_LEN 15:0
+
 constexpr uint32_t kRxTsHeaderLen = 16;         // 7.1.6 timestamp-in-buffer header
 
 // ---------------------------------------------------------------------------
@@ -229,6 +236,11 @@ constexpr uint32_t kTsyncRxEnabled  = 1u << 4;
 
 constexpr uint32_t kStatsBegin = 0x4000;
 constexpr uint32_t kStatsEnd   = 0x5000;  // exclusive
+
+// Read only, by the dext's 100 ms accumulator (never through ReadReg32):
+constexpr uint32_t kCrcerrs = 0x04000;  // 333016 §8.18.1 CRC Error Count, clear on read (verify offset)
+constexpr uint32_t kMpc     = 0x04010;  // 333016 §8.18.5 Missed Packets Count, clear on read (verify)
+constexpr uint32_t kRnbc    = 0x040A0;  // 333016 §8.18.34 Receive No Buffers Count, clear on read (verify)
 
 }  // namespace i210
 
