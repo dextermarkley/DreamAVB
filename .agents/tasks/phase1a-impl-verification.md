@@ -70,3 +70,96 @@ Not verified (needs hardware, later hw steps): `GetCounters`/`StepClock`/`SetStr
 3. `nic::i210_readable` (the probe-side mirror of `isReadableRegOffsetI210`) gains 0xC030 (RQDPC(0)) to match the FEAT-001 dext denylist. No probe dump lists it.
 4. `avb-probe/Cargo.toml` keeps its `io-kit-sys` and `core-foundation-sys` entries, now unused by the probe itself, so `Cargo.lock` changes are additions only.
 5. `driver/AVBShared.h` header comment now points at `crates/avb-dext/src/abi.rs` (comment only).
+
+## FEAT-003: avb-gptp (slave-only 802.1AS) and avb-srp (MRP/MSRP/MVRP)
+
+Branch `phase1a-listener`. Software only: no frame was sent to or received from the 16R, and no servo ran against real SYSTIM.
+
+| # | Command | Result |
+|---|---|---|
+| 1 | `cargo build --manifest-path /Users/dexter/AVB-Audio/Cargo.toml --workspace --offline` (once, without `--locked`, after adding both crates to `[workspace].members`) | builds; `Cargo.lock` +16 lines, 0 removed: packages `avb-gptp` and `avb-srp`, each depending on `avb-core` and `serde` (=1.0.229, already locked). No new external crate |
+| 2 | `cargo test --manifest-path /Users/dexter/AVB-Audio/Cargo.toml -p avb-gptp -p avb-srp --locked` (with `-- --nocapture`, log `.agents/tmp/feat003-test.log`) | pass. avb-gptp 59, avb-srp 30, 0 failed |
+| 3 | `cargo clippy --manifest-path /Users/dexter/AVB-Audio/Cargo.toml --workspace --all-targets --locked -- -D warnings` (log `.agents/tmp/feat003-clippy.log`) | pass, 0 warnings. Both crates build under `#![deny(clippy::indexing_slicing)]` (test modules opt out) |
+| 4 | `cargo fmt --manifest-path /Users/dexter/AVB-Audio/Cargo.toml --all --check` | pass, no diff |
+| 5 | `cargo test --manifest-path /Users/dexter/AVB-Audio/Cargo.toml --workspace --locked` | pass: avb-core 22, avb-dext 28, avb-gptp 59, avb-installer 0, avb-probe 16 + 0, avb-srp 30 |
+| 6 | grep of `crates/avb-gptp/src` and `crates/avb-srp/src` for `std::time`, `Instant`, `SystemTime`, `std::thread`, `std::fs`, `std::net`, `std::io`, `mach_absolute`, `libc` | no matches: no clock, thread or I/O in either crate |
+| 7 | review of `avb_gptp::msg` encoders | only `encode_pdelay_req`, `encode_pdelay_resp`, `encode_pdelay_resp_follow_up`, `encode_signaling_gptp_capable`. The Sync/Follow_Up/Announce builders that drive the simulated 16R live in `src/sim.rs`, which is `#[cfg(test)]`. Every simulation test also asserts that the port never transmitted an Announce, Sync or Follow_Up |
+
+### Servo simulation (§7.3 pass criteria)
+
+Simulation (`crates/avb-gptp/src/sim.rs`):
+- The GM runs at −83 ppm against our free-running oscillator.
+- 10 ns RMS Gaussian noise is added to every I210 timestamp (Sync RX, t1, t4, the 16R's Pdelay_Req RX, our Pdelay_Resp TX). The 16R's own timestamps are exact.
+- True one-way delay is 142.6 ns, with the I210_1000 latency profile.
+- The dext is modeled with a 500 µs tick, 300 µs harvest delay and the §3.6 settle rule (AMBIG flag through the first tick ≥ 1 ms after a SYSTIM write).
+- Each StepClock/SetClock write has a 500 ns error.
+- SYSTIM starts 5 s, so ACQUIRE does a SetClock.
+- "Steady state" starts max(10 s, 40 updates) after LOCKED, the PI's settling time (pole radius √0.8 per update); 60 s are measured from there.
+
+| Case | Lock (from start) | Steady mean | Steady sd | Syncs | Budget |
+|---|---|---|---|---|---|
+| Ts = 1/32 s | 1.552 s | 0.01 ns | 10.68 ns | 1920 | lock ≤ 10 s, \|mean\| < 5, sd < 20 |
+| Ts = 1/8 s | 3.177 s | −0.04 ns | 11.10 ns | 480 | same |
+| Ts = 1 s | 18.053 s | 0.17 ns | 11.47 ns | 60 | lock ≤ 30 s |
+| Ts 1/8 → 1/32 s mid-run | no unlock (unlocks 0, steps 1 = the ACQUIRE SetClock) | 0.03 ns | 10.79 ns | 640 | must not unlock |
+
+All cases also check the following:
+- Exactly one step: the ACQUIRE SetClock, with `set_clocks` = 1.
+- asCapable made exactly one transition (false → true), so it stayed true across the SetClock.
+- The servo never entered HOLDOVER.
+- Applied frequency is −83 000 ppb ± 300 ppb.
+- `nrr_systim` is 1 ± 0.05 ppm, and `nrr_free` is (1 − 83 ppm) ± 0.3 ppm.
+- Compensated path delay is 142.6 ± 5 ns.
+- Clock model valid, `gptp_ppm_vs_mach` = −83 ± 0.05.
+
+Other results:
+- 600 ppm step-input anti-windup test: the GM jumps to +600 ppm for 10 s, then returns to −83 ppm. |offset| stayed < 1 µs for 24 Syncs, reached 3.369 s after the return. Normal lock is 3.177 s, so the 2× bound is 6.35 s.
+- NRR across a 100 µs step (2.5 ns timestamp sd as in Phase 0b, exact step write): `nrr_systim` moved at most 0.0027 ppm (bound 0.01 ppm). The NRR was held across the generation change, and asCapable stayed true on every tick.
+
+### 802.1Q-2018 §35.2.4.3 / §35.2.6 check (Listener without a registered Talker)
+
+Finding: **not forbidden**, so the TA_WAIT Asking-Failed declaration (design §8.2) is supported. `Participant::declare(Attribute::Listener { decl: AskingFailed })` has no talker-registration precondition. A test declares it with no talker registered and checks the four-packed Asking Failed encoding.
+
+Basis:
+- The paywalled 802.1Q-2018 text itself was not available to read.
+- IEEE 802.1 maintenance request 0150 (Pearson, against 802.1Q-2014, whose clause 35 numbering -2018 keeps) analyzes these exact clauses:
+  - §35.2.4.3 describes Talker Failed handling by MAP, a bridge component, so it doesn't specify end-station behavior.
+  - §35.2.6 is an encoding rule that lets an applicant switch Talker Advertise ↔ Talker Failed without a Leave. It doesn't constrain an end-station applicant.
+- The end-station Listener clause (§35.1.2.2, quoted in IEEE 802.1 slide ca-farkas-SRP-ISIS-interworking-0713) conditions declaring *Ready* on having received a Talker Advertise. It doesn't prohibit a declaration without one.
+- The bridge-only rule (§35.2.4.4) of not propagating a Listener without a registered Talker is MAP behavior.
+
+Sources:
+- `http://files.serialport.org/ieee802/maint/requests/maint_0150.pdf`
+- `https://ieee802.org/1/files/public/docs2013/ca-farkas-SRP-ISIS-interworking-0713-v01.pdf`
+
+Re-check against the -2018 text when available. The M3 hardware run shows how the 16R reacts (U-8).
+
+MRP tables: Table 10-3 (applicant) and Table 10-4 (registrar) were written from the 802.1Q-2011 tables as reproduced in IEEE 802.1 slide `new-tsn-fredette-refresh-timer-0713-v1.pdf` (pages 4–5). Maintenance item 0044 adds the "ignored if the registrar is MT" note on VO/AO/QO for rLA!/txLA!/txLAF!. Every cell is pinned by `mrp::tests`. No GPL/LGPL source was consulted.
+
+Not verified (hardware, later hw steps):
+- Pdelay with the real 16R, and turnaround.
+- Lock on real SYSTIM, and the PTP-8 offset/sd.
+- The 16R's MSRP Domain/TA behavior and the U-8 outcome.
+- MRP interop timing.
+
+### Deviations
+
+1. The servo-simulation "steady state" window is defined as starting max(10 s, 40 updates) after LOCKED. The design leaves it undefined. Measured from the LOCKED instant itself, Ts = 1 s still carries the end of the convergence tail (sd 49 ns).
+2. The Sync receipt timeout (servo → HOLDOVER after 3·Ts) restarts on every matched Sync/Follow_Up from the master, and on a Ts change. Otherwise the first Sync at a shorter Ts would time out against the previous Sync and unlock the servo, which the mid-run Ts-change test caught.
+3. "asCapable continuously false for > 3·Ta" in Slave is measured from the later of the false edge and the Slave entry. Otherwise an Announce accepted before the first Pdelay exchanges finish would be dropped back to Listening immediately.
+4. The delay used in syncEvent is the mean of the last 8 compensated delays. Status reports the last value, the mean and the sd. t3 includes the Pdelay_Resp_Follow_Up correctionField and also the Pdelay_Resp correctionField. Both are 0 from the 16R (Phase 0b G4).
+5. Our Pdelay_Req/Resp/Resp_Follow_Up/Signaling use header octet 1 = 0x02 (minorVersionPTP 0), byte-identical to the Phase 0b frame the 16R answered. The decoder accepts minorVersionPTP 1.
+6. The anti-windup clamp can't be reached in TRACKING at Ts ≥ 1/8 s with |offset| ≤ 100 µs. In the 600 ppm test the excursion was handled by the step rule (41 steps, 0 saturations; each step resets i). The clamp-and-freeze behavior is pinned in `servo::tests::pi_update_and_anti_windup` at Ts = 1/32 s (Kp 6.4).
+7. The NRR-across-a-step test steps the servo with an exact write. With the default 500 ns step error, the PI's correction of that residual moves the disciplined SYSTIM rate, and with it `nrr_systim`, by about 0.12 ppm. That is a real rate change, not bookkeeping.
+8. GptpCounters has counters beyond §7.6:
+   - `syncs_used`, `follow_up_timeouts`, `sync_timeouts`;
+   - `pdelay_step_discard`, `multiple_responders`, `foreign_port`, `rx_no_ts`, `rx_dropped`;
+   - `interval_requests_honored`/`_rejected`, `step_gen_changes`, `port_state_changes`.
+9. MRP choices the design leaves open:
+   - A changed value of a declared attribute (Ready ↔ Asking Failed, TA ↔ TF, TSpec) is sent as New!. A Join! would leave a Quiet applicant silent.
+   - Transmit opportunities are immediate on a new need, repeated after JoinTime while an applicant still wants to send, and capped at 3 per 1.5 × JoinTime.
+   - LeaveAll is carried on the first vector of each message in the PDU.
+   - Any received LeaveAll restarts our LeaveAll timer.
+   - A Lv for the talker type that isn't the registered one, after an Advertise ↔ Failed switch, is ignored.
+   - Optional sends ([s]/[sJ]) are never sent, because we encode one value per vector.
+   - Table 10-3 note 8 (AN tx! → QA) is implemented as printed and marked *(verify)*.

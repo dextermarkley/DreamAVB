@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/avb-core", "crates/avb-dext", "crates/avb-installer", "crates/avb-probe"]
+members = ["crates/avb-core", "crates/avb-dext", "crates/avb-gptp", "crates/avb-installer", "crates/avb-probe", "crates/avb-srp"]
 resolver = "2"
 
 [workspace.package]

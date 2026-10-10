@@ -73,6 +73,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "avb-gptp"
+version = "0.1.0"
+dependencies = [
+ "avb-core",
+ "serde",
+]
+
+[[package]]
 name = "avb-installer"
 version = "0.1.0"
 dependencies = [
@@ -96,6 +104,14 @@ dependencies = [
  "mach2 0.7.0",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "avb-srp"
+version = "0.1.0"
+dependencies = [
+ "avb-core",
+ "serde",
 ]
 
 [[package]]

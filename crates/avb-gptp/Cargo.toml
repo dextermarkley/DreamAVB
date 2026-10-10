@@ -1,0 +1,15 @@
+[package]
+name = "avb-gptp"
+description = "Sans-IO slave-only IEEE 802.1AS time-aware end station: messages, peer delay, port, servo, gPTP<->mach model, status"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "avb_gptp"
+path = "src/lib.rs"
+
+[dependencies]
+avb-core = { path = "../avb-core" }
+serde = { version = "=1.0.229", features = ["derive"] }

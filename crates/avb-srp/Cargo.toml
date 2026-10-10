@@ -1,0 +1,15 @@
+[package]
+name = "avb-srp"
+description = "Sans-IO IEEE 802.1Q MRP end-station participant: applicant/registrar/LeaveAll, MRPDU vector codec, MSRP and MVRP attributes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "avb_srp"
+path = "src/lib.rs"
+
+[dependencies]
+avb-core = { path = "../avb-core" }
+serde = { version = "=1.0.229", features = ["derive"] }
