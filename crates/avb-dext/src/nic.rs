@@ -138,6 +138,7 @@ pub fn i210_readable(off: u32) -> bool {
             | 0x8FDC
             | 0x8FE0
             | 0x8FE4
+            | 0xC030 // RQDPC(0): owned by the dext's statistics accumulator (ABI v3)
     )
 }
 
@@ -161,6 +162,7 @@ mod tests {
         assert!(!i210_readable(0xB618));
         assert!(!i210_readable(0x00C0));
         assert!(!i210_readable(0x4010));
+        assert!(!i210_readable(0xC030));
         assert!(!i210_readable(0x20000));
     }
 

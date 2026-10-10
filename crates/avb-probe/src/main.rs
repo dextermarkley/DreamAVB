@@ -2,6 +2,7 @@
 //! AVBBcmDriver). `--nic auto|i210|bcm` picks the service (auto: I210 first).
 //!
 //!   info / regs           decode AvbInfo, read-only register dump
+//!   counters              ABI v3 GetCounters snapshot (read-only)
 //!   clock                 G2a: NIC clock ticks, rate vs mach_absolute_time
 //!   adjfreq               G2b: frequency adjust sign and magnitude
 //!   datapath up|down      Stage B bring-up / shutdown
@@ -50,6 +51,8 @@ enum Cmd {
     Info,
     /// Read-only dump of the Phase 0 registers.
     Regs,
+    /// Print the dext counters (GetCounters; read-only, works without rings).
+    Counters,
     /// G2a: sample the NIC clock and regress it against mach_absolute_time.
     Clock {
         #[arg(long, default_value_t = 10.0)]
@@ -291,6 +294,17 @@ fn cmd_regs(dev: &Device, json: Option<&Path>) -> Result<()> {
     emit(json, "regs", &rec)
 }
 
+fn cmd_counters(dev: &Device, json: Option<&Path>) -> Result<()> {
+    let c = dev.get_counters()?;
+    let mut rec = serde_json::Map::new();
+    for (index, name) in abi::COUNTER_NAMES {
+        let v = c.get(index);
+        println!("{name:<24} [{index:2}] {v}");
+        rec.insert(name.into(), v.into());
+    }
+    emit(json, "counters", &rec)
+}
+
 // ---------------------------------------------------------------------------
 // G2a / G2b
 
@@ -328,16 +342,35 @@ fn print_clock_stats(label: &str, s: &ClockStats) {
     }
 }
 
+/// JSON form of `abi::ClockSample` (avb-dext has no serde dependency); the
+/// field names are the ABI's.
+#[derive(Clone, Copy, Serialize)]
+struct ClockSampleJson {
+    mach_before: u64,
+    eav_ns: u64,
+    mach_after: u64,
+}
+
+impl From<ClockSample> for ClockSampleJson {
+    fn from(s: ClockSample) -> Self {
+        Self {
+            mach_before: s.mach_before,
+            eav_ns: s.eav_ns,
+            mach_after: s.mach_after,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ClockRecord {
     seconds: f64,
     interval_ms: u64,
     stats: ClockStats,
-    first: Option<ClockSample>,
-    last: Option<ClockSample>,
+    first: Option<ClockSampleJson>,
+    last: Option<ClockSampleJson>,
     /// Every raw sample, so hardware behaviour (e.g. counter width) can be
     /// analysed offline.
-    raw: Vec<ClockSample>,
+    raw: Vec<ClockSampleJson>,
 }
 
 fn cmd_clock(
@@ -365,9 +398,9 @@ fn cmd_clock(
             seconds,
             interval_ms,
             stats: s.clone(),
-            first: samples.first().copied(),
-            last: samples.last().copied(),
-            raw: samples.clone(),
+            first: samples.first().copied().map(Into::into),
+            last: samples.last().copied().map(Into::into),
+            raw: samples.iter().copied().map(Into::into).collect(),
         },
     )?;
     Ok(s)
@@ -887,6 +920,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Info => cmd_info(&dev, json).map(|_| ()),
         Cmd::Regs => cmd_regs(&dev, json),
+        Cmd::Counters => cmd_counters(&dev, json),
         Cmd::Clock {
             seconds,
             interval_ms,

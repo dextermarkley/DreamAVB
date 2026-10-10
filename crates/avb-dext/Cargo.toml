@@ -1,0 +1,17 @@
+[package]
+name = "avb-dext"
+description = "User-space side of the AVB dext ABI v3: AVBShared.h mirror, IOKit Device and shared-memory RX ring consumer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "avb_dext"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "=1.0.104"
+core-foundation-sys = "=0.8.7"
+io-kit-sys = "=0.5.0"
+mach2 = "=0.7.0"

@@ -1,7 +1,7 @@
 // AVBShared.h - user-client ABI shared by the AVB dexts (AVBBcmDriver,
 // AVBI210Driver) and the Rust user-space tools (mirrored by hand in
-// crates/avb-probe/src/abi.rs, moving to crates/avb-dext/src/abi.rs; both
-// sides assert the struct sizes and offsets below).
+// crates/avb-dext/src/abi.rs; both sides assert the struct sizes and offsets
+// below).
 //
 // Rules:
 //   * fixed-width types, natural alignment, no implicit padding;
