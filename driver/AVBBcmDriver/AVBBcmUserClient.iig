@@ -1,5 +1,5 @@
 // AVBBcmUserClient.iig - user client for avb-probe. ExternalMethod-only in
-// Phase 0 (selectors in AVBBcmShared.h); CopyClientMemoryForType shared rings
+// Phase 0 (selectors in AVBShared.h); CopyClientMemoryForType shared rings
 // are reserved for Phase 1 (selectors 16..31).
 
 #ifndef AVBBcmUserClient_h

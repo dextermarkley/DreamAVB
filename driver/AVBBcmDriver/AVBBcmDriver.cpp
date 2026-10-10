@@ -34,7 +34,7 @@
 #include <PCIDriverKit/PCIDriverKit.h>
 
 #include "AVBBcmDriver.h"
-#include "../AVBBcmShared.h"
+#include "../AVBShared.h"
 #include "Bcm57762Regs.h"
 #include "Tg3Logic.hpp"
 
@@ -1177,7 +1177,7 @@ IMPL(AVBBcmDriver, TimerFired)
 }
 
 // ---------------------------------------------------------------------------
-// User client methods (selectors in AVBBcmShared.h)
+// User client methods (selectors in AVBShared.h)
 
 static kern_return_t setStructOut(IOUserClientMethodArguments * a, const void * p, size_t len)
 {
@@ -1198,10 +1198,14 @@ AVBBcmDriver::HandleUserMethod(uint64_t selector, IOUserClientMethodArguments * 
         info.abi_version = AVB_ABI_VERSION;
         info.vendor_device = v->vendorDevice;
         info.subsys = v->subsys;
-        info.asic_rev = v->asicRev;
+        info.hw_rev = v->asicRev;
+        info.nic_kind = AVB_NIC_BCM57762;
         if (ok(v)) {
-            v->pci->ConfigurationRead32(bcm::kMiscHostCtrl, &info.misc_host_ctrl);
-            info.grc_mode = rd(v, bcm::kGrcMode);
+            v->pci->ConfigurationRead32(bcm::kMiscHostCtrl, &info.ctrl_a);
+            info.ctrl_b = rd(v, bcm::kGrcMode);
+        }
+        if (ok(v)) {
+            info.clock_ctl = rd(v, bcm::kEavRefClkCorrectCtl);
         }
         info.stage = v->stage;
         info.fault = v->fault;

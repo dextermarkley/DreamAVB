@@ -25,7 +25,7 @@
 		7A0000000000000000000025 /* Tg3Logic.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = Tg3Logic.hpp; sourceTree = "<group>"; };
 		7A0000000000000000000026 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		7A0000000000000000000027 /* AVBBcmDriver.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = AVBBcmDriver.entitlements; sourceTree = "<group>"; };
-		7A0000000000000000000028 /* AVBBcmShared.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AVBBcmShared.h; sourceTree = "<group>"; };
+		7A0000000000000000000028 /* AVBShared.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AVBShared.h; sourceTree = "<group>"; };
 		7A0000000000000000000029 /* DriverKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = DriverKit.framework; path = System/DriverKit/System/Library/Frameworks/DriverKit.framework; sourceTree = SDKROOT; };
 		7A000000000000000000002A /* PCIDriverKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = PCIDriverKit.framework; path = System/DriverKit/System/Library/Frameworks/PCIDriverKit.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
@@ -46,7 +46,7 @@
 		7A0000000000000000000002 = {
 			isa = PBXGroup;
 			children = (
-				7A0000000000000000000028 /* AVBBcmShared.h */,
+				7A0000000000000000000028 /* AVBShared.h */,
 				7A0000000000000000000004 /* AVBBcmDriver */,
 				7A0000000000000000000005 /* Frameworks */,
 				7A0000000000000000000003 /* Products */,

@@ -1,4 +1,4 @@
-// Host-side unit tests for Tg3Logic.hpp and the AVBBcmShared.h ABI.
+// Host-side unit tests for Tg3Logic.hpp and the AVBShared.h ABI.
 // Plain assert-style runner: prints one line per check group, exits non-zero
 // on the first failure.
 
@@ -7,7 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "../AVBBcmShared.h"
+#include "../AVBShared.h"
 #include "../AVBBcmDriver/Tg3Logic.hpp"
 
 using namespace tg3logic;
@@ -24,7 +24,10 @@ static int gChecks = 0;
     } while (0)
 
 // ABI sizes and offsets (mirrored by crates/avb-probe/src/abi.rs tests).
-static_assert(sizeof(AvbInfo) == 52);
+static_assert(sizeof(AvbInfo) == 60);
+static_assert(offsetof(AvbInfo, nic_kind) == 52);
+static_assert(offsetof(AvbInfo, clock_ctl) == 56);
+static_assert(AVB_ABI_VERSION == 2);
 static_assert(sizeof(AvbClockSample) == 24);
 static_assert(sizeof(AvbRxEntry) == 152);
 static_assert(sizeof(AvbRxBatch) == 3656);
@@ -153,6 +156,7 @@ static void testMisc() {
     CHECK(isReadableRegOffset(0x6900));
     CHECK(!isReadableRegOffset(0x6901));
     CHECK(!isReadableRegOffset(0x10000));
+    CHECK(!isReadableRegOffset(0x1fffc));  // inside the shared limit, outside the BCM window
     const uint8_t sb[0x14] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x34, 0x12, 0, 0, 0, 0, 0x05, 0x00, 0xff, 0x01};
     CHECK(le16At(sb, bcm::kSbRxStdConsumer) == 0x1234);
     CHECK(le16At(sb, bcm::kSbRxProducer0) == 5);

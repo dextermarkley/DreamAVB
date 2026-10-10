@@ -12,7 +12,7 @@
 
 #include "AVBBcmUserClient.h"
 #include "AVBBcmDriver.h"
-#include "../AVBBcmShared.h"
+#include "../AVBShared.h"
 
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "AVBBcm: uc: " fmt, ##__VA_ARGS__)
 
@@ -49,7 +49,7 @@ kern_return_t dispatchToDriver(OSObject * target, void * reference, IOUserClient
 constexpr uint32_t kVar = kIOUserClientVariableStructureSize;
 
 // {function, checkCompletionExists, scalarIn, structIn, scalarOut, structOut}
-// per selector in AVBBcmShared.h. Variable-size structures are range-checked
+// per selector in AVBShared.h. Variable-size structures are range-checked
 // again inside the driver.
 const IOUserClientMethodDispatch kDispatch[kAvbSelCount] = {
     /* 0 GetInfo          */ {dispatchToDriver, 0, 0, 0, 0, kVar},

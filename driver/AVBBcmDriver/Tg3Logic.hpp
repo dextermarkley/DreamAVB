@@ -199,8 +199,12 @@ constexpr bool isOurDevice(uint32_t vendorDevice, uint32_t subsystem) {
 
 constexpr bool isAsic57766(uint32_t asicRevReg) { return (asicRevReg >> 12) == bcm::kAsicRev57766; }
 
+// BCM BAR0 register window. Deliberately local: AVB_REG_READ_LIMIT in
+// AVBShared.h is the maximum over all NICs (0x20000 for the I210).
+constexpr uint32_t kBcmRegReadLimit = 0x10000u;
+
 constexpr bool isReadableRegOffset(uint64_t off) {
-    return off < 0x10000u && (off & 3u) == 0;
+    return off < kBcmRegReadLimit && (off & 3u) == 0;
 }
 
 // Little-endian u16 from a byte buffer (status block fields).
