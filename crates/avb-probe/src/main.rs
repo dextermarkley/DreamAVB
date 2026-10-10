@@ -225,6 +225,10 @@ const REG_DUMP: &[(&str, u32)] = &[
     ("EAV_REF_CLCK_MSB", 0x6904),
     ("EAV_REF_CLK_CORRECT_CTL", 0x6928),
     ("RX_PTP_CTL", 0x06c8),
+    ("TX_TSTAMP_LSB", 0x05c0),
+    ("TX_TSTAMP_MSB", 0x05c4),
+    ("RX_TSTAMP_LSB", 0x06b0),
+    ("RX_TSTAMP_MSB", 0x06b4),
     ("MAC_MODE", 0x0400),
     ("MAC_STATUS", 0x0404),
 ];
@@ -262,12 +266,13 @@ fn sample_clock(dev: &Device, seconds: f64, interval_ms: u64) -> Result<Vec<Cloc
 fn print_clock_stats(label: &str, s: &ClockStats) {
     match s.fit {
         Some(f) => println!(
-            "{label}: n={} slope={:.9} ({:+.3} ppm vs mach) residual_rms={:.1} ns monotonic={} bracket median={:.0} ns max={:.0} ns",
+            "{label}: n={} slope={:.9} ({:+.3} ppm vs mach) residual_rms={:.1} ns monotonic={} wraps32={} bracket median={:.0} ns max={:.0} ns",
             s.samples,
             f.slope,
             f.ppm(),
             f.residual_rms,
             s.monotonic,
+            s.wraps32,
             s.bracket_median_ns,
             s.bracket_max_ns
         ),
@@ -282,6 +287,9 @@ struct ClockRecord {
     stats: ClockStats,
     first: Option<ClockSample>,
     last: Option<ClockSample>,
+    /// Every raw sample, so hardware behaviour (e.g. counter width) can be
+    /// analysed offline.
+    raw: Vec<ClockSample>,
 }
 
 fn cmd_clock(
@@ -311,6 +319,7 @@ fn cmd_clock(
             stats: s.clone(),
             first: samples.first().copied(),
             last: samples.last().copied(),
+            raw: samples.clone(),
         },
     )?;
     Ok(s)
@@ -486,10 +495,11 @@ fn cmd_rx_ptp(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()> {
             };
             let has_ts = e.has_ts != 0;
             println!(
-                "{:<20} seq={:<5} src={} has_ts={} hw_ts={} harvest_mach={}",
+                "{:<20} seq={:<5} src={} type_flags=0x{:04x} has_ts={} hw_ts={} harvest_mach={}",
                 format!("{:?}", m.msg_type),
                 m.seq,
                 m.source,
+                e.type_flags,
                 u8::from(has_ts),
                 e.hw_ts,
                 e.harvest_mach
@@ -625,7 +635,7 @@ fn cmd_pdelay(dev: &Device, json: Option<&Path>, count: u32) -> Result<()> {
             x.t1 = Some(hw);
             x.eav_at_doorbell = Some(lo);
             x.eav_next_sample = Some(hi);
-            x.t1_bracketed = Some(lo < hw && hw < hi);
+            x.t1_bracketed = Some(stats::in_bracket(lo, hw, hi));
         }
         // Collect Pdelay_Resp (t2, t4) and Pdelay_Resp_Follow_Up (t3).
         let mut corr = (0.0, 0.0);

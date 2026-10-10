@@ -103,10 +103,45 @@ pub fn linear_fit(xs: &[f64], ys: &[f64]) -> Option<Fit> {
     })
 }
 
+/// On the BCM57762 the EAV MSB register reads 0 and the LSB wraps every
+/// 2^32 ns (~4.29 s), measured on hardware. When every sample's high word is
+/// zero, extend the counter in software (one wrap per decrease; valid while
+/// samples are < 4.29 s apart). Returns the unwrapped values and wrap count.
+pub fn unwrap32(values: &[u64]) -> (Vec<u64>, usize) {
+    if values.iter().any(|v| v >> 32 != 0) {
+        return (values.to_vec(), 0);
+    }
+    let mut wraps = 0u64;
+    let mut out = Vec::with_capacity(values.len());
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 && *v < values[i - 1] {
+            wraps += 1;
+        }
+        out.push(v + (wraps << 32));
+    }
+    (out, wraps as usize)
+}
+
+/// `lo < t < hi`. When the bracket comes from 32-bit-only EAV reads (MSB
+/// reads 0) but `t` is a full 64-bit latch, compare modulo 2^32.
+pub fn in_bracket(lo: u64, t: u64, hi: u64) -> bool {
+    if lo >> 32 == 0 && hi >> 32 == 0 && t >> 32 != 0 {
+        let m = 0xffff_ffffu64;
+        let span = hi.wrapping_sub(lo) & m;
+        let off = t.wrapping_sub(lo) & m;
+        off > 0 && off < span
+    } else {
+        lo < t && t < hi
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ClockStats {
     pub fit: Option<Fit>,
     pub ppm_vs_mach: Option<f64>,
+    /// 32-bit wraps unwrapped in software (0 when the MSB is live).
+    pub wraps32: usize,
+    /// Monotonic after unwrapping.
     pub monotonic: bool,
     pub bracket_median_ns: f64,
     pub bracket_max_ns: f64,
@@ -119,8 +154,9 @@ pub fn clock_stats(samples: &[ClockSample], tb: Timebase) -> ClockStats {
         .iter()
         .map(|s| tb.mach_to_ns(midpoint(s.mach_before, s.mach_after)))
         .collect();
-    let ys: Vec<f64> = samples.iter().map(|s| s.eav_ns as f64).collect();
-    let eav: Vec<u64> = samples.iter().map(|s| s.eav_ns).collect();
+    let raw: Vec<u64> = samples.iter().map(|s| s.eav_ns).collect();
+    let (eav, wraps32) = unwrap32(&raw);
+    let ys: Vec<f64> = eav.iter().map(|v| *v as f64).collect();
     let brackets: Vec<f64> = samples
         .iter()
         .map(|s| tb.mach_delta_ns(s.mach_before, s.mach_after))
@@ -129,6 +165,7 @@ pub fn clock_stats(samples: &[ClockSample], tb: Timebase) -> ClockStats {
     ClockStats {
         ppm_vs_mach: fit.map(|f| f.ppm()),
         fit,
+        wraps32,
         monotonic: is_strictly_monotonic(&eav),
         bracket_median_ns: median(&brackets),
         bracket_max_ns: brackets.iter().copied().fold(f64::NAN, f64::max),
@@ -195,6 +232,31 @@ mod tests {
         assert!(median(&[]).is_nan());
         assert_eq!(midpoint(10, 20), 15);
         assert_eq!(midpoint(10, 5), 10);
+    }
+
+    #[test]
+    fn unwrap32_extends_counter() {
+        let (u, w) = unwrap32(&[0xffff_0000, 0x0000_1000, 0x0001_0000]);
+        assert_eq!(w, 1);
+        assert_eq!(u, vec![0xffff_0000, 0x1_0000_1000, 0x1_0001_0000]);
+        // A live MSB disables unwrapping.
+        let (u, w) = unwrap32(&[0x1_0000_0005, 0x1_0000_0001]);
+        assert_eq!((u, w), (vec![0x1_0000_0005, 0x1_0000_0001], 0));
+    }
+
+    #[test]
+    fn in_bracket_handles_32bit_reads() {
+        // Values measured on the BCM57762 (seq 0x4000).
+        assert!(in_bracket(318_873_137, 331_031_367_832, 318_916_864));
+        assert!(!in_bracket(
+            318_873_137,
+            331_031_367_832 + 100_000,
+            318_916_864
+        ));
+        // Bracket straddling a 32-bit wrap.
+        assert!(in_bracket(0xffff_fff0, 0x5_0000_0002, 0x10));
+        assert!(in_bracket(5, 6, 7));
+        assert!(!in_bracket(5, 8, 7));
     }
 
     #[test]
