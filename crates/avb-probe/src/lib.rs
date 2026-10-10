@@ -6,6 +6,7 @@
 pub mod abi;
 pub mod freq;
 pub mod iokit;
+pub mod nic;
 pub mod ptp;
 pub mod report;
 pub mod stats;

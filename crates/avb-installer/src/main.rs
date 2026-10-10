@@ -1,4 +1,4 @@
-//! avb-installer: host app for the AVBBcmDriver system extension.
+//! avb-installer: host app for the AVB driver system extensions.
 //!
 //! This binary lives at `AVBInstaller.app/Contents/MacOS/avb-installer` and is
 //! executed directly, so `NSBundle.mainBundle` is the app bundle and sysextd
@@ -9,9 +9,9 @@
 //! its delegate protocol.
 //!
 //! Subcommands:
-//!   activate    submit an activation request and wait for the result
-//!   deactivate  submit a deactivation request and wait for the result
-//!   status      print `systemextensionsctl list` lines for our bundle ID
+//!   activate                          activate the I210 dext and wait for the result
+//!   deactivate [--dext i210|bcm57762] deactivate a dext (default i210) and wait
+//!   status                            print `systemextensionsctl list` lines for both dexts
 
 use std::process::{Command, ExitCode};
 
@@ -30,7 +30,8 @@ use objc2_system_extensions::{
 };
 
 const APP_BUNDLE_ID: &str = "com.avbaudio.installer";
-const DEXT_BUNDLE_ID: &str = "com.avbaudio.installer.bcm57762";
+const DEXT_I210: &str = "com.avbaudio.installer.i210";
+const DEXT_BCM: &str = "com.avbaudio.installer.bcm57762";
 const RUN_LOOP_TIMEOUT_S: f64 = 300.0;
 
 /// Readable name for an `OSSystemExtensionErrorDomain` code.
@@ -82,7 +83,7 @@ define_class!(
         fn needs_user_approval(&self, _request: &OSSystemExtensionRequest) {
             println!(
                 "user approval required: open System Settings > General > Login Items & \
-                 Extensions > Driver Extensions and enable AVBBcmDriver. Waiting..."
+                 Extensions > Driver Extensions and enable AVBI210Driver. Waiting..."
             );
         }
 
@@ -144,9 +145,9 @@ fn check_bundle() -> Result<()> {
     Ok(())
 }
 
-fn submit(action: Action) -> Result<()> {
+fn submit(action: Action, dext: &str) -> Result<()> {
     check_bundle()?;
-    let ident = NSString::from_str(DEXT_BUNDLE_ID);
+    let ident = NSString::from_str(dext);
     let queue = DispatchQueue::main();
     let request = unsafe {
         match action {
@@ -165,7 +166,7 @@ fn submit(action: Action) -> Result<()> {
         OSSystemExtensionManager::sharedManager().submitRequest(&request);
     }
     println!(
-        "{} request submitted for {DEXT_BUNDLE_ID}; waiting up to {RUN_LOOP_TIMEOUT_S:.0} s",
+        "{} request submitted for {dext}; waiting up to {RUN_LOOP_TIMEOUT_S:.0} s",
         match action {
             Action::Activate => "activation",
             Action::Deactivate => "deactivation",
@@ -185,27 +186,31 @@ fn status() -> Result<()> {
         .output()
         .context("running systemextensionsctl list")?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut found = false;
-    for line in text.lines().filter(|l| l.contains(DEXT_BUNDLE_ID)) {
-        println!("{line}");
-        found = true;
-    }
-    if !found {
-        println!("{DEXT_BUNDLE_ID}: not installed");
+    for id in [DEXT_I210, DEXT_BCM] {
+        let mut found = false;
+        for line in text.lines().filter(|l| l.contains(id)) {
+            println!("{line}");
+            found = true;
+        }
+        if !found {
+            println!("{id}: not installed");
+        }
     }
     Ok(())
 }
 
 fn usage() {
-    eprintln!("usage: avb-installer <activate|deactivate|status>");
+    eprintln!("usage: avb-installer <activate | deactivate [--dext i210|bcm57762] | status>");
 }
 
 fn main() -> ExitCode {
-    let arg = std::env::args().nth(1);
-    let result = match arg.as_deref() {
-        Some("activate") => submit(Action::Activate),
-        Some("deactivate") => submit(Action::Deactivate),
-        Some("status") => status(),
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let result = match argv.as_slice() {
+        ["activate"] => submit(Action::Activate, DEXT_I210),
+        ["deactivate"] | ["deactivate", "--dext", "i210"] => submit(Action::Deactivate, DEXT_I210),
+        ["deactivate", "--dext", "bcm57762"] => submit(Action::Deactivate, DEXT_BCM),
+        ["status"] => status(),
         _ => {
             usage();
             return ExitCode::from(64);

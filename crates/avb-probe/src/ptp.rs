@@ -244,9 +244,65 @@ pub fn link_delay_ns(
     ((local - remote) as f64 - corr_resp_ns - corr_fu_ns) / 2.0
 }
 
+/// Link delay with the timestamp-point latencies removed: the TX timestamp is
+/// taken `tx_lat_ns` before the frame reaches the wire (t1 + tx_lat) and the RX
+/// timestamp `rx_lat_ns` after it arrived (t4 - rx_lat). Equals
+/// raw - (tx_lat + rx_lat) / 2.
+#[allow(clippy::too_many_arguments)]
+pub fn compensated_link_delay_ns(
+    t1: u64,
+    t2: u64,
+    t3: u64,
+    t4: u64,
+    corr_resp_ns: f64,
+    corr_fu_ns: f64,
+    tx_lat_ns: i64,
+    rx_lat_ns: i64,
+) -> f64 {
+    let t1c = (t1 as i128 + i128::from(tx_lat_ns)).max(0) as u64;
+    let t4c = (t4 as i128 - i128::from(rx_lat_ns)).max(0) as u64;
+    link_delay_ns(t1c, t2, t3, t4c, corr_resp_ns, corr_fu_ns)
+}
+
+/// Neighbor rate ratio from two consecutive exchanges, each given as
+/// (t3, t4): (t3_n - t3_{n-1}) / (t4_n - t4_{n-1}). None if t4 did not advance.
+pub fn neighbor_rate_ratio(prev: (u64, u64), cur: (u64, u64)) -> Option<f64> {
+    let d_peer = cur.0 as i128 - prev.0 as i128;
+    let d_local = cur.1 as i128 - prev.1 as i128;
+    if d_local <= 0 {
+        return None;
+    }
+    Some(d_peer as f64 / d_local as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compensation_and_rate_ratio() {
+        let t1 = 1_000_000_000u64;
+        let t2 = t1 + 300 + 5_000_000_000;
+        let t3 = t2 + 10_000;
+        let t4 = t1 + 300 + 10_000 + 300;
+        let raw = link_delay_ns(t1, t2, t3, t4, 0.0, 0.0);
+        assert_eq!(raw, 300.0);
+        let c = compensated_link_delay_ns(t1, t2, t3, t4, 0.0, 0.0, 178, 448);
+        assert_eq!(c, raw - 313.0);
+        assert_eq!(
+            compensated_link_delay_ns(t1, t2, t3, t4, 0.0, 0.0, 0, 0),
+            raw
+        );
+
+        assert_eq!(
+            neighbor_rate_ratio((t3, t4), (t3 + 1_000_000_000, t4 + 1_000_000_000)),
+            Some(1.0)
+        );
+        // Peer clock 1 ppm fast.
+        let r = neighbor_rate_ratio((t3, t4), (t3 + 1_000_001_000, t4 + 1_000_000_000)).unwrap();
+        assert!((r - (1.0 + 1e-6)).abs() < 1e-12, "{r}");
+        assert!(neighbor_rate_ratio((t3, t4), (t3 + 5, t4)).is_none());
+    }
 
     const MAC: [u8; 6] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
 

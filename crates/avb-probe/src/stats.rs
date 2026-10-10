@@ -45,6 +45,17 @@ pub fn median(values: &[f64]) -> f64 {
     }
 }
 
+/// Mean and sample standard deviation (n - 1). None for fewer than 2 values.
+pub fn mean_stddev(values: &[f64]) -> Option<(f64, f64)> {
+    let n = values.len();
+    if n < 2 {
+        return None;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let var = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n - 1) as f64;
+    Some((mean, var.sqrt()))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Fit {
     pub slope: f64,
@@ -257,6 +268,16 @@ mod tests {
         assert!(in_bracket(0xffff_fff0, 0x5_0000_0002, 0x10));
         assert!(in_bracket(5, 6, 7));
         assert!(!in_bracket(5, 8, 7));
+    }
+
+    #[test]
+    fn mean_and_sample_stddev() {
+        assert!(mean_stddev(&[]).is_none());
+        assert!(mean_stddev(&[1.0]).is_none());
+        let (m, s) = mean_stddev(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]).unwrap();
+        assert!((m - 5.0).abs() < 1e-12);
+        assert!((s - (32.0f64 / 7.0).sqrt()).abs() < 1e-12);
+        assert_eq!(mean_stddev(&[3.0, 3.0]).unwrap(), (3.0, 0.0));
     }
 
     #[test]

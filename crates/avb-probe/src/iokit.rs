@@ -1,4 +1,5 @@
-//! Thin IOKit wrapper around the AVBBcmDriver user client.
+//! Thin IOKit wrapper around the AVB dext user client (AVBI210Driver or
+//! AVBBcmDriver; same ABI).
 //!
 //! One typed method per selector in `abi::sel`. All math lives elsewhere.
 
@@ -13,14 +14,38 @@ use io_kit_sys::{
 };
 
 use crate::abi::{self, sel, AvbInfo, ClockSample, RxBatch};
+use crate::nic::{self, NicProfile};
 
-/// Registry name of the dext's service (its IOUserClass).
-pub const SERVICE_NAME: &str = "AVBBcmDriver";
+/// Which dext service to open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NicSelect {
+    /// AVBI210Driver first, then AVBBcmDriver.
+    Auto,
+    I210,
+    Bcm,
+}
 /// kIOMainPortDefault (MACH_PORT_NULL).
 const MAIN_PORT_DEFAULT: u32 = 0;
 
 pub struct Device {
     conn: io_connect_t,
+    profile: &'static NicProfile,
+}
+
+/// Look up a service by its registry name; 0 when absent.
+fn find_service(name: &str) -> Result<io_service_t> {
+    let name = CString::new(name).expect("static name");
+    unsafe {
+        let matching = IOServiceNameMatching(name.as_ptr());
+        if matching.is_null() {
+            bail!("IOServiceNameMatching returned NULL");
+        }
+        // IOServiceGetMatchingService consumes the matching dictionary.
+        Ok(IOServiceGetMatchingService(
+            MAIN_PORT_DEFAULT,
+            matching as _,
+        ))
+    }
 }
 
 fn kr_check(kr: i32, what: &str) -> Result<()> {
@@ -48,23 +73,38 @@ fn kr_check(kr: i32, what: &str) -> Result<()> {
 }
 
 impl Device {
-    /// Find the AVBBcmDriver service and open user client type 0.
-    pub fn open() -> Result<Self> {
-        let name = CString::new(SERVICE_NAME).expect("static name");
-        let service: io_service_t = unsafe {
-            let matching = IOServiceNameMatching(name.as_ptr());
-            if matching.is_null() {
-                bail!("IOServiceNameMatching returned NULL");
-            }
-            // IOServiceGetMatchingService consumes the matching dictionary.
-            IOServiceGetMatchingService(MAIN_PORT_DEFAULT, matching as _)
+    /// Find the selected dext service, open user client type 0 and check that
+    /// the dext reports the NIC kind the service name promises.
+    pub fn open(sel: NicSelect) -> Result<Self> {
+        let candidates: &[&'static NicProfile] = match sel {
+            NicSelect::Auto => &nic::ALL,
+            NicSelect::I210 => &[&nic::I210],
+            NicSelect::Bcm => &[&nic::BCM57762],
         };
-        if service == 0 {
-            bail!(
-                "{SERVICE_NAME} service not found (is the dext activated and matched to the \
-                 14e4:1682 adapter? see `ioreg -l -w0 | grep -A20 {SERVICE_NAME}`)"
-            );
+        let mut found = None;
+        for p in candidates {
+            let s = find_service(p.service_name)?;
+            if s != 0 {
+                found = Some((s, *p));
+                break;
+            }
         }
+        let Some((service, profile)) = found else {
+            if let [p] = candidates {
+                bail!(
+                    "{} service not found (is {} activated and matched to the {} adapter? see \
+                     `ioreg -l -w0 | grep -A20 {}`)",
+                    p.service_name,
+                    p.dext_bundle_id,
+                    p.match_desc,
+                    p.service_name
+                );
+            }
+            bail!(
+                "neither AVBI210Driver nor AVBBcmDriver service found (is a dext activated and \
+                 matched? see `ioreg -l -w0 | grep -A20 AVB`)"
+            );
+        };
         let mut conn: io_connect_t = 0;
         let kr = unsafe {
             let kr = IOServiceOpen(service, mach2::traps::mach_task_self(), 0, &mut conn);
@@ -72,7 +112,22 @@ impl Device {
             kr
         };
         kr_check(kr, "IOServiceOpen")?;
-        Ok(Self { conn })
+        let dev = Self { conn, profile };
+        let info = dev.info()?;
+        if info.nic_kind != profile.kind {
+            bail!(
+                "{} reports nic_kind {} but the {} profile expects {}",
+                profile.service_name,
+                info.nic_kind,
+                profile.label,
+                profile.kind
+            );
+        }
+        Ok(dev)
+    }
+
+    pub fn profile(&self) -> &'static NicProfile {
+        self.profile
     }
 
     fn call(
@@ -164,7 +219,7 @@ impl Device {
         Ok(buf)
     }
 
-    /// Load the EAV clock; returns the immediate readback.
+    /// Load the NIC clock; returns the immediate readback.
     pub fn set_clock(&self, ns: u64) -> Result<u64> {
         let mut out = [0u64; 1];
         self.call(sel::SET_CLOCK, &[ns], &[], &mut out, None, "SetClock")?;
@@ -173,8 +228,12 @@ impl Device {
 
     /// Program the frequency correction; returns the raw register value written.
     pub fn adj_freq(&self, ppb: i64) -> Result<u32> {
-        if ppb.abs() > abi::ADJ_FREQ_MAX_PPB {
-            bail!("|ppb| must be <= {}", abi::ADJ_FREQ_MAX_PPB);
+        if ppb.abs() > self.profile.max_ppb {
+            bail!(
+                "|ppb| must be <= {} on the {}",
+                self.profile.max_ppb,
+                self.profile.label
+            );
         }
         let mut out = [0u64; 1];
         self.call(sel::ADJ_FREQ, &[ppb as u64], &[], &mut out, None, "AdjFreq")?;
@@ -253,7 +312,7 @@ impl Device {
     }
 
     pub fn read_reg32(&self, off: u32) -> Result<u32> {
-        if off >= abi::REG_READ_LIMIT || off & 3 != 0 {
+        if off >= self.profile.reg_read_limit || off & 3 != 0 {
             bail!("register offset 0x{off:x} out of range or unaligned");
         }
         let mut out = [0u64; 1];

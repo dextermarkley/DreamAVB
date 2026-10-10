@@ -1,9 +1,13 @@
-//! Rust mirror of `driver/AVBBcmShared.h` (user-client ABI version 1).
+//! Rust mirror of `driver/AVBShared.h` (user-client ABI version 2).
 //!
 //! Keep in lock-step with the C header: the tests at the bottom assert the
 //! same sizes and field offsets the C++ side `static_assert`s.
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
+
+/// `AvbInfo::nic_kind` values.
+pub const NIC_BCM57762: u32 = 1;
+pub const NIC_I210: u32 = 2;
 
 /// External method selectors.
 pub mod sel {
@@ -26,7 +30,8 @@ pub const RX_BATCH_MAX: usize = 24;
 pub const RX_COPY_BYTES: usize = 128;
 pub const FRAME_MIN_LEN: usize = 60;
 pub const FRAME_MAX_LEN: usize = 1514;
-pub const REG_READ_LIMIT: u32 = 0x10000;
+/// Maximum over all NICs; each NIC profile carries its own tighter limit.
+pub const REG_READ_LIMIT: u32 = 0x20000;
 
 pub const INIT_FLAG_PROMISC: u64 = 1 << 0;
 pub const INIT_FLAG_RX_PTP_V2_L2: u64 = 1 << 1;
@@ -68,6 +73,10 @@ pub fn fault_name(fault: u32) -> &'static str {
         8 => "MDIO busy timeout",
         9 => "NIC SRAM signature missing",
         10 => "TX stall",
+        11 => "GIO master-disable timeout",
+        12 => "reset / config-done timeout",
+        13 => "SW/FW semaphore timeout",
+        14 => "queue enable/disable timeout",
         _ => "unknown",
     }
 }
@@ -88,9 +97,12 @@ pub struct AvbInfo {
     pub abi_version: u32,
     pub vendor_device: u32,
     pub subsys: u32,
-    pub asic_rev: u32,
-    pub misc_host_ctrl: u32,
-    pub grc_mode: u32,
+    /// BCM: ASIC rev (cfg 0xfc). I210: PCI revision ID.
+    pub hw_rev: u32,
+    /// BCM: MISC_HOST_CTRL. I210: CTRL.
+    pub ctrl_a: u32,
+    /// BCM: GRC_MODE. I210: STATUS.
+    pub ctrl_b: u32,
     pub stage: u32,
     pub fault: u32,
     pub flags: u32,
@@ -98,12 +110,16 @@ pub struct AvbInfo {
     pub pad: [u8; 2],
     pub tb_numer: u32,
     pub tb_denom: u32,
+    pub nic_kind: u32,
+    /// BCM: EAV_REF_CLK_CORRECT_CTL. I210: TIMINCA.
+    pub clock_ctl: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ClockSample {
     pub mach_before: u64,
+    /// NIC clock ns (EAV on BCM, SYSTIM sec*1e9+ns on I210).
     pub eav_ns: u64,
     pub mach_after: u64,
 }
@@ -173,7 +189,7 @@ mod tests {
 
     #[test]
     fn sizes_match_c_static_asserts() {
-        assert_eq!(size_of::<AvbInfo>(), 52);
+        assert_eq!(size_of::<AvbInfo>(), 60);
         assert_eq!(size_of::<ClockSample>(), 24);
         assert_eq!(size_of::<RxEntry>(), 152);
         assert_eq!(size_of::<RxBatch>(), 3656);
@@ -186,15 +202,17 @@ mod tests {
         assert_eq!(offset_of!(AvbInfo, abi_version), 0);
         assert_eq!(offset_of!(AvbInfo, vendor_device), 4);
         assert_eq!(offset_of!(AvbInfo, subsys), 8);
-        assert_eq!(offset_of!(AvbInfo, asic_rev), 12);
-        assert_eq!(offset_of!(AvbInfo, misc_host_ctrl), 16);
-        assert_eq!(offset_of!(AvbInfo, grc_mode), 20);
+        assert_eq!(offset_of!(AvbInfo, hw_rev), 12);
+        assert_eq!(offset_of!(AvbInfo, ctrl_a), 16);
+        assert_eq!(offset_of!(AvbInfo, ctrl_b), 20);
         assert_eq!(offset_of!(AvbInfo, stage), 24);
         assert_eq!(offset_of!(AvbInfo, fault), 28);
         assert_eq!(offset_of!(AvbInfo, flags), 32);
         assert_eq!(offset_of!(AvbInfo, mac), 36);
         assert_eq!(offset_of!(AvbInfo, tb_numer), 44);
         assert_eq!(offset_of!(AvbInfo, tb_denom), 48);
+        assert_eq!(offset_of!(AvbInfo, nic_kind), 52);
+        assert_eq!(offset_of!(AvbInfo, clock_ctl), 56);
         assert_eq!(offset_of!(ClockSample, mach_before), 0);
         assert_eq!(offset_of!(ClockSample, eav_ns), 8);
         assert_eq!(offset_of!(ClockSample, mach_after), 16);

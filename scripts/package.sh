@@ -12,7 +12,10 @@ set -euo pipefail
 ROOT="$(/bin/realpath "$(/usr/bin/dirname "$0")/..")"
 SCRATCH="$ROOT/.agents/tmp"
 BUILD="$ROOT/build"
-DEXT_ID="com.avbaudio.installer.bcm57762"
+# Only the I210 dext is embedded and signed. The BCM dext is still built as a
+# compile-regression check but never packaged.
+DEXT_ID="com.avbaudio.installer.i210"
+DEXT_ENT="$ROOT/driver/AVBI210Driver/AVBI210Driver.entitlements"
 APP="$BUILD/AVBInstaller.app"
 DEXT_BUILT="$BUILD/driver/Debug-driverkit/$DEXT_ID.dext"
 
@@ -53,10 +56,12 @@ if [ "$IDENTITY" != "-" ]; then
     echo "team ID (cert OU): ${TEAM:-unknown}"
 fi
 
-echo "== build dext"
-/usr/bin/xcodebuild -project "$ROOT/driver/AVBBcmDriver.xcodeproj" -target AVBBcmDriver \
-    -configuration Debug -sdk driverkit \
-    SYMROOT="$BUILD/driver" OBJROOT="$BUILD/driver/obj" CODE_SIGNING_ALLOWED=NO build
+for proj in AVBI210Driver AVBBcmDriver; do
+    echo "== build dext $proj"
+    /usr/bin/xcodebuild -project "$ROOT/driver/$proj.xcodeproj" -target "$proj" \
+        -configuration Debug -sdk driverkit \
+        SYMROOT="$BUILD/driver" OBJROOT="$BUILD/driver/obj" CODE_SIGNING_ALLOWED=NO build
+done
 
 echo "== build Rust (release)"
 cargo build --manifest-path "$ROOT/Cargo.toml" --workspace --release --locked
@@ -81,6 +86,15 @@ cp "$ROOT/target/release/avb-probe" "$APP/Contents/MacOS/avb-probe"
 DEXT="$APP/Contents/Library/SystemExtensions/$DEXT_ID.dext"
 cp -R "$DEXT_BUILT" "$DEXT"
 
+# DriverKit refuses to exec a non-arm64e platform binary (Phase 0 lesson).
+DEXT_EXE="$DEXT/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$DEXT/Info.plist")"
+ARCHS="$(/usr/bin/lipo -archs "$DEXT_EXE")"
+if [ "$ARCHS" != "arm64e" ]; then
+    echo "dext executable archs are '$ARCHS', expected exactly arm64e" >&2
+    exit 1
+fi
+echo "dext executable archs: $ARCHS"
+
 # sysextd only replaces an installed extension when the version increases.
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$DEXT/Info.plist"
@@ -89,13 +103,13 @@ cp -R "$DEXT_BUILT" "$DEXT"
 
 for p in "$APP/Contents/Info.plist" "$DEXT/Info.plist" \
          "$ROOT/packaging/installer.entitlements" "$ROOT/packaging/probe.entitlements" \
-         "$ROOT/driver/AVBBcmDriver/AVBBcmDriver.entitlements"; do
+         "$DEXT_ENT"; do
     /usr/bin/plutil -lint "$p"
 done
 
 echo "== sign (inside-out)"
 /usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none \
-    --entitlements "$ROOT/driver/AVBBcmDriver/AVBBcmDriver.entitlements" "$DEXT"
+    --entitlements "$DEXT_ENT" "$DEXT"
 /usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none -o runtime \
     --entitlements "$ROOT/packaging/probe.entitlements" "$APP/Contents/MacOS/avb-probe"
 /usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none -o runtime \
@@ -107,4 +121,8 @@ for item in "$DEXT" "$APP/Contents/MacOS/avb-probe" "$APP"; do
     echo "-- entitlements: $item"
     /usr/bin/codesign -d --entitlements - "$item"
 done
+echo "-- dext IOKitPersonalities"
+/usr/bin/plutil -extract IOKitPersonalities xml1 -o - "$DEXT/Info.plist" | /usr/bin/plutil -p -
+echo "-- embedded system extensions"
+/bin/ls "$APP/Contents/Library/SystemExtensions"
 echo "packaged: $APP"

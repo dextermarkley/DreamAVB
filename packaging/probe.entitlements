@@ -4,6 +4,7 @@
 <dict>
 	<key>com.apple.developer.driverkit.userclient-access</key>
 	<array>
+		<string>com.avbaudio.installer.i210</string>
 		<string>com.avbaudio.installer.bcm57762</string>
 	</array>
 </dict>

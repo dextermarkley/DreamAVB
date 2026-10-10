@@ -1,11 +1,12 @@
-//! avb-probe: Phase 0 hardware gates for the AVBBcmDriver dext.
+//! avb-probe: Phase 0 / 0b hardware gates for the AVB dexts (AVBI210Driver,
+//! AVBBcmDriver). `--nic auto|i210|bcm` picks the service (auto: I210 first).
 //!
 //!   info / regs           decode AvbInfo, read-only register dump
-//!   clock                 G2a: EAV clock ticks, rate vs mach_absolute_time
-//!   adjfreq               G2b: frequency correction sign and magnitude
+//!   clock                 G2a: NIC clock ticks, rate vs mach_absolute_time
+//!   adjfreq               G2b: frequency adjust sign and magnitude
 //!   datapath up|down      Stage B bring-up / shutdown
-//!   rx-ptp                G3: RX PTP latch on the 16R's gPTP event frames
-//!   pdelay                G4: TX latch + peer-delay sanity
+//!   rx-ptp                G3: RX PTP timestamps on the 16R's gPTP event frames
+//!   pdelay                G4: TX timestamps + peer delay and rate ratio
 //!   all                   the whole sequence, with a JSON report
 //!
 //! None of these claims "works" by itself: the printed numbers are the
@@ -21,17 +22,21 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use avb_probe::abi::{self, AvbInfo, ClockSample};
-use avb_probe::iokit::Device;
+use avb_probe::iokit::{Device, NicSelect};
+use avb_probe::nic::NicProfile;
 use avb_probe::ptp::{self, MsgType, PortIdentity};
+use avb_probe::report;
 use avb_probe::stats::{self, ClockStats, Timebase};
-use avb_probe::{freq, report};
 
 #[derive(Parser)]
 #[command(
     name = "avb-probe",
-    about = "Phase 0 probe for the BCM57762 AVB dext (EAV clock, RX/TX PTP latches)"
+    about = "Phase 0 probe for the AVB dexts (NIC clock, frequency adjust, RX/TX PTP timestamps)"
 )]
 struct Cli {
+    /// Which dext to talk to: auto (AVBI210Driver, then AVBBcmDriver), i210 or bcm.
+    #[arg(long, global = true, default_value = "auto", value_parser = ["auto", "i210", "bcm"])]
+    nic: String,
     /// Append machine-readable results to this JSON file.
     #[arg(long, global = true)]
     json: Option<PathBuf>,
@@ -45,7 +50,7 @@ enum Cmd {
     Info,
     /// Read-only dump of the Phase 0 registers.
     Regs,
-    /// G2a: sample the EAV clock and regress it against mach_absolute_time.
+    /// G2a: sample the NIC clock and regress it against mach_absolute_time.
     Clock {
         #[arg(long, default_value_t = 10.0)]
         seconds: f64,
@@ -73,10 +78,10 @@ enum Cmd {
     },
     /// G4: send Pdelay_Req with TX timestamps and compute the link delay.
     Pdelay {
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 30)]
         count: u32,
     },
-    /// info, clock 10 s, adjfreq +-100000 ppb, datapath up, rx-ptp 10 s, pdelay 5, datapath down.
+    /// info, clock 10 s, adjfreq +-100000 ppb, datapath up, rx-ptp 10 s, pdelay 30, datapath down.
     All,
 }
 
@@ -153,62 +158,121 @@ fn fmt_mac(m: &[u8; 6]) -> String {
 
 #[derive(Serialize)]
 struct InfoRecord {
+    nic: String,
+    nic_kind: u32,
+    service: String,
     vendor_device: String,
     subsys: String,
-    asic_rev: String,
-    misc_host_ctrl: String,
-    grc_mode: String,
-    time_sync_enable: bool,
+    hw_rev: String,
+    ctrl_a_name: String,
+    ctrl_a: String,
+    ctrl_b_name: String,
+    ctrl_b: String,
+    clock_ctl_name: String,
+    clock_ctl: String,
     stage: String,
     fault: String,
     flags: u32,
-    ape: bool,
-    asf: bool,
     link_up: bool,
     gbe_full_duplex: bool,
-    sram_signature_ok: bool,
+    /// BCM only.
+    time_sync_enable: Option<bool>,
+    ape: Option<bool>,
+    asf: Option<bool>,
+    sram_signature_ok: Option<bool>,
+    /// I210 only, decoded from STATUS.
+    status_link_up: Option<bool>,
+    status_speed_mbps: Option<u32>,
+    status_full_duplex: Option<bool>,
     mac: String,
     timebase: Timebase,
 }
 
+/// I210 STATUS: FD bit 0, LU bit 1, SPEED 7:6 (00 10, 01 100, 1x 1000 Mb/s).
+fn i210_link_from_status(status: u32) -> (bool, u32, bool) {
+    let speed = match (status >> 6) & 3 {
+        0 => 10,
+        1 => 100,
+        _ => 1000,
+    };
+    (status & 2 != 0, speed, status & 1 != 0)
+}
+
 fn cmd_info(dev: &Device, json: Option<&Path>) -> Result<AvbInfo> {
+    let p = dev.profile();
     let i = dev.info()?;
+    let is_bcm = p.kind == abi::NIC_BCM57762;
+    let is_i210 = p.kind == abi::NIC_I210;
+    let i210_link = is_i210.then(|| i210_link_from_status(i.ctrl_b));
     let rec = InfoRecord {
+        nic: p.label.into(),
+        nic_kind: i.nic_kind,
+        service: p.service_name.into(),
         vendor_device: format!("0x{:08x}", i.vendor_device),
         subsys: format!("0x{:08x}", i.subsys),
-        asic_rev: format!("0x{:08x}", i.asic_rev),
-        misc_host_ctrl: format!("0x{:08x}", i.misc_host_ctrl),
-        grc_mode: format!("0x{:08x}", i.grc_mode),
-        time_sync_enable: i.grc_mode & 0x0008_0000 != 0,
+        hw_rev: format!("0x{:08x}", i.hw_rev),
+        ctrl_a_name: p.ctrl_a_name.into(),
+        ctrl_a: format!("0x{:08x}", i.ctrl_a),
+        ctrl_b_name: p.ctrl_b_name.into(),
+        ctrl_b: format!("0x{:08x}", i.ctrl_b),
+        clock_ctl_name: p.clock_ctl_name.into(),
+        clock_ctl: format!("0x{:08x}", i.clock_ctl),
         stage: abi::stage_name(i.stage).into(),
         fault: format!("{} ({})", i.fault, abi::fault_name(i.fault)),
         flags: i.flags,
-        ape: i.flags & abi::FLAG_APE != 0,
-        asf: i.flags & abi::FLAG_ASF != 0,
         link_up: i.flags & abi::FLAG_LINK_UP != 0,
         gbe_full_duplex: i.flags & abi::FLAG_1000FD != 0,
-        sram_signature_ok: i.flags & abi::FLAG_SIG_OK != 0,
+        time_sync_enable: is_bcm.then_some(i.ctrl_b & 0x0008_0000 != 0),
+        ape: is_bcm.then_some(i.flags & abi::FLAG_APE != 0),
+        asf: is_bcm.then_some(i.flags & abi::FLAG_ASF != 0),
+        sram_signature_ok: is_bcm.then_some(i.flags & abi::FLAG_SIG_OK != 0),
+        status_link_up: i210_link.map(|l| l.0),
+        status_speed_mbps: i210_link.map(|l| l.1),
+        status_full_duplex: i210_link.map(|l| l.2),
         mac: fmt_mac(&i.mac),
         timebase: timebase(&i),
     };
     println!(
+        "nic            {} (nic_kind {}, service {})",
+        rec.nic, rec.nic_kind, rec.service
+    );
+    println!(
         "vendor:device  {}   subsystem {}",
         rec.vendor_device, rec.subsys
     );
+    if is_bcm {
+        println!(
+            "hw_rev         {}   (57766-class: {})",
+            rec.hw_rev,
+            (i.hw_rev >> 12) == 0x57766
+        );
+    } else {
+        println!("hw_rev         {}   (PCI revision ID)", rec.hw_rev);
+    }
     println!(
-        "asic_rev       {}   (57766-class: {})",
-        rec.asic_rev,
-        (i.asic_rev >> 12) == 0x57766
-    );
-    println!(
-        "misc_host_ctrl {}   grc_mode {} (TIME_SYNC_ENABLE {})",
-        rec.misc_host_ctrl, rec.grc_mode, rec.time_sync_enable
+        "{:<14} {}   {} {}   {} {}",
+        rec.ctrl_a_name, rec.ctrl_a, rec.ctrl_b_name, rec.ctrl_b, rec.clock_ctl_name, rec.clock_ctl
     );
     println!("stage          {}   fault {}", rec.stage, rec.fault);
     println!(
-        "flags          0x{:x}  ape={} asf={} link_up={} 1000FD={} sram_sig={}",
-        rec.flags, rec.ape, rec.asf, rec.link_up, rec.gbe_full_duplex, rec.sram_signature_ok
+        "flags          0x{:x}  link_up={} 1000FD={}",
+        rec.flags, rec.link_up, rec.gbe_full_duplex
     );
+    if is_bcm {
+        println!(
+            "bcm            TIME_SYNC_ENABLE={} ape={} asf={} sram_sig={}",
+            i.ctrl_b & 0x0008_0000 != 0,
+            i.flags & abi::FLAG_APE != 0,
+            i.flags & abi::FLAG_ASF != 0,
+            i.flags & abi::FLAG_SIG_OK != 0
+        );
+    }
+    if let Some((up, speed, fd)) = i210_link {
+        println!(
+            "STATUS link    up={up} speed={speed} Mb/s {}",
+            if fd { "full" } else { "half" }
+        );
+    }
     println!(
         "mac            {}   timebase {}/{}",
         rec.mac, rec.timebase.numer, rec.timebase.denom
@@ -217,27 +281,11 @@ fn cmd_info(dev: &Device, json: Option<&Path>) -> Result<AvbInfo> {
     Ok(i)
 }
 
-const REG_DUMP: &[(&str, u32)] = &[
-    ("MISC_HOST_CTRL", 0x0068),
-    ("GRC_MODE", 0x6800),
-    ("EAV_REF_CLCK_CTL", 0x6908),
-    ("EAV_REF_CLCK_LSB", 0x6900),
-    ("EAV_REF_CLCK_MSB", 0x6904),
-    ("EAV_REF_CLK_CORRECT_CTL", 0x6928),
-    ("RX_PTP_CTL", 0x06c8),
-    ("TX_TSTAMP_LSB", 0x05c0),
-    ("TX_TSTAMP_MSB", 0x05c4),
-    ("RX_TSTAMP_LSB", 0x06b0),
-    ("RX_TSTAMP_MSB", 0x06b4),
-    ("MAC_MODE", 0x0400),
-    ("MAC_STATUS", 0x0404),
-];
-
 fn cmd_regs(dev: &Device, json: Option<&Path>) -> Result<()> {
     let mut rec = serde_json::Map::new();
-    for (name, off) in REG_DUMP {
+    for (name, off) in dev.profile().reg_dump {
         let v = dev.read_reg32(*off)?;
-        println!("{name:<24} 0x{off:04x} = 0x{v:08x}");
+        println!("{name:<24} 0x{off:05x} = 0x{v:08x}");
         rec.insert((*name).into(), format!("0x{v:08x}").into());
     }
     emit(json, "regs", &rec)
@@ -305,7 +353,7 @@ fn cmd_clock(
     print_clock_stats("clock", &s);
     if let (Some(a), Some(b)) = (samples.first(), samples.last()) {
         println!(
-            "eav advanced {} ns over {:.0} ns of host time",
+            "nic clock advanced {} ns over {:.0} ns of host time",
             b.eav_ns as i128 - a.eav_ns as i128,
             tb.mach_delta_ns(a.mach_before, b.mach_before)
         );
@@ -344,8 +392,9 @@ fn cmd_adjfreq(
     seconds: f64,
     interval_ms: u64,
 ) -> Result<()> {
-    if ppb.abs() > abi::ADJ_FREQ_MAX_PPB {
-        bail!("|ppb| must be <= {}", abi::ADJ_FREQ_MAX_PPB);
+    let prof: &NicProfile = dev.profile();
+    if ppb.abs() > prof.max_ppb {
+        bail!("|ppb| must be <= {} on the {}", prof.max_ppb, prof.label);
     }
     let info = dev.info()?;
     let tb = timebase(&info);
@@ -363,10 +412,10 @@ fn cmd_adjfreq(
                 break;
             }
             let reg = dev.adj_freq(p)?;
-            if reg != freq::correction_from_ppb(p) {
+            if reg != (prof.correction_from_ppb)(p) {
                 println!(
                     "warning: dext wrote 0x{reg:08x}, probe expected 0x{:08x}",
-                    freq::correction_from_ppb(p)
+                    (prof.correction_from_ppb)(p)
                 );
             }
             let s = stats::clock_stats(&sample_clock(dev, seconds, interval_ms)?, tb);
@@ -375,13 +424,13 @@ fn cmd_adjfreq(
             if p == 0 && baseline.is_none() {
                 baseline = measured;
             }
-            let expected = freq::expected_rate_ppb(reg);
+            let expected = (prof.expected_rate_ppb)(reg);
             let delta = match (measured, baseline) {
                 (Some(m), Some(b)) => Some(m - b),
                 _ => None,
             };
             let scale = delta
-                .map(|d| freq::scale_factor(d, expected))
+                .map(|d| avb_probe::freq::scale_factor(d, expected))
                 .filter(|x| x.is_finite());
             if p != 0 {
                 println!(
@@ -574,14 +623,55 @@ struct PdelayExchange {
     t2: Option<u64>,
     t3: Option<u64>,
     t4: Option<u64>,
+    corr_resp_ns: Option<f64>,
+    corr_fu_ns: Option<f64>,
+    /// ((t4 - t1) - (t3 - t2) - corrections) / 2.
     link_delay_ns: Option<f64>,
+    /// Same with t1 + tx_latency and t4 - rx_latency (NIC profile).
+    link_delay_comp_ns: Option<f64>,
+    /// (t3 - t3_prev) / (t4 - t4_prev) against the previous complete exchange.
+    neighbor_rate_ratio: Option<f64>,
+}
+
+#[derive(Serialize, Default)]
+struct DelaySummary {
+    n: usize,
+    mean: Option<f64>,
+    stddev: Option<f64>,
+    median: Option<f64>,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+fn summarize(v: &[f64]) -> DelaySummary {
+    let ms = stats::mean_stddev(v);
+    DelaySummary {
+        n: v.len(),
+        mean: ms.map(|m| m.0).or_else(|| v.first().copied()),
+        stddev: ms.map(|m| m.1),
+        median: (!v.is_empty()).then(|| stats::median(v)),
+        min: v.iter().copied().reduce(f64::min),
+        max: v.iter().copied().reduce(f64::max),
+    }
+}
+
+fn fmt_opt(v: Option<f64>, prec: usize) -> String {
+    v.map_or("n/a".into(), |x| format!("{x:.prec$}"))
 }
 
 #[derive(Serialize)]
 struct PdelayRecord {
+    nic: String,
+    tx_latency_ns: i64,
+    rx_latency_ns: i64,
     exchanges: Vec<PdelayExchange>,
     tx_ok: usize,
+    complete: usize,
     median_link_delay_ns: Option<f64>,
+    link_delay_raw: DelaySummary,
+    link_delay_compensated: DelaySummary,
+    nrr_mean: Option<f64>,
+    nrr_stddev: Option<f64>,
 }
 
 /// EAV value at host time `mach`, extrapolated from a nearby sample at rate 1.
@@ -599,8 +689,10 @@ fn cmd_pdelay(dev: &Device, json: Option<&Path>, count: u32) -> Result<()> {
             abi::stage_name(info.stage)
         );
     }
+    let prof = dev.profile();
     let me = PortIdentity::from_mac(info.mac, 1);
     let mut exchanges = Vec::new();
+    let mut prev_t3t4: Option<(u64, u64)> = None;
     for i in 0..count {
         if interrupted() {
             break;
@@ -667,7 +759,23 @@ fn cmd_pdelay(dev: &Device, json: Option<&Path>, count: u32) -> Result<()> {
             sleep(Duration::from_millis(2));
         }
         if let (Some(t1), Some(t2), Some(t3), Some(t4)) = (x.t1, x.t2, x.t3, x.t4) {
+            x.corr_resp_ns = Some(corr.0);
+            x.corr_fu_ns = Some(corr.1);
             x.link_delay_ns = Some(ptp::link_delay_ns(t1, t2, t3, t4, corr.0, corr.1));
+            x.link_delay_comp_ns = Some(ptp::compensated_link_delay_ns(
+                t1,
+                t2,
+                t3,
+                t4,
+                corr.0,
+                corr.1,
+                prof.tx_latency_1000_ns,
+                prof.rx_latency_1000_ns,
+            ));
+            if let Some(prev) = prev_t3t4 {
+                x.neighbor_rate_ratio = ptp::neighbor_rate_ratio(prev, (t3, t4));
+            }
+            prev_t3t4 = Some((t3, t4));
         }
         println!(
             "seq={seq:#06x} tx={} t1={} bracketed={} t2={} t3={} t4={} link_delay={}",
@@ -679,26 +787,75 @@ fn cmd_pdelay(dev: &Device, json: Option<&Path>, count: u32) -> Result<()> {
             x.t4.map_or("-".into(), |v| v.to_string()),
             x.link_delay_ns.map_or("-".into(), |v| format!("{v:.1} ns"))
         );
+        if let Some(c) = x.link_delay_comp_ns {
+            println!(
+                "  compensated link_delay={c:.1} ns  nrr={}",
+                x.neighbor_rate_ratio.map_or("-".into(), |r| format!(
+                    "{r:.9} ({:+.3} ppm)",
+                    (r - 1.0) * 1e6
+                ))
+            );
+        }
         exchanges.push(x);
         nap(Duration::from_millis(1000));
     }
-    let delays: Vec<f64> = exchanges.iter().filter_map(|x| x.link_delay_ns).collect();
-    let median = (!delays.is_empty()).then(|| stats::median(&delays));
+    let raw: Vec<f64> = exchanges.iter().filter_map(|x| x.link_delay_ns).collect();
+    let comp: Vec<f64> = exchanges
+        .iter()
+        .filter_map(|x| x.link_delay_comp_ns)
+        .collect();
+    let nrr: Vec<f64> = exchanges
+        .iter()
+        .filter_map(|x| x.neighbor_rate_ratio)
+        .collect();
     let tx_ok = exchanges.iter().filter(|x| x.t1.is_some()).count();
+    let raw_s = summarize(&raw);
+    let comp_s = summarize(&comp);
+    let nrr_ms = stats::mean_stddev(&nrr);
     println!(
-        "summary: {tx_ok}/{} TX timestamps ok, median link delay {}",
+        "summary: {tx_ok}/{} TX timestamps ok, {} complete exchanges",
         exchanges.len(),
-        median.map_or("n/a (no complete exchanges)".into(), |m| format!(
-            "{m:.1} ns"
-        ))
+        raw.len()
+    );
+    for (label, d) in [("raw", &raw_s), ("compensated", &comp_s)] {
+        println!(
+            "  link delay {label:<12} mean {} sd {} median {} min {} max {} ns",
+            fmt_opt(d.mean, 1),
+            fmt_opt(d.stddev, 1),
+            fmt_opt(d.median, 1),
+            fmt_opt(d.min, 1),
+            fmt_opt(d.max, 1)
+        );
+    }
+    println!(
+        "  compensation: tx {} ns, rx {} ns ({})",
+        prof.tx_latency_1000_ns, prof.rx_latency_1000_ns, prof.label
+    );
+    println!(
+        "  neighbor rate ratio n={} mean {} sd {}",
+        nrr.len(),
+        nrr_ms.map_or("n/a".into(), |m| format!(
+            "{:.9} ({:+.3} ppm)",
+            m.0,
+            (m.0 - 1.0) * 1e6
+        )),
+        nrr_ms.map_or("n/a".into(), |m| format!("{:.3} ppm", m.1 * 1e6))
     );
     emit(
         json,
         "pdelay",
         &PdelayRecord {
-            exchanges,
+            nic: prof.label.into(),
+            tx_latency_ns: prof.tx_latency_1000_ns,
+            rx_latency_ns: prof.rx_latency_1000_ns,
             tx_ok,
-            median_link_delay_ns: median,
+            complete: raw.len(),
+            median_link_delay_ns: raw_s.median,
+            link_delay_raw: raw_s,
+            link_delay_compensated: comp_s,
+            nrr_mean: nrr_ms.map(|m| m.0),
+            nrr_stddev: nrr_ms.map(|m| m.1),
+            exchanges,
         },
     )
 }
@@ -710,7 +867,7 @@ fn cmd_all(dev: &Device, json: Option<&Path>) -> Result<()> {
     cmd_clock(dev, json, 10.0, 100)?;
     cmd_adjfreq(dev, json, 100_000, 10.0, 100)?;
     cmd_datapath(dev, json, true)?;
-    let r = cmd_rx_ptp(dev, json, 10.0).and_then(|_| cmd_pdelay(dev, json, 5));
+    let r = cmd_rx_ptp(dev, json, 10.0).and_then(|_| cmd_pdelay(dev, json, 30));
     // Always try to take the datapath down again.
     let down = cmd_datapath(dev, json, false);
     r?;
@@ -720,7 +877,12 @@ fn cmd_all(dev: &Device, json: Option<&Path>) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     install_sigint();
-    let dev = Device::open()?;
+    let sel = match cli.nic.as_str() {
+        "i210" => NicSelect::I210,
+        "bcm" => NicSelect::Bcm,
+        _ => NicSelect::Auto,
+    };
+    let dev = Device::open(sel)?;
     let json = cli.json.as_deref();
     match cli.cmd {
         Cmd::Info => cmd_info(&dev, json).map(|_| ()),

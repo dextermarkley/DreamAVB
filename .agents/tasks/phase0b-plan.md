@@ -517,3 +517,20 @@ Hardware-step procedure:
 ## Deviations
 
 (Implementer: record any deviation from the decisions above here, with the datasheet section or concrete failure that forced it.)
+
+Checked against 333016 rev 3.7 (public PDF). Where the plan differed, the datasheet was followed:
+
+1. TIMINCA (8.15.11): Incvalue is bits 30:0, not 23:0, and INC_TIME = 8 ns ± Incvalue·2⁻³² ns, so TIMINCA = 0 means the nominal 8 ns per tick. The dext still caps Incvalue at 24 bits (|ppb| ≤ 488 281), so the golden table is unchanged.
+2. ICR/IMC (8.8): the primary offsets are ICR 0x1500 and IMC 0x150C. 0x00C0/0x00D8 are documented aliases. The dext uses the primary ones, and both ICR offsets are on the read denylist.
+3. MDIC (8.2.4): bits 25:21 are reserved on the I210, and the PHY address comes from MDICNFG (default = internal PHY). The frames therefore carry no PHYADD, and `mdicReadFrame/WriteFrame` take only the register.
+4. TCTL (8.12.1): bits 21:12 are BST (back-off slot time, default 0x40), not COLD. `tctlValue()` = EN | PSP | CT 0xF | BST 0x40 = 0x000400FA.
+5. RX writeback (7.1.4.2.2): the extended error field is 31:20, with RXE at bit 31 (error bit 11). Only RXE is treated as a frame error, since L4E/IPE don't apply to L2 PTP.
+6. Reset completion (4.3.1 note): the datasheet requires EEC.Auto_RD (0x12010 bit 9) and STATUS.PF_RST_DONE after a ≥ 3 ms wait. The dext polls Auto_RD, PF_RST_DONE and EEMNGCTL.CFG_DONE0 together (≤ 100 ms) after a 10 ms sleep.
+7. Shutdown order: 4.5.9.2 says the RX path can only be disabled after all RX queues are. The dext clears RXDCTL0.ENABLE (and polls it) before clearing RCTL.RXEN. Per 4.5.10.1, TX waits up to 10 ms for TDH == TDT before clearing TXDCTL0.ENABLE.
+8. Timestamp latencies: 333016 7.8.3.1 characterises latency only at 100 Mb/s (Table 7-62: TX 984–1024 ns, RX 2148–2228 ns). The 1000 Mb/s values TX 178 / RX 448 ns are not in the datasheet. They are the Intel-published constants Linux igb uses (its 100 Mb/s pair, 1024/2213, matches Table 7-62). Treat them as unverified until G4.
+9. RCTL also keeps DPF (bit 22, power-on default 1), so pause frames stay discarded after RCTL is rewritten.
+10. Read denylist extended with other side-effect reads from 8.x: EICR 0x1580 and TSICR 0xB66C (read-to-clear), SWSM 0x5B50 (a read sets SMBI), AUXSTMPL0..AUXSTMPH1 0xB65C–0xB668 (latch release), and PEIND 0x1084, RR2DCDELAY 0x5BF4, BMTPDC/B2OSPC/O2BGPTC 0x8FDC–0x8FE4 (RC).
+11. ETQF[3] sets only EType | Filter enable | 1588 time stamp. Queue Enable (bit 31) stays 0: no steering is needed with one queue.
+12. SRRCTL0 keeps BSIZEHEADER at its default 4. It's ignored for DESCTYPE 001b, but writing the default avoids changing a field the plan didn't name.
+13. TX timestamp descriptor bit: bit 19 is `MAC.2STEP_1588` (7.2.2.3.3), which latches into TXSTMPL/H. This is the plan's "MAC_TSTAMP".
+14. Stage A also reads RAL0/RAH0 for the MAC (read only), as the plan lists, and flushes posted writes by reading STATUS, because IMC/EIMC are write-only.
