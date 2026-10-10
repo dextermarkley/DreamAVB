@@ -1,6 +1,6 @@
 # Phase 1a Design: AVB listener bridge (StudioLive 16R → Mac over the Intel I210)
 
-Branch `phase1a-listener` (from 4035832). Never push. Requirements: `.agents/tasks/phase1a-requirements.md` (IDs below refer to it). Revision 3: revision 2 addressed every pass-1 finding (1 HIGH, 9 MEDIUM, 9 NIT; §18). Revision 3 addressed every pass-2 finding (0 HIGH, 4 MEDIUM, 12 NIT; §19). Revision 4 addresses every pass-3 finding of `.agents/tasks/phase1a-design-review.md` (0 HIGH, 3 MEDIUM, 5 NIT); responses are in §20.
+Branch `phase1a-listener` (from 4035832). Never push. Requirements: `.agents/tasks/phase1a-requirements.md` (IDs below refer to it). Revision 3: revision 2 addressed every pass-1 finding (1 HIGH, 9 MEDIUM, 9 NIT; §18). Revision 3 addressed every pass-2 finding (0 HIGH, 4 MEDIUM, 12 NIT; §19). Revision 4 addressed every pass-3 finding (0 HIGH, 3 MEDIUM, 5 NIT; §20). Revision 5 addresses every pass-4 finding of `.agents/tasks/phase1a-design-review.md` (0 HIGH, 2 MEDIUM, 6 NIT); responses are in §21.
 
 ## 0. Overview
 
@@ -123,6 +123,9 @@ enum AvbRxClass : uint8_t {
 #define AVB_RXF_VLAN_FRAME (1u << 1)  // set iff data[12..14] == 0x8100 (tag present in data[])
 #define AVB_RXF_VLAN_DESC  (1u << 2)  // set iff descriptor VP set AND no in-buffer 0x8100 at offset 12;
                                       // vlan_tci then holds the tag. Never set together with VLAN_FRAME
+#define AVB_RXF_TS_STEP_AMBIG (1u << 3) // harvested inside a SYSTIM step's settling window (§3.6):
+                                      // hw_ts_ns may belong to either timebase; never use it for timing
+#define AVB_STEP_SETTLE_NS 1000000u   // settling window after a SYSTIM write (§3.6)
 
 struct AvbRxSlot {              // 2048 B
     uint64_t hw_ts_ns;          //  0 SYSTIM ns of reception (if AVB_RXF_TS_HW)
@@ -135,7 +138,8 @@ struct AvbRxSlot {              // 2048 B
     uint8_t  cls;               // 34 AvbRxClass
     uint8_t  pad0;              // 35
     uint32_t desc_len;          // 36 raw PKT_LEN (includes 16 B TS header if TSIP)
-    uint8_t  pad1[24];          // 40
+    uint32_t clock_gen;         // 40 dext clock generation (ivars->clockGen) at harvest
+    uint8_t  pad1[20];          // 44
     uint8_t  data[AVB_RX_SLOT_DATA_MAX]; // 64
 };
 
@@ -198,7 +202,8 @@ struct AvbShmHeader {           // 1024 B at offset 0 of kAvbMemRx
     uint64_t audio_head;        // 256
     uint8_t  pad2[120];         // 264
     struct AvbCounters counters;// 384
-    uint8_t  reserved[128];     // 896
+    uint32_t clock_gen;         // 896 incremented by every SYSTIM write (SetClock/StepClock); release-stored
+    uint8_t  reserved[124];     // 900
 };
 
 struct AvbShmConsumer {         // 256 B at offset 0 of kAvbMemConsumer
@@ -221,10 +226,13 @@ struct AvbStreamFilter {        // 136 B
 #ifdef __cplusplus
 static_assert(sizeof(AvbRxSlot) == AVB_RX_SLOT_SIZE, "AvbRxSlot ABI size");
 static_assert(offsetof(AvbRxSlot, data) == AVB_RX_SLOT_HDR, "AvbRxSlot data offset");
+static_assert(offsetof(AvbRxSlot, clock_gen) == 40 && offsetof(AvbRxSlot, pad1) == 44, "AvbRxSlot clock_gen");
 static_assert(sizeof(AvbCounters) == 512, "AvbCounters ABI size");
 static_assert(sizeof(AvbShmHeader) == 1024, "AvbShmHeader ABI size");
 static_assert(offsetof(AvbShmHeader, ctl_head) == 128 && offsetof(AvbShmHeader, audio_head) == 256 &&
               offsetof(AvbShmHeader, counters) == 384, "AvbShmHeader offsets");
+static_assert(offsetof(AvbShmHeader, clock_gen) == 896 && offsetof(AvbShmHeader, reserved) == 900,
+              "AvbShmHeader clock_gen");
 static_assert(sizeof(AvbShmConsumer) == 256 && offsetof(AvbShmConsumer, audio_tail) == 128, "consumer");
 static_assert(sizeof(AvbStreamFilter) == 136, "AvbStreamFilter ABI size");
 static_assert(sizeof(AvbStreamFilter) <= 4096 && sizeof(AvbCounters) <= 4096, "inline");
@@ -240,7 +248,7 @@ static_assert(kAvbCtrRxClassBase + kAvbRxGptp - 1 == 1 && kAvbCtrRxClassBase + k
 
 The header gains `#include <stddef.h>` next to the existing `#include <stdint.h>`, because the new `static_assert`s use `offsetof`; today the header compiles only because its includers happen to pull `<stddef.h>` in.
 
-The 128 B separation of the hot indices matches the Apple Silicon cache-line size. The Rust mirror in `crates/avb-dext/src/abi.rs` repeats every size and offset above in `offset_of!` tests (DP-1), plus `const` asserts that the per-class counter index of `Gptp` is 1 and of `Stream` is 6 (`fn class_counter_index(cls) -> usize { cls as usize }`, the only Rust helper that maps a class to a counter). `driver/tests/i210logic_tests.cpp` gains the same `offsetof` checks, so both sides assert the same literals.
+The 128 B separation of the hot indices matches the Apple Silicon cache-line size. The Rust mirror in `crates/avb-dext/src/abi.rs` repeats every size and offset above in `offset_of!` tests (DP-1), including `AvbRxSlot.clock_gen` = 40, `pad1` = 44, `AvbShmHeader.clock_gen` = 896, `reserved` = 900, the `AVB_RXF_TS_STEP_AMBIG` bit value 8 and `AVB_STEP_SETTLE_NS` = 1 000 000, plus `const` asserts that the per-class counter index of `Gptp` is 1 and of `Stream` is 6 (`fn class_counter_index(cls) -> usize { cls as usize }`, the only Rust helper that maps a class to a counter). `driver/tests/i210logic_tests.cpp` gains the same `offsetof` checks, so both sides assert the same literals.
 
 ### 3.2 Dispatch table (AVBI210UserClient.cpp)
 
@@ -295,7 +303,7 @@ void ClientGone(AVBI210UserClient * client) LOCALONLY;
 `ClientGone(client)`, if `client == owner`, runs in this order on the driver queue, so it is serialized with `TimerFired`:
 1. `producerRunning = false` and `hdr->producer_running = 0`;
 2. `shutdownDatapath(v)` (existing bounded quiesce, Bus Master off, DMA freed);
-3. clear the stream filter, the TX timestamp state and the token bucket;
+3. clear the stream filter, the TX timestamp state and the token bucket; `setFlags(v, 0, AVB_FLAG_RINGS_ATTACHED | AVB_FLAG_OWNED)` (before the release, so the header mirror is still valid);
 4. `OSSafeReleaseNULL(rxMem)` and `OSSafeReleaseNULL(consumerMem)`. The kernel mapping holds its own reference, so a dead client's mapping is torn down independently;
 5. `owner = nullptr`.
 
@@ -332,7 +340,9 @@ If the 16R AEM reports more than 16 STREAM_OUTPUTs, the daemon refuses to bind i
 Harvest (`TimerFired`, every 500 µs) in ring mode. The loop is bounded by `kRxRingSize` per tick.
 
 ```
-if rxMem: atomic_store_release(&hdr->last_tick_mach, mach_absolute_time())   // first, every tick
+tickStart = mach_absolute_time()
+if rxMem: atomic_store_release(&hdr->last_tick_mach, tickStart)   // first, every tick
+ambig = rxStepAmbiguous(&ivars->stepAmbig, tickStart)            // pure, I210Logic.hpp (§3.6); once per tick
 tail_c = atomic_load_acquire(&consumer->ctl_tail); tail_a = ...audio_tail
 validate: 0 <= ctl_head - tail_c <= ctl_slots  (same for audio);
           if violated: count kAvbCtrConsumerIndexInvalid, treat that ring as full this tick
@@ -351,7 +361,8 @@ for each descriptor with DD:
     if verdict is a drop: count the reason; rearm; continue
     ring = (verdict == Stream) ? audio : control
     if head - tail == slots: count RingOverrun{Ctl|Audio}; rearm; continue      // drop-newest
-    slot = ring[head & (slots-1)]; fill header (index = head), memcpy(slot.data, frame, flen)
+    slot = ring[head & (slots-1)]; fill header (index = head, clock_gen = ivars->clockGen,
+           flags |= ambig ? AVB_RXF_TS_STEP_AMBIG : 0), memcpy(slot.data, frame, flen)
     head++ (local)
     rearm(idx)
 after loop: atomic_store_release(&hdr->ctl_head, ...), (&hdr->audio_head, ...);
@@ -365,7 +376,7 @@ checkTx() (existing) every tick
 `rxHarvestStep(bool *discarding, bool eop)` (finding 4 of pass 3): if `*discarding`, it returns `Discard` and clears `*discarding` when `eop`; otherwise, if `!eop`, it sets `*discarding` and returns `NonEop`; otherwise it returns `Frame`. `IV::rxDiscardToEop` (bool) is zeroed by `setupRx` and `shutdownDatapath` together with the ring indices. A multi-descriptor frame therefore costs one `RxNonEop` count and no `RxFrames` count, and its EOP tail is never classified as a frame. The same helper replaces the `!EOP` branch of the legacy `harvestRx` path, so both RX modes behave the same.
 
 Atomic primitives (dext side, finding 8 of pass 3). The dext uses the compiler builtins it already uses (`__atomic_thread_fence`), not `<atomic>`:
-- `atomic_store_release(p, v)` is `__atomic_store_n(p, v, __ATOMIC_RELEASE)`; used for `ctl_head`, `audio_head`, `last_tick_mach`, `stage`, `flags`, `fault`, `producer_running`.
+- `atomic_store_release(p, v)` is `__atomic_store_n(p, v, __ATOMIC_RELEASE)`; used for `ctl_head`, `audio_head`, `last_tick_mach`, `stage`, `flags`, `fault`, `producer_running`, `clock_gen`. Slot fields (including `clock_gen` and `flags`) are plain stores published by the release store of the head.
 - `atomic_load_acquire(p)` is `__atomic_load_n(p, __ATOMIC_ACQUIRE)`; used for `consumer->ctl_tail` and `consumer->audio_tail`.
 - Counters are stored with `__atomic_store_n(&hdr->counters[i], v, __ATOMIC_RELAXED)` on naturally aligned `uint64_t`, which is a single tear-free 64-bit store on arm64.
 
@@ -383,10 +394,11 @@ Live header fields (the daemon's only view of dext health; SAF-4). Each has exac
 | Field | Written by | When |
 |---|---|---|
 | `stage` | `setStage(v, s)`, which replaces every direct `v->stage = …` assignment (today in Stage A, `initDatapath` and `shutdownDatapath`) | every stage change; release store into `hdr->stage` if `rxMem` is attached |
-| `flags` | `setFlags(v, set, clear)`, which replaces every `v->flags \|= / &= …` (today in `setupLink` and `shutdownDatapath`; new: the 5 ms STATUS poll) | every flag change; mirrored likewise |
+| `flags` | `setFlags(v, set, clear)`, which replaces every `v->flags \|= / &= …` (today in `setupLink` and `shutdownDatapath`; new: the 5 ms STATUS poll, and `RingAttach`/`RingDetach`/`ClientGone` for `AVB_FLAG_RINGS_ATTACHED \| AVB_FLAG_OWNED`, §3.6) | every flag change; mirrored likewise |
 | `fault` | `setFault()` (existing single latch point) | when the fault latches, before `setFault` returns; release store |
 | `producer_running` | `setStage` and `RingAttach`/`RingDetach`/`ClientGone` | recomputed as `rxMem != nullptr && stage == kAvbStageDatapath && fault == 0`; `setFault` also clears it |
 | `last_tick_mach` | `TimerFired` | first statement of every tick (above) |
+| `clock_gen` | the `setClock()` helper (§3.6), the only SYSTIM write sequence; `RingAttach` initializes it from `ivars->clockGen` | every SYSTIM write; release store |
 | `ctl_head`, `audio_head`, `counters` | harvester | end of every tick |
 
 `RingAttach` initializes `stage`, `fault`, `flags` and `producer_running` in the new header from ivars before returning, so the header is valid from the first map. Because `setFault` writes the header itself, a fault latched inside `harvestRx`, `checkTx` or the stats read is visible to the daemon even though `TimerFired` then stops re-arming (existing behavior: it re-arms only while `ok(v) && stage == 2`).
@@ -449,19 +461,24 @@ Sustained worst case is about 300/s. The dext bound of 1000/s with burst 64 is t
   - Rejects `|delta| > AVB_STEP_CLOCK_MAX_NS` and results outside `[0, 2^32 s)` with `kIOReturnBadArgument`.
   - Sequence: `m0 = mach; s0 = readClock; m1 = mach; mid = (m0+m1)/2; m2 = mach; target = s0 + delta + ns(m2 - mid); setClock(target); after = readClock`. The target math is `stepTarget()` in `I210Logic.hpp`, host-tested.
   - Writes only SYSTIML and SYSTIMH, in the existing order. Expected residual error is the MMIO write latency, a few µs, which the servo absorbs.
+- Clock generation and step tagging (rev 5, dext-owned because only the driver queue serializes SYSTIM writes with harvesting):
+  - The existing `setClock(v, ns)` helper is the only SYSTIM write sequence (Stage A init, `SetClock`, `StepClock`). Right after its SYSTIMH write it does `ivars->clockGen += 1` (u32, starts at 0 in `Start`, never reset by `InitDatapath`), `atomic_store_release(&hdr->clock_gen, clockGen)` if `rxMem` is attached, and `rxStepArm(&ivars->stepAmbig, mach_absolute_time(), settleTicks)`. `settleTicks` is `AVB_STEP_SETTLE_NS` converted once at `Start` with the timebase (24 000 ticks at 24 MHz). `AdjFreq` changes neither.
+  - `RxStepAmbig { bool pending; uint64_t stepMach; uint64_t settleTicks; }` and the two pure helpers live in `I210Logic.hpp`: `rxStepArm(s, nowMach, settle)` sets `pending = true`, `stepMach = nowMach` (a second step before settling just moves `stepMach` forward); `bool rxStepAmbiguous(s, tickStartMach)` returns `false` if `!pending`; otherwise it returns `true`, and clears `pending` if `tickStartMach >= stepMach + settleTicks`. So every tick from the step up to and including the **first tick that starts at least 1 ms after the SYSTIM write** marks all its slots `AVB_RXF_TS_STEP_AMBIG`, and later ticks don't.
+  - Why this is correct regardless of timer latency: the condition uses each tick's measured start time, not its schedule, so a late tick only extends the ambiguous span. A frame received before the SYSTIM write has its descriptor written back within the settle window (RXDCTL.WTHRESH = 1, so each descriptor is written back on completion; 1 ms also exceeds the time to receive and DMA a full RX packet buffer at line rate, *verify RXPBS size in 333016 §8.10*). The settling tick reads every DD descriptor in the ring (the loop bound equals `kRxRingSize`), so it harvests every pre-step frame; a later tick only sees descriptors completed after the settling tick started, i.e. after the step. The cost is that frames received up to about 1–1.5 ms after a step (longer if ticks are late) are unusable for timing; steps happen only at ACQUIRE and on > 100 µs excursions.
+  - The legacy `PollRx` path (`AvbRxEntry`) is unchanged and carries no generation; only the probe uses it.
 - `SetStreamFilter`:
   - Requires rings attached and caller = owner.
   - Validates `count ≤ 16`, every `dest_mac[0] & 1`, and `1 ≤ vid ≤ 4094`. Otherwise `kIOReturnBadArgument`.
   - Copies into ivars. Applied from the next tick, which runs on the same queue, so no tearing.
 - `RingAttach(flags)`:
   - `flags != 0` → BadArgument; stage < 1 → NotReady; another owner → ExclusiveAccess; same owner while attached → returns the existing values (idempotent); caller previously detached on this connection → NotPermitted (below).
-  - Allocates `rxMem` (`IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, AVB_RX_MEM_SIZE, 16384)`) and `consumerMem` (16 KiB), zeroes both, fills the header constants and increments `generation`.
+  - Allocates `rxMem` (`IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, AVB_RX_MEM_SIZE, 16384)`) and `consumerMem` (16 KiB), zeroes both, fills the header constants (including `clock_gen` from `ivars->clockGen`), increments `generation`, sets `owner`, and then calls `setFlags(v, AVB_FLAG_RINGS_ATTACHED | AVB_FLAG_OWNED, 0)`, which also mirrors the flags into the new header.
   - Allocation failure → `kIOReturnNoMemory`, logged once. It is not a hardware fault, so nothing is latched.
   - One attach per connection. `IOUserClient.iig` requires `CopyClientMemoryForType` to return the same `IOMemoryDescriptor` instance for a given type on a given user client, so after a `RingDetach`, a further `RingAttach` from the **same** user client returns `kIOReturnNotPermitted` (logged `AVBI210: rings: reattach on same connection; reopen`). The flag is a user-client ivar `ringsUsed`, set by the driver through `void MarkRingsUsed() LOCALONLY` and read through `bool RingsUsed() LOCALONLY`, both new in `AVBI210UserClient.iig`. A new connection's `RingAttach` allocates **fresh** memory and increments `generation`; it never reuses a previous attach's buffers. `scalarOut[0]` returns the new generation. The daemon already uses exactly one attach per connection (§5.2, §5.3).
   - If `stage == 2` at attach time (a data path a probe left up), the harvester switches from legacy mode to ring mode on the next tick and `producer_running` becomes 1.
 - `RingDetach()` (strictly owner; not attached → `kIOReturnNotReady`; caller ≠ owner → `kIOReturnExclusiveAccess`), on the driver queue:
   1. `producerRunning = false`; `hdr->producer_running = 0` (release store).
-  2. Clear the stream filter. If `stage == 2`, the harvester reverts to legacy software-ring mode from the next tick (the data path itself stays up).
+  2. Clear the stream filter. If `stage == 2`, the harvester reverts to legacy software-ring mode from the next tick (the data path itself stays up). `setFlags(v, 0, AVB_FLAG_RINGS_ATTACHED | AVB_FLAG_OWNED)`, while `rxMem` is still valid, so the mirrored header write lands in live memory.
   3. `OSSafeReleaseNULL(rxMem)`, `OSSafeReleaseNULL(consumerMem)`. The client's existing mappings keep their own reference until it calls `IOConnectUnmapMemory64`; they are then stale (their `generation` no longer matches any live attach) and the producer never writes them again.
   4. `owner = nullptr`.
 - Daemon generation check: after mapping (§5.2 step 5) the daemon requires `hdr.generation == RingAttach scalarOut[0]`; a mismatch is exit 4 (`shared-memory generation mismatch`).
@@ -482,6 +499,7 @@ Sustained worst case is about 300/s. The dext bound of 1000/s with burst 64 is t
 | Stop writing before memory release (DP-11) | `ClientGone` and `RingDetach` order on the driver queue | Only the driver queue serializes with the harvester |
 | Ownership only via rings; non-owner exit changes nothing | `RingAttach`/`RingDetach`/`ClientGone` (§3.2) | Keeps Phase 0b multi-process probe semantics when no daemon runs |
 | Live header fields always reflect ivars | `setStage`/`setFlags`/`setFault`, the only writers (§3.4) | The daemon's fault and link detection depends on them even after the timer stops |
+| Every slot's `clock_gen`/`AVB_RXF_TS_STEP_AMBIG` correctly separates pre-step from post-step receptions | `setClock()` helper + `rxStepAmbiguous` per tick (§3.6) | Only the driver queue orders SYSTIM writes against harvesting; a daemon-side mach window would depend on timer latency |
 | Clear-on-read statistics read only by the accumulator | `isReadableRegOffsetI210` denylist incl. RQDPC(0) | DP-8 monotonicity |
 
 Host tests added to `driver/tests/i210logic_tests.cpp`:
@@ -491,6 +509,7 @@ Host tests added to `driver/tests/i210logic_tests.cpp`:
 - VLAN flag derivation `rxVlanFlags(vp, frame)` for all four VP × in-buffer-tag combinations (§3.4 rule 1): VP=0/no tag → none; VP=0/tag → VLAN_FRAME; VP=1/tag → VLAN_FRAME only; VP=1/no tag → VLAN_DESC only;
 - ring index validation (`ringFree(head, tail, slots)`, including wrap at 2^64 and invalid tails);
 - `stepTarget`;
+- `rxStepArm`/`rxStepAmbiguous` (settle = 1 ms in ticks): no step → never ambiguous; step at T, ticks starting at T+0.2 ms and T+0.7 ms → ambiguous, still pending; tick at T+1.2 ms → ambiguous and settles; next tick → not ambiguous; **simulated 5 ms tick delay**: step at T, next tick at T+5 ms → ambiguous and settles (it is the first settled tick), the tick after it → not ambiguous; a second step at T+0.5 ms before settling moves `stepMach` (tick at T+1.2 ms still pending, T+1.6 ms settles); tick start exactly at `stepMach + settle` settles;
 - the token bucket (`tokenBucketTake(state, nowNs)`);
 - stats accumulation;
 - the ABI `offsetof`/`sizeof` literals;
@@ -553,7 +572,7 @@ Cross-thread communication; nothing on the per-packet path locks or allocates:
   - Sent over `std::sync::mpsc::sync_channel::<Box<StreamTable>>(4)` on bind/unbind/format change. A bounded channel allocates its buffer at construction, so neither side allocates on send.
   - The audio thread `try_recv`s between batches.
   - It returns the old table over a second `sync_channel(4)` with `try_send`, so the drop happens on `ctl`. On `TrySendError::Full` the audio thread keeps the old box in a single-slot `Option` (preallocated) and retries on the next batch before accepting another new table; each `Full` is counted in `audio_return_full` (status). `ctl` uses blocking-free `try_send` too and, on `Full`, retries on its next 500 µs tick.
-- **ctl → audio gPTP time model:** `avb_core::SeqLock<GptpMachModel>` (copy type, writer `ctl`, readers `audio`/`rec`).
+- **ctl → audio gPTP time model:** `avb_core::SeqLock<GptpMachModel, N>` (writer `ctl`, readers `audio`/`rec`). To be free of data races in Rust, the seqlock stores no plain fields: its storage is `seq: AtomicU32` plus `[AtomicU64; N]`, and `T: SeqWords<N>` (`fn to_words(self) -> [u64; N]`, `fn from_words([u64; N]) -> Self`; f64 via `to_bits`/`from_bits`, bool/u32 widened). Writer: `seq.store(s + 1, Relaxed)` (odd) → `fence(Release)` → each word `store(Relaxed)` → `seq.store(s + 2, Release)`. Reader: `s1 = seq.load(Acquire)`; if odd, spin and retry; each word `load(Relaxed)`; `fence(Acquire)`; `s2 = seq.load(Relaxed)`; accept iff `s1 == s2`. The writer never blocks; a reader retries at most 1000 times and then returns `Err(Contended)` (counted `seqlock_contended`; the caller keeps its previous copy). The §10.6 ring clock block uses the same protocol on its shared-memory fields.
 - **audio → ctl per-stream counters:** `Arc<[StreamCounters; 16]>` of `AtomicU64`, relaxed. AECP GET_COUNTERS and status read them.
 - **audio → ring header media-clock model:** `avb_audioring` seqlock block (§10.6).
 - **main ↔ all shutdown:** a static `AtomicBool` set from the SIGINT/SIGTERM handler (installed with `libc::sigaction`; the handler only stores the flag).
@@ -565,7 +584,7 @@ Start sequence; exit codes in §11.4:
 2. `GetInfo`. ABI ≠ 3 → exit 4: `dext ABI v<n> != avb-daemon ABI v3; rebuild and reactivate (scripts/package.sh, avb-installer activate)`. Fault ≠ 0 → exit 7.
 3. `RingAttach(0)`. ExclusiveAccess → exit 10: `the I210 rings are owned by another client (another avb-daemon); stop it first`. This makes the daemon the owner (§3.2).
 4. `IOConnectMapMemory64(type 1)` and `(type 2)` with `kIOMapAnywhere`.
-5. Validate the header: magic, ABI, header/slot sizes, slot counts, offsets, total size equal to the Rust constants, and `generation` equal to `RingAttach`'s `scalarOut[0]`. Mismatch → exit 4.
+5. Validate the header: magic, ABI, header/slot sizes, slot counts, offsets, total size equal to the Rust constants, and `generation` equal to `RingAttach`'s `scalarOut[0]`. Mismatch → exit 4. Then acquire-load `clock_gen` as the initial step generation (§7.3).
 6. If `stage == 2` (a data path a probe left up with no owner, which §3.2 allows), call `ShutdownDatapath` first. Ownership is unaffected, so no other client can take the data path between this step and the next. Then `InitDatapath(0)`, which resets the dext counters and sets `producer_running = 1`.
 7. Wait ≤ 10 s for `AVB_FLAG_LINK_UP` in the header. Otherwise exit 5: `no link on the I210 (cable to the 16R?)`.
 
@@ -748,7 +767,7 @@ Initiator: every 1 s ± 0, the port sends Pdelay_Req with `want_ts`:
 Responder:
 - On the 16R's Pdelay_Req: t2 = its RX timestamp. Send Pdelay_Resp (`want_ts`, requestReceiptTimestamp = t2_c, requestingPortIdentity copied, correction 0).
 - Then t3 = TX timestamp. Send Pdelay_Resp_Follow_Up (responseOriginTimestamp = t3_c).
-- Turnaround budget, Pdelay_Req arrival to Pdelay_Resp on the wire: ≤ 0.5 ms harvest + ≤ 0.5 ms `ctl` loop + about 50 µs SendFrame, so expected ≤ 1.2 ms and worst case ≤ 3 ms. The 802.1AS bound is 10 ms (IEEE 802.1AS-2020 Annex B.2.3, "Pdelay turnaround time" *(verify clause)*). Turnaround is measured per response (t3 − t2) and reported with its max.
+- Turnaround budget, Pdelay_Req arrival to Pdelay_Resp on the wire: ≤ 0.5 ms harvest + ≤ 0.5 ms `ctl` loop + about 50 µs SendFrame, so expected ≤ 1.2 ms and worst case ≤ 3 ms. The 802.1AS bound is 10 ms (IEEE 802.1AS-2020 Annex B.2.3, "Pdelay turnaround time" *(verify clause)*). Turnaround is measured per response (t3 − t2) and reported with its max. Exception (rev 5): a Pdelay_Resp can wait behind a pending step (§7.3 TX generation), which is itself held for up to 20 ms behind an outstanding timestamp. When the scheduler is about to hand a Pdelay_Resp to `SendFrame` and `mach_now − harvest_mach` of the 16R's Pdelay_Req slot exceeds **8 ms** (mach is used because it is unaffected by steps), the Pdelay_Resp and its Follow_Up are dropped and `pdelay_resp_late_drop` is counted; the 16R counts one lost response. With the normal ≤ 0.5 ms harvest delay that keeps every Pdelay_Resp we do send within 10 ms of t2. This only arises after a TX timestamp timeout (DP-9 target 0).
 - If the TX timestamp for Pdelay_Resp times out, no Follow_Up is sent; this is counted as `pdelay_resp_ts_fail`.
 - Pdelay_Resp is serialized behind any outstanding timestamped frame by the TX scheduler (§5.2). Our own Pdelay_Req is deferred by up to 50 ms if a response is in flight, so the two never contend.
 
@@ -784,7 +803,11 @@ This covers the 16R-reboot case (ADC-13, §9.4 reboot rows): its Announce stops,
 Offset per Sync:
 ```
 rateRatio  = (1 + cumulativeScaledRateOffset · 2^-41) · NRR_systim
-syncEvent  = preciseOriginTimestamp + correctionField(ns) + delay_comp · rateRatio / NRR_systim
+syncEvent  = preciseOriginTimestamp
+           + (FollowUp.correctionField + Sync.correctionField) · 2^-16   // ns; both Scaled ns (i64)
+           + delay_comp · rateRatio / NRR_systim
+           // Sync.correctionField is expected to be 0 in two-step 802.1AS (802.1AS-2020 §11.4.2 / §11.2.15 *(verify clause)*);
+           // it is added, not assumed, and pinned by a vector with a non-zero Sync correctionField
 offset_ns  = t_rx_c(Sync) − syncEvent           // positive: our SYSTIM is ahead
 ```
 
@@ -807,16 +830,15 @@ Constants, recomputed whenever Ts changes:
 - A host simulation test pins them at Ts ∈ {0.03125, 0.125, 1} s: a GM at −83 ppm and 10 ns RMS timestamp noise must lock within 10 s (within 30 s at Ts = 1 s, i.e. 30 updates), with steady-state |mean| < 5 ns and sd < 20 ns. A fourth case changes Ts mid-run from 0.125 to 0.03125 s and must not unlock.
 - If hardware shows otherwise, the hardware step tunes them and records the values.
 
-Step bookkeeping (`avb_gptp::stepgen`, sans-IO; the daemon supplies mach times in ns via the timebase):
-- Each `StepClock`/`SetClock` issued by `ctl` records `step_begin_mach` (read immediately before the IOKit call) and `step_end_mach` (immediately after it returns), then increments `gen` (u32). `AdjFreq` doesn't change `gen`. `StepClock`/`SetClock` and the harvester are serialized on the dext's driver queue, so every frame harvested before the call has `harvest_mach < step_begin_mach`.
-- Generation of an **RX** event timestamp (Sync `t_rx`, Pdelay_Resp `t4`, the 16R's Pdelay_Req `t2`), from the slot's `harvest_mach` relative to the most recent step `s`:
-  - `harvest_mach < s.step_begin_mach` → `s.gen_before` (old generation);
-  - `harvest_mach > s.step_end_mach + 2 ms` → `s.gen_after` (new generation). 2 ms is 4 dext ticks of 500 µs including leeway: a frame received before the step is harvested within that bound unless the harvester is more than 2048 descriptors behind, which DP-6 sizing excludes;
-  - otherwise **AMBIGUOUS**: the frame is not used for timing and `rx_ts_ambiguous_step` is counted. An ambiguous Pdelay_Req from the 16R is still answered with Pdelay_Resp, but its Pdelay_Resp_Follow_Up is skipped exactly as for `pdelay_resp_step_skip`. An ambiguous Pdelay_Resp/Follow_Up makes our exchange incomplete (not counted as lost).
-  Only the most recent step is kept: steps are at least one Sync apart (one per servo update), far more than 2 ms.
+Step bookkeeping (`avb_gptp::stepgen`, sans-IO; rev 5: the classification comes from the dext, §3.6, and no longer from daemon-side mach windows, so it doesn't depend on timer latency):
+- The current generation `gen` (u32) is `hdr.clock_gen`, acquire-loaded once after mapping (§5.2) and again immediately after every `StepClock`/`SetClock` call returns. Those selectors are owner-only (§3.2), so while the daemon owns the rings no other client can change `clock_gen`, and the cached value is exact between calls. `AdjFreq` doesn't change it.
+- Generation of an **RX** event timestamp (Sync `t_rx`, Pdelay_Resp `t4`, the 16R's Pdelay_Req `t2`), from the slot alone:
+  - `flags & AVB_RXF_TS_STEP_AMBIG` → **AMBIGUOUS**: the frame is not used for timing and `rx_ts_ambiguous_step` is counted. An ambiguous Pdelay_Req from the 16R is still answered with Pdelay_Resp, but its Pdelay_Resp_Follow_Up is skipped exactly as for `pdelay_resp_step_skip`. An ambiguous Pdelay_Resp/Follow_Up makes our exchange incomplete (not counted as lost).
+  - otherwise the generation is `slot.clock_gen`. The pure function is `classify_rx_gen(slot_gen, ambig) -> RxGen::{Gen(u32), Ambiguous}`; comparisons with `gen` are equality only (u32 wrap is irrelevant).
+  Any number of steps may be outstanding in the rings: each slot carries its own generation, so nothing depends on steps being far apart.
 - Generation of a **TX** timestamp (t1, t3): `gen` at the moment `SendFrame` was called. To make that unambiguous, `ctl` never issues `StepClock`/`SetClock` while a `want_ts` frame is outstanding: the TX scheduler (§5.2) holds the step until the outstanding timestamp resolves or times out (≤ 20 ms, `kTxTsTimeoutNs`), and starts no new `want_ts` frame while a step is pending. The held step uses the offset computed when it was decided; 20 ms at the 488 ppm bound is < 10 µs of extra error, which the next Sync corrects.
 - **Sync/Follow_Up:** a Sync whose `t_rx` generation ≠ current `gen`, or is AMBIGUOUS, is not used for the offset or the servo (counted `sync_step_skip`). This prevents a pre-step Sync processed after the step from producing a ~100 µs bogus offset and a second step (acceptance 5).
-- **NRR window:** on every `gen` change the window (§7.2) is cleared. The last valid NRR is held, and used for asCapable's "NRR valid" condition, for `delay` and for `rateRatio`, until 2 complete new-generation exchanges have entered the window; then the window's own NRR replaces it. A step therefore doesn't drop asCapable. After the ACQUIRE `SetClock` there is no previous valid NRR (SYSTIM was near 0), so nothing is held: the ACQUIRE seed `f = f_applied + (rateRatio−1)·1e9` on a later GM change uses only an NRR computed from post-`SetClock` exchanges. An NRR with |NRR − 1| > 1000 ppm is rejected and counted `nrr_out_of_range` (§7.2).
+- **NRR window:** on every `gen` change the window (§7.2) is cleared. The last valid NRR is held, and used for asCapable's "NRR valid" condition, for `delay` and for `rateRatio`, until 2 complete new-generation exchanges have entered the window; then the window's own NRR replaces it. A step therefore doesn't drop asCapable. The ACQUIRE `SetClock` is treated exactly like a `StepClock` (rev 5): NRR is a ratio of differences within one generation and doesn't depend on SYSTIM's absolute value, so the last valid pre-`SetClock` NRR is held across it, and asCapable and the servo don't bounce through HOLDOVER after ACQUIRE. What is never used is an NRR computed across generations; the window clearing guarantees that, so the ACQUIRE seed `f = f_applied + (rateRatio−1)·1e9` on a later GM change always comes from a single-generation NRR (held or current). An NRR with |NRR − 1| > 1000 ppm is rejected and counted `nrr_out_of_range` (§7.2).
 
 Exchanges straddling a step or SetClock are discarded, in both roles:
 - Initiator: a Pdelay exchange whose t1 and t4 carry different step generations, or whose t4 is AMBIGUOUS, is dropped (not counted as lost).
@@ -854,7 +876,8 @@ PTP-8 targets kept: |mean offset| ≤ 100 ns and sd ≤ 100 ns over ≥ 5 min af
 - offset (last, mean, sd over the window), path delay raw and compensated (last, mean, sd);
 - `nrr_systim`, `nrr_free`, cumulative rateRatio, applied ppb;
 - counters: Sync/Follow_Up/Announce rx, Pdelay req tx/rx, resp tx/rx, FU tx/rx, timeouts, lost responses, TS failures, steps, saturations, GM changes, asCapable transitions (with timestamps);
-- revision-4 counters: `rx_ts_ambiguous_step`, `sync_step_skip`, `nrr_out_of_range`, `announce_timeouts`, `ascapable_slave_loss`, `announce_interval_invalid`, `announce_rejected`, `sync_while_listening`, `sync_in_holdover`, plus `step_gen` and `port_state` transitions (with timestamps).
+- revision-4 counters: `rx_ts_ambiguous_step`, `sync_step_skip`, `nrr_out_of_range`, `announce_timeouts`, `ascapable_slave_loss`, `announce_interval_invalid`, `announce_rejected`, `sync_while_listening`, `sync_in_holdover`, plus `step_gen` and `port_state` transitions (with timestamps);
+- revision-5 counters: `pdelay_resp_late_drop`, `slot_gen_invalid`.
 
 ## 8. MSRP / MVRP (`avb-srp`)
 
@@ -889,14 +912,14 @@ Domain:
 
 Listener: for each bound stream (§9.4):
 - Talker Advertise registered → declare Ready.
-- Talker Failed registered → declare Asking Failed (802.1Q §35.2.4.3 *(verify)*).
+- Talker Failed registered → declare Asking Failed (802.1Q §35.2.4.3 *(verify)*). This includes a Talker Failed that was already registered when the stream entered SETTLED_NO_RSV (for example, registered while the stream was still probing); §9.4 has the row.
 - Neither, for less than `TA_WAIT = 2 s` since the stream entered SETTLED_NO_RSV → no declaration.
 - Neither, after `TA_WAIT` (U-8 outcome "the 16R withholds its TA until a Listener exists"): count `ta_wait_expired`, log once per stream at warn `U-8: no Talker Advertise for <stream_id> after 2 s; declaring Listener (Asking Failed)`, and declare the Listener attribute for the effective stream_id with declaration type **Asking Failed**. A later TA registration then follows the normal rule (re-declare as Ready). The stream_id used is the one PROBE_TX (or the GET_STREAM_INFO fallback) returned, the same one the TA must carry. Basis: an end-station Listener declaration does not require a registered Talker attribute, and Asking Failed is the declaration type for a listener that cannot (yet) receive the stream (802.1Q-2018 §35.2.4.3 and §35.2.6 *(verify)*). **If the 802.1Q text forbids a Listener declaration without a registered Talker attribute**, this edge is not implemented: the implementer stops and asks the user (listed in §4's contradictions that are never adapted silently), and until then the stream stays in SETTLED_NO_RSV with `ta_wait_expired` still counted and logged.
 - Withdrawn on unbind and on shutdown.
 
-Talker Advertise is authoritative for stream addressing (AAF-2). When the TA for a bound stream_id registers (or changes), `ctl` compares its dest MAC and VLAN ID with the values PROBE_TX (or the GET_STREAM_INFO fallback) returned:
+Talker Advertise is authoritative for stream addressing (AAF-2). When the TA for a bound stream_id registers (§9.4 SETTLED_NO_RSV row) or changes while registered (§9.4 `TA attributes changed` row; `avb_srp` emits `TalkerChanged { stream_id, old, new }` when a registered TA's dest MAC, VID, TSpec or accumulated latency differ from the stored values), `ctl` compares its dest MAC and VLAN ID with the values PROBE_TX (or the GET_STREAM_INFO fallback) returned:
 - equal → nothing changes;
-- different → count `ta_probe_mismatch`, log both value sets at warn, and switch the binding's **effective** dest MAC/VID to the TA values: `SetStreamFilter` is re-issued and the `audio` stream table is replaced. The §10.2 step 4 check compares against these effective values.
+- different → count `ta_probe_mismatch`, log both value sets at warn, and switch the binding's **effective** dest MAC/VID to the TA values: `SetStreamFilter` is re-issued and the `audio` stream table is replaced. The §10.2 step 4 check compares against these effective values. A TSpec or accumulated-latency change updates the stored TA and the next `audio` stream table (the §10.3 `early_bound` uses it). In SETTLED_RSV_OK none of this touches the Listener declaration: Ready stays declared.
 
 Before a TA exists, the effective values are the PROBE_TX values, so the filter can be set early; no audio is accepted as "bound" for the record start condition (§11.2 step 4) until SETTLED_RSV_OK, i.e. until a TA has confirmed them.
 
@@ -1081,10 +1104,10 @@ States:
 - PRB_W_RESP: first PROBE_TX_COMMAND sent, 200 ms;
 - PRB_W_RESP2: second PROBE_TX_COMMAND sent, 200 ms;
 - PRB_W_RETRY: 4 s back-off before the next probe cycle;
-- SETTLED_NO_RSV: stream addressing known (PROBE_TX or fallback); no Talker Advertise yet, or Listener Ready not yet declared. Its timer is `TA_WAIT = 2 s`, armed on entry if neither a TA nor a Talker Failed is registered for the effective stream_id (§8.2);
+- SETTLED_NO_RSV: stream addressing known (PROBE_TX or fallback); no Talker Advertise yet, or Listener Ready not yet declared. Its timer is `TA_WAIT = 2 s`, armed on entry if neither a TA nor a Talker Failed is registered for the effective stream_id (§8.2). On entry the SM evaluates the current registrations once, in this order: a registered TA takes the "TA registered (or already registered on entry)" row; otherwise a registered Talker Failed takes the "Talker Failed registered (or already registered on entry)" row; otherwise TA_WAIT is armed. Entry therefore always leads to a declaration or to an armed timer;
 - SETTLED_RSV_OK: Talker Advertise registered and our Listener Ready declared.
 
-Per-binding state: (talker_entity_id, talker_unique_id, controller_entity_id, flags), `probe_cycles` (consecutive probe cycles with no response at all), the effective stream_id/dest MAC/VID, and `last_available_index` of the talker. Entering a state cancels the previous state's timer. "Withdraw Listener" means the MSRP Listener declaration for that stream_id is withdrawn (Lv) and the stream's filter entry and audio-table entry are removed (`SetStreamFilter` re-issued, table replaced).
+Per-binding state: (talker_entity_id, talker_unique_id, controller_entity_id, flags), `probe_cycles` (consecutive probe cycles with no response at all), the effective stream_id/dest MAC/VID, and `last_available_index` of the talker. `last_available_index` is initialized at BIND_RX from the talker's entry in the ADP table (§9.2), which tracks `available_index` for every entity, including while this SM is UNBOUND; it is unset if the talker isn't in the table yet (then the first ENTITY_AVAILABLE only sets it). After that it is set to the talker's `available_index` on **every** ENTITY_AVAILABLE received from it, in every bound state and whichever row the event takes (including `acmp_listener_ignored`), after the reboot comparison below has been evaluated. A second reboot is therefore detected against the post-first-reboot value. Entering a state cancels the previous state's timer. "Withdraw Listener" means the MSRP Listener declaration for that stream_id is withdrawn (Lv) and the stream's filter entry and audio-table entry are removed (`SetStreamFilter` re-issued, table replaced).
 
 Transitions (exhaustive; any event not listed for a state is counted `acmp_listener_ignored{state,event}` and has no effect):
 
@@ -1103,7 +1126,8 @@ Transitions (exhaustive; any event not listed for a state is counted `acmp_liste
 | SETTLED_NO_RSV | TA_WAIT timer (no TA registered for the effective stream_id within 2 s of entry) | SETTLED_NO_RSV | count `ta_wait_expired`; log once per stream `U-8: no Talker Advertise for <stream_id> after 2 s; declaring Listener (Asking Failed)`; declare Listener Asking Failed (§8.2; if the 802.1Q check forbids it, the edge is absent per §4 and only the count and log happen). A later TA registration takes the row above (→ SETTLED_RSV_OK, re-declared as Ready) |
 | SETTLED_NO_RSV | Talker Failed withdrawn, no TA registered | SETTLED_NO_RSV | keep the Asking Failed declaration (same result as an expired TA_WAIT); count `talker_failed_withdrawn` |
 | SETTLED_RSV_OK | TA withdrawn | SETTLED_NO_RSV | withdraw Listener Ready (no declaration while there is no TA until TA_WAIT expires, §8.2); TA_WAIT armed on entry |
-| SETTLED_NO_RSV / SETTLED_RSV_OK | Talker Failed registered | SETTLED_NO_RSV | declare Asking Failed; if the failure code is a bandwidth/resource code, classify A-5 |
+| SETTLED_NO_RSV / SETTLED_RSV_OK | Talker Failed registered (or, on entry to SETTLED_NO_RSV, already registered with no TA registered) for the effective stream_id | SETTLED_NO_RSV | declare Asking Failed (replacing Ready if declared); if the failure code is in `A5_FAILURE_CODES`, classify A-5; TA_WAIT not armed |
+| SETTLED_RSV_OK | TA attributes changed (same stream_id; dest MAC, VID, TSpec or accumulated latency differ; `TalkerChanged`) | SETTLED_RSV_OK | apply §8.2: compare with the effective values, count `ta_probe_mismatch` if dest MAC/VID differ from the PROBE_TX values, make the new TA values effective; on a MAC/VID change re-issue `SetStreamFilter` and replace the `audio` stream table; on a TSpec/latency-only change replace the stream table only; Listener Ready stays declared (no Lv) |
 | any bound state | talker ENTITY_DEPARTING or ADP entry timeout | PRB_W_AVAIL | withdraw Listener |
 | any bound state | talker ENTITY_AVAILABLE with `available_index` < `last_available_index` (reboot) | PRB_W_DELAY | withdraw Listener; `probe_cycles := 0`; arm random 0–1 s (re-probe, ADC-13) |
 | any bound state | BIND_RX, same talker_entity_id and talker_unique_id | unchanged | update controller_entity_id/flags; respond SUCCESS |
@@ -1273,7 +1297,7 @@ Layout v1, little-endian, position-independent. Header region 16 384 B, data at 
 | 48 | config_generation u64 | bumped on any layout/config change |
 | 128 | write_frame u64 (AtomicU64) | frames [0, write_frame) committed; absolute frame index; producer release-stores |
 | 256 | read_frame u64 (AtomicU64) | consumer release-stores |
-| 384 | clock block (128 B) | seq u32, pad u32, anchor_frame u64, anchor_mach f64, mach_per_frame f64, rate_hz_vs_mach f64, media_ppm_vs_gptp f64, uncertainty_ns f64, locked u32, reset_count u32 |
+| 384 | clock block (128 B) | seq u32, pad u32, anchor_frame u64, anchor_mach f64, mach_per_frame f64, rate_hz_vs_mach f64, media_ppm_vs_gptp f64, uncertainty_ns f64, locked u32, reset_count u32. Every field is accessed only atomically (rev 5): `seq`, `locked`, `reset_count` as `AtomicU32`; the u64 and f64 fields as `AtomicU64` (f64 via `to_bits`/`from_bits`). Writer (`audio`): `seq` odd (Relaxed) → `fence(Release)` → field stores (Relaxed) → `seq` even (Release). Reader (`rec`, Phase 1b): `seq` (Acquire), retry while odd → field loads (Relaxed) → `fence(Acquire)` → `seq` re-check (Relaxed), retry on change (the §5.1 `SeqLock` protocol and retry bound). A C/C++ reader in Phase 1b uses `__atomic_load_n` on the same fields |
 | 512 | counters [64] u64 | overrun_frames, overrun_events, consumer_skips, gap_frames_total, late_drops, placement_rejects, zero_fill_frames, … |
 | 1024 | streams [16] × 64 B | +0 stream_id u64, +8 first_channel u32, +12 channels u32, +16 gap_frames u64, +24 gap_events u64, +32 last_frame u64, +40 active u32, +44 bit_depth u32, +48 pad [16] |
 | 2048 | channel_map [1024] × 8 B (ends 10 240) | stream_index u16, stream_channel u16, reserved u32 |
@@ -1468,7 +1492,7 @@ The daemon never retries a register operation or tries alternative values (SAF-4
 | CLI timeouts | 1–600 s | exit 2 |
 | `--milan-cert-version` | `major.minor`, each 0–255 | exit 2 |
 | Dext shm header | §5.2 step 5, every field equal to the compiled constants | exit 4 |
-| Dext slot | `len ≤ 1984` (also guaranteed by the dext's oversize guard, §3.4; the daemon re-checks because the mapping is a trust boundary), `cls` in range, `index` == expected, not both VLAN flags set | drop + counter (desync handling) |
+| Dext slot | `len ≤ 1984` (also guaranteed by the dext's oversize guard, §3.4; the daemon re-checks because the mapping is a trust boundary), `cls` in range, `index` == expected, not both VLAN flags set; `clock_gen` not ahead of `hdr.clock_gen` (wrapping difference `hdr.clock_gen − slot.clock_gen` < 2^31) | drop + counter (desync handling; `slot_gen_invalid` for the last rule) |
 | RX descriptor (in the dext) | TSIP ⇒ PKT_LEN ≥ 16; payload ≤ 1984 | RxErrors / RxOversize; buffer re-armed |
 | Ethernet frames | length ≥ header sizes before every field access; VLAN at most one tag; all parsers return `Result<_, DropReason>`; no panics or indexing without checks (`clippy::indexing_slicing` denied in the protocol crates) | drop + per-reason counter |
 | gPTP | versionPTP 2, majorSdoId 1, domain 0, messageLength ≥ the type's size and ≤ frame; Follow_Up TLV type 3 / organizationId 00-80-C2 / subtype 1 *(verify)*; messages from portIdentities other than the 16R counted and ignored | drop + counter |
@@ -1498,15 +1522,15 @@ The daemon never retries a register operation or tries alternative values (SAF-4
 
 | Crate | Tests |
 |---|---|
-| avb-core | ext32 wrap (±2^31 around 2^32 boundaries), MAC/EUI-64 derivation, VLAN parse, SeqLock concurrent reader test, `is_avdecc_dest` boundary table (same MACs as the dext test), Timebase conversions for 125/3 and 1/1 |
-| avb-dext | ABI sizes/offsets vs the literals in §3.1; shm header validation accept/reject; slot consumer over a heap buffer simulating producer heads/tails including wrap and desync |
-| avb-gptp | encode/decode vectors for every message type (byte-exact, from 802.1AS figures + M1 captures); link delay and NRR math (the Phase 0b numbers as a vector: raw 455.6 → comp 142.6); asCapable transitions; servo simulation at Ts ∈ {1/32, 1/8, 1} s plus a mid-run Ts change (§7.3 pass criteria); Ts derivation from logMessageInterval incl. rejection of −6, 2 and 0x7F (previous Ts kept, counter incremented); servo step rule in TRACKING and LOCKED (→ TRACKING, `i = 0`), ACQUIRE entered only at start and GM change, integrator frozen while clamped (a 600 ppm GM step-input test must not wind up: after the GM returns to −83 ppm, |offset| < 1 µs within 2× the normal lock time); responder skips Pdelay_Resp_Follow_Up across a step; model regression with synthetic brackets and outliers. **Step bookkeeping (rev 4):** generation classification of RX timestamps at `harvest_mach` = begin−1, begin, end+2 ms, end+2 ms+1 (old / ambiguous / ambiguous / new); a 100 µs step in the middle of a full NRR window moves the reported `nrr_systim` by ≤ 0.01 ppm and asCapable stays true; a Sync harvested inside the ambiguity window is skipped (`sync_step_skip`) and causes no second step; an ambiguous Pdelay_Req is answered without Follow_Up; a step decided while a `want_ts` frame is outstanding is issued only after the timestamp resolves or times out; an NRR of 1 + 1.5e−3 is rejected (`nrr_out_of_range`); SetClock at ACQUIRE followed by a GM change seeds `f` from a post-SetClock NRR only (the pre-SetClock exchanges never enter the window). **Port SM (rev 4):** one test per edge: Listening → Slave (first GM → ACQUIRE); Slave → Listening on announceReceiptTimeout with Ta from logMessageInterval 0 and −3 and the 1 s placeholder (servo → HOLDOVER, advertised GM = our clockIdentity, ADP re-advertise action emitted); Slave → Listening on asCapable false for > 3·Ta; Listening → Slave with the same GM (HOLDOVER → TRACKING on the next Sync with asCapable, no ACQUIRE); with a different GM (`gm_changes`, ACQUIRE); Slave → Slave GM change; Announce interval 5 and 0x7F rejected (Ta kept); Announce from our own clockIdentity or with our clockIdentity in the path trace rejected; HOLDOVER stays HOLDOVER while Syncs arrive with asCapable false (`sync_in_holdover`) |
+| avb-core | ext32 wrap (±2^31 around 2^32 boundaries), MAC/EUI-64 derivation, VLAN parse, SeqLock (atomic words, §5.1) concurrent writer/reader test with no torn values and the retry bound returning `Err(Contended)` against a writer held at odd `seq`, `is_avdecc_dest` boundary table (same MACs as the dext test), Timebase conversions for 125/3 and 1/1 |
+| avb-dext | ABI sizes/offsets vs the literals in §3.1 (including `clock_gen` at slot 40 and header 896, `AVB_RXF_TS_STEP_AMBIG` = 8); shm header validation accept/reject; slot consumer over a heap buffer simulating producer heads/tails including wrap and desync |
+| avb-gptp | encode/decode vectors for every message type (byte-exact, from 802.1AS figures + M1 captures); link delay and NRR math (the Phase 0b numbers as a vector: raw 455.6 → comp 142.6); asCapable transitions; servo simulation at Ts ∈ {1/32, 1/8, 1} s plus a mid-run Ts change (§7.3 pass criteria); Ts derivation from logMessageInterval incl. rejection of −6, 2 and 0x7F (previous Ts kept, counter incremented); servo step rule in TRACKING and LOCKED (→ TRACKING, `i = 0`), ACQUIRE entered only at start and GM change, integrator frozen while clamped (a 600 ppm GM step-input test must not wind up: after the GM returns to −83 ppm, |offset| < 1 µs within 2× the normal lock time); responder skips Pdelay_Resp_Follow_Up across a step; model regression with synthetic brackets and outliers. **Step bookkeeping (rev 4, classification rev 5):** `classify_rx_gen` on slots (gen g, no AMBIG → g; AMBIG with any gen → Ambiguous); with `FakeDext` modelling the §3.6 dext rule and a **simulated 5 ms tick delay** after a step: a pre-step Sync and a pre-step 16R Pdelay_Req DMA'd before the step and harvested by the delayed (first settled) tick are AMBIG (Sync skipped, no second step; Pdelay_Req answered without Follow_Up), and slots from the next tick carry the new generation and are used; the current `gen` follows `hdr.clock_gen` after each StepClock/SetClock; a slot with `clock_gen` ahead of the header is dropped (`slot_gen_invalid`); a 100 µs step in the middle of a full NRR window moves the reported `nrr_systim` by ≤ 0.01 ppm and asCapable stays true; a Sync in an AMBIG slot or with an old `clock_gen` is skipped (`sync_step_skip`) and causes no second step; an ambiguous Pdelay_Req is answered without Follow_Up; a step decided while a `want_ts` frame is outstanding is issued only after the timestamp resolves or times out; an NRR of 1 + 1.5e−3 is rejected (`nrr_out_of_range`); asCapable stays true across the ACQUIRE SetClock (the pre-SetClock NRR is held) and the servo goes ACQUIRE → TRACKING without entering HOLDOVER; SetClock at ACQUIRE followed by a GM change seeds `f` from a single-generation NRR (no window ever mixes pre- and post-SetClock exchanges); syncEvent vector with a non-zero Sync correctionField (both correction fields added, 2^-16 scaling, negative values); a Pdelay_Resp waiting behind a held step for > 8 ms since its Pdelay_Req's harvest is dropped with `pdelay_resp_late_drop` and no Follow_Up, one at 7.9 ms is sent. **Port SM (rev 4):** one test per edge: Listening → Slave (first GM → ACQUIRE); Slave → Listening on announceReceiptTimeout with Ta from logMessageInterval 0 and −3 and the 1 s placeholder (servo → HOLDOVER, advertised GM = our clockIdentity, ADP re-advertise action emitted); Slave → Listening on asCapable false for > 3·Ta; Listening → Slave with the same GM (HOLDOVER → TRACKING on the next Sync with asCapable, no ACQUIRE); with a different GM (`gm_changes`, ACQUIRE); Slave → Slave GM change; Announce interval 5 and 0x7F rejected (Ta kept); Announce from our own clockIdentity or with our clockIdentity in the path trace rejected; HOLDOVER stays HOLDOVER while Syncs arrive with asCapable false (`sync_in_holdover`) |
 | avb-srp | applicant/registrar transition tables (every row); LeaveAll; PDU encode/decode vectors for Domain, TA, TF, Listener (four-packed), MVRP VID; NumberOfValues > 1 decode |
 | avb-avtp | AAF header decode vectors; stream-format decode/encode (§10.1 vectors); `decodable()` matrix |
-| avb-avdecc | ADP/AECP/ACMP encode/decode vectors; descriptor codecs round-trip; enumeration against a scripted fake talker (including timeouts, IN_PROGRESS, NOT_IMPLEMENTED); `derive` with a synthetic AEM of 3 streams × 4 ch, one with 17 AAF streams (refusal), and one with 2 AAF outputs around a CRF output at index 1 (CRF `unbound_by_design`, STREAM_INPUT 0 ↔ output 0, STREAM_INPUT 1 ↔ output 2, no exit 8); ACMP addressing (every encoded ACMPDU goes to 91:E0:F0:01:00:00); TA-vs-PROBE_TX mismatch switching the effective values; A-5 status classification against `A5_RESOURCE_STATUSES` (and a non-member such as LISTENER_EXCLUSIVE not classified); entity responder per command (status codes, STREAM_IS_RUNNING); ACMP listener SM: one test per §9.4 table row (including the rev-4 TA_WAIT row: no TA for 2 s → Asking Failed declared once, `ta_wait_expired` = 1, a TA at 3 s → SETTLED_RSV_OK with Ready; TA_WAIT not armed when Talker Failed is registered on entry; Talker Failed withdrawn row), plus the fallback window and reboot/rebind filter removal; controller binding (rev 4): with 3 streams, CONNECT_RX for j+1 is not sent before j's final outcome; a response with the wrong sequence_id, wrong listener_unique_id, wrong controller_entity_id, or the command message_type (loopback echo) is ignored and counted `acmp_ctrl_unmatched`; ACMP and AECP sequence counters advance independently; GET_AVB_INFO `msrp_mappings` reflects an adopted Domain (SRclassID 6, priority 2, VID 3) after a mismatch, not {6, 3, 2}; CLOCK_SOURCE 1 location following the reference index; model-id stability |
+| avb-avdecc | ADP/AECP/ACMP encode/decode vectors; descriptor codecs round-trip; enumeration against a scripted fake talker (including timeouts, IN_PROGRESS, NOT_IMPLEMENTED); `derive` with a synthetic AEM of 3 streams × 4 ch, one with 17 AAF streams (refusal), and one with 2 AAF outputs around a CRF output at index 1 (CRF `unbound_by_design`, STREAM_INPUT 0 ↔ output 0, STREAM_INPUT 1 ↔ output 2, no exit 8); ACMP addressing (every encoded ACMPDU goes to 91:E0:F0:01:00:00); TA-vs-PROBE_TX mismatch switching the effective values; A-5 status classification against `A5_RESOURCE_STATUSES` (and a non-member such as LISTENER_EXCLUSIVE not classified); entity responder per command (status codes, STREAM_IS_RUNNING); ACMP listener SM: one test per §9.4 table row (including the rev-4 TA_WAIT row: no TA for 2 s → Asking Failed declared once, `ta_wait_expired` = 1, a TA at 3 s → SETTLED_RSV_OK with Ready; Talker Failed withdrawn row; rev 5: Talker Failed already registered while in PRB_W_RESP, then PROBE_TX SUCCESS → Asking Failed declared on entry, A-5 classified for a code in `A5_FAILURE_CODES` and not for a non-member, TA_WAIT not armed; the same on entry via the probe fallback; TA and Talker Failed both registered on entry → TA row wins (Ready); SETTLED_RSV_OK with the TA's VID changed → `ta_probe_mismatch`, `SetStreamFilter` re-issued with the new VID, Ready still declared and no Lv emitted; SETTLED_RSV_OK with only accumulated latency changed → no filter call, new stream table with the new `early_bound`, Ready still declared; `last_available_index` updated on an ENTITY_AVAILABLE in SETTLED_RSV_OK and in PRB_W_RETRY, initialized from the ADP table at BIND_RX, and two successive reboots (index 5 → 1 → 6 → 0) both detected), plus the fallback window and reboot/rebind filter removal; controller binding (rev 4): with 3 streams, CONNECT_RX for j+1 is not sent before j's final outcome; a response with the wrong sequence_id, wrong listener_unique_id, wrong controller_entity_id, or the command message_type (loopback echo) is ignored and counted `acmp_ctrl_unmatched`; ACMP and AECP sequence counters advance independently; GET_AVB_INFO `msrp_mappings` reflects an adopted Domain (SRclassID 6, priority 2, VID 3) after a mismatch, not {6, 3, 2}; CLOCK_SOURCE 1 location following the reference index; model-id stability |
 | avb-mediaclock | DLL convergence with synthetic pt (±100 ppm, ns quantization), wrap, tv=0, sparse, mr reset, gaps; placement rounding; window stats |
-| avb-audioring | layout offsets; producer/consumer SPSC stress across 2 threads; overrun/skip; zero-fill; gap log |
-| avb-daemon | `txsched`: strict priority, drop-new on a full class (`TxFull` + counter), Pdelay_Resp sent next with the AVDECC queue full, a held `want_ts` frame not blocking non-timestamped frames, a pending step blocking new `want_ts` frames until it is issued; stream-table channels: with the return `sync_channel(4)` full, the audio side keeps the old table, counts `audio_return_full` and returns it on the next batch, all under the counting allocator (0 allocations on the audio side); `gptp` subcommand against `FakeDext` with a silent peer → exit 6 after `--discover-timeout`, with a Pdelay-only peer → runs to `--seconds`, `locked: false`, exit 0; WAV/RF64 header bytes (golden; 104 B header); RF64 switch at the 4 GiB boundary (sizes computed, no huge file written); pcap header; **pipeline test**: synthetic AEM (3 streams × 4 ch, INT_32BIT depth 24, 48 kHz) + generated AAF frames with jitter, a gap, a late packet and a reordered packet, fed through `audio` logic → ring → `rec` → WAV bytes. It checks alignment (AAF-7), zero-fill, counters, channel map and bit exactness, and runs under a counting allocator asserting 0 allocations inside the per-packet function (acceptance 14, NFR-3). A second case runs the same pipeline at 96 kHz / 12 spf with 2 streams × 6 ch and checks that lock_packets, lag_frames, capacity_frames and the WAV header follow the model (§10.5) |
+| avb-audioring | layout offsets; clock-block seqlock over atomic fields (f64 bit round-trip, concurrent writer/reader); producer/consumer SPSC stress across 2 threads; overrun/skip; zero-fill; gap log |
+| avb-daemon | `txsched`: strict priority, drop-new on a full class (`TxFull` + counter), Pdelay_Resp sent next with the AVDECC queue full, a held `want_ts` frame not blocking non-timestamped frames, a pending step blocking new `want_ts` frames until it is issued; the 8 ms Pdelay_Resp late-drop rule; stream-table channels: with the return `sync_channel(4)` full, the audio side keeps the old table, counts `audio_return_full` and returns it on the next batch, all under the counting allocator (0 allocations on the audio side); `gptp` subcommand against `FakeDext` with a silent peer → exit 6 after `--discover-timeout`, with a Pdelay-only peer → runs to `--seconds`, `locked: false`, exit 0; WAV/RF64 header bytes (golden; 104 B header); RF64 switch at the 4 GiB boundary (sizes computed, no huge file written); pcap header; **pipeline test**: synthetic AEM (3 streams × 4 ch, INT_32BIT depth 24, 48 kHz) + generated AAF frames with jitter, a gap, a late packet and a reordered packet, fed through `audio` logic → ring → `rec` → WAV bytes. It checks alignment (AAF-7), zero-fill, counters, channel map and bit exactness, and runs under a counting allocator asserting 0 allocations inside the per-packet function (acceptance 14, NFR-3). A second case runs the same pipeline at 96 kHz / 12 spf with 2 streams × 6 ch and checks that lock_packets, lag_frames, capacity_frames and the WAV header follow the model (§10.5) |
 | driver/tests | §3.7 list |
 
 Integration vs hardware: everything tagged [CODE] is covered above. [HW] items are proven only by M1–M5 runs (§4), and the build-verification doc must not claim them (VER-5).
@@ -1536,7 +1560,8 @@ Each milestone run uses `package.sh` → `avb-installer activate` → (user appr
 - No `/tmp`, `cd`, sudo, `csrutil`, `nvram` or `bputil` in code or scripts.
 - No hardcoded rate, channel or stream counts outside tests: grep for `48000`, `8000`, `192`, `65536`, `125_000`, `8 *` in non-test code. Rate-dependent thresholds must be the §10.5 durations converted with the model's rate/spf. The only allowed literals are the S_max = 16 limit, the 1722 nsr code table in `stream_format`, and the §10.3 class A observation interval.
 - Ownership rules match §3.2 (no ownership change in `InitDatapath`/`ShutdownDatapath`).
-- Every `v->stage`/`v->flags` write goes through `setStage`/`setFlags` (grep).
+- Every `v->stage`/`v->flags` write goes through `setStage`/`setFlags` (grep). `RingAttach` sets and `RingDetach`/`ClientGone` clear `AVB_FLAG_RINGS_ATTACHED | AVB_FLAG_OWNED` through `setFlags`, the clear before `rxMem` is released (§3.6). M0 checks it on hardware: `avb-probe info` shows both flags while a daemon owns the rings and neither after it exits (clean and SIGKILL).
+- `setClock()` is the only SYSTIM write sequence and is where `clockGen`, `hdr->clock_gen` and `rxStepArm` are updated (grep for SYSTIML/SYSTIMH writes).
 - Every ACMPDU is sent to 91:E0:F0:01:00:00.
 
 ## 15. Only confirmable on the real 16R
@@ -1582,7 +1607,7 @@ New:
 Changed:
 - `Cargo.toml` (members), `Cargo.lock`;
 - `driver/AVBShared.h` (§3.1, including `#include <stddef.h>` and `kAvbCtrRxOversize`);
-- `driver/AVBI210Driver/{AVBI210Driver.iig, AVBI210Driver.cpp, AVBI210UserClient.iig (adds `MarkRingsUsed`/`RingsUsed` LOCALONLY), AVBI210UserClient.cpp, I210Regs.h, I210Logic.hpp (adds `rxFrameBounds`, `rxVlanFlags`, `rxHarvestStep`)}`;
+- `driver/AVBI210Driver/{AVBI210Driver.iig, AVBI210Driver.cpp, AVBI210UserClient.iig (adds `MarkRingsUsed`/`RingsUsed` LOCALONLY), AVBI210UserClient.cpp, I210Regs.h, I210Logic.hpp (adds `rxFrameBounds`, `rxVlanFlags`, `rxHarvestStep`, `RxStepAmbig`/`rxStepArm`/`rxStepAmbiguous`)}`;
 - `driver/AVBBcmDriver/AVBBcmUserClient.cpp`: all three `kAvbSelCount` uses (lines 54, 66, 131) become `kAvbSelBaseCount`, with the `sizeof`-based static_assert (§3.1);
 - `driver/tests/i210logic_tests.cpp` and `driver/tests/tg3logic_tests.cpp`: both change `static_assert(AVB_ABI_VERSION == 2)` to `== 3` (mandatory: the build fails otherwise). tg3 also asserts `kAvbSelBaseCount == 10`; i210 adds the §3.1 offset literals and the §3.7 tests;
 - `crates/avb-probe/{Cargo.toml, src/lib.rs}` (`abi.rs` and `iokit.rs` move into `avb-dext`, re-exported). The probe's ABI check becomes v3. All probe commands keep working: `datapath`/`rx-ptp`/`pdelay` use the legacy PollRx mode, which stays available when no rings are attached. The multi-process flow (`datapath up` in one process, `rx-ptp`/`pdelay` in later ones) works because, with no ring owner, the data path outlives the probe process (§3.2). It works only while no daemon owns the rings; while one does, the probe's data-path commands get `kIOReturnExclusiveAccess` and its read-only commands (`info`, `regs`, `clock`) keep working. None are retired (DP-12);
@@ -1665,3 +1690,18 @@ All 8 findings are addressed; none are backlogged or ignored. No ABI v3 layout, 
 | 6 | NIT | Addressed. `msrp_mappings` uses the effective Domain from `avb_srp`; test with an adopted Domain | §9.3, §14.1 |
 | 7 | NIT | Addressed as proposed. One ACMP command in flight per listener id pair, sequential in j order, matched on message_type + 1, controller_entity_id, listener ids and sequence_id; separate controller ACMP u16 counter, distinct from AECP and from the listener entity's PROBE_TX counter (whose matching now also names message_type); GET_TX_STATE uses the controller counter with talker ids | §9.2, §9.4, §14.1 |
 | 8 | NIT | Addressed. `__atomic_store_n`/`__atomic_load_n` with RELEASE/ACQUIRE for heads, tails and live header fields; RELAXED 64-bit counter stores; Rust mirrors via `AtomicU64`/`AtomicU32` views with Acquire/Release/Relaxed | §3.4 |
+
+## 21. Review findings (pass 4) and responses
+
+All 8 findings are addressed; none are backlogged or ignored. The only ABI v3 change is finding 1's use of 4 bytes of `AvbRxSlot.pad1` and 4 bytes of `AvbShmHeader.reserved`; no selector, register access, dependency or other offset moved, and `AVB_RX_MEM_SIZE` is unchanged.
+
+| # | Sev | Response | Where |
+|---|---|---|---|
+| 1 | MED | Addressed with the suggested dext-side tagging; the daemon-side `harvest_mach` windows and the wrong 2048-descriptor justification are removed. `AvbRxSlot.clock_gen` (u32 at 40, `pad1` now 20 B at 44), `AVB_RXF_TS_STEP_AMBIG` (bit 3), `AvbShmHeader.clock_gen` (u32 at 896, `reserved` now 124 B at 900), `AVB_STEP_SETTLE_NS`. The `setClock()` helper (the only SYSTIM write sequence) increments `ivars->clockGen`, release-stores it into the header and arms `RxStepAmbig`. The pure `rxStepAmbiguous` marks every tick from the step through the first tick that **starts** ≥ 1 ms after the SYSTIM write as AMBIG; it uses measured tick start times, so a late timer only lengthens the ambiguous span and can't mislabel a pre-step frame. 1 ms is used rather than the suggested 100 µs so the settle window also covers draining a full RX packet buffer at line rate (*verify RXPBS*); WTHRESH = 1 (existing `rxdctlEnable()`) covers descriptor write-back. The daemon takes AMBIG → AMBIGUOUS, else `slot.clock_gen`; current `gen` = `hdr.clock_gen` after each StepClock/SetClock (owner-only, so exact). New invariant row, writer-table row, static_asserts (C++ and Rust literals), a `slot_gen_invalid` trust-boundary check, host tests for `rxStepAmbiguous` including the simulated 5 ms tick delay, and FakeDext-based stepgen tests (first settled tick AMBIG, next tick new generation) | §3.1, §3.4, §3.6, §3.7, §5.2, §7.3, §7.6, §13.2, §14.1, §14.4, §17 |
+| 2 | MED | Addressed as proposed. The Talker Failed row now reads "registered (or, on entry to SETTLED_NO_RSV, already registered with no TA registered)": Asking Failed is declared, A-5 is classified for `A5_FAILURE_CODES`, TA_WAIT isn't armed. Entry evaluation order is fixed: TA, then Talker Failed, then arm TA_WAIT, so entry always leads to a declaration or an armed timer. New row `SETTLED_RSV_OK \| TA attributes changed → SETTLED_RSV_OK` applies §8.2 (compare, `ta_probe_mismatch`, effective values, `SetStreamFilter` + stream table on MAC/VID change, stream table only on a TSpec/latency change), and Ready stays declared. §8.2 now points at both rows (`TalkerChanged` from `avb_srp`). Tests for each new row in §14.1 | §8.2, §9.4, §14.1 |
+| 3 | NIT | Addressed. The pre-SetClock NRR is held across the ACQUIRE SetClock exactly as across a StepClock (NRR is offset-invariant). The GM-change ACQUIRE seed still always comes from a single-generation NRR. The test is now "asCapable stays true across the ACQUIRE SetClock, no HOLDOVER" | §7.3, §14.1 |
+| 4 | NIT | Addressed. `syncEvent = preciseOriginTimestamp + (FU.correctionField + Sync.correctionField)·2^-16 + delay_comp·rateRatio/NRR_systim`, with a comment that Sync's value is expected to be 0 in two-step (*verify clause*). Vector with a non-zero Sync correctionField | §7.3, §14.1 |
+| 5 | NIT | Addressed with the drop option. A Pdelay_Resp is dropped together with its Follow_Up if `mach_now − harvest_mach` of the Pdelay_Req exceeds 8 ms when it reaches `SendFrame`, counted `pdelay_resp_late_drop`. Mach is used because it is unaffected by steps. The other option (letting Pdelay_Resp bypass a held step) was not taken because its outstanding timestamp would hold the step again | §7.2, §7.6, §14.1 |
+| 6 | NIT | Addressed as proposed. The §10.6 clock block is accessed only through `AtomicU32`/`AtomicU64` (f64 bits), with the specified fence protocol. `avb_core::SeqLock` becomes `SeqLock<T: SeqWords<N>, N>` over `[AtomicU64; N]`, with the same protocol and a 1000-retry bound that returns `Err(Contended)`. Tests in avb-core and avb-audioring | §5.1, §10.6, §14.1 |
+| 7 | NIT | Addressed as proposed. `RingAttach` calls `setFlags(set RINGS_ATTACHED \| OWNED)` after allocating and setting the owner. `RingDetach` and `ClientGone` clear both before `rxMem` is released. Writer table, review checklist and an M0 check with `avb-probe info` | §3.3, §3.4, §3.6, §14.4 |
+| 8 | NIT | Addressed. `last_available_index` is initialized from the ADP table at BIND_RX and updated on every ENTITY_AVAILABLE from the talker in every bound state, after the reboot comparison. The ADP table tracks it while UNBOUND. Test with two successive reboots | §9.4, §14.1 |
