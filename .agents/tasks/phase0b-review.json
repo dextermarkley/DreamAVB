@@ -1,0 +1,24 @@
+{
+  "verdict": "APPROVED",
+  "findings": [
+    {
+      "severity": "non-blocking",
+      "confidence": "likely",
+      "title": "BCM rollback path",
+      "detail": "avb-installer deactivate --dext bcm57762 submits a deactivation for an extension the new AVBInstaller.app no longer embeds; sysextd will likely reject it as not found. Document `systemextensionsctl uninstall 8NG8NMGYVF com.avbaudio.installer.bcm57762` as the BCM rollback, or drop the --dext bcm57762 form."
+    },
+    {
+      "severity": "non-blocking",
+      "confidence": "confirmed (code behaviour); impact possible",
+      "title": "Inherited Bus Master not cleared in Start",
+      "detail": "AVBI210Driver::Start sets Memory Space only and never clears an inherited Bus Master bit, so a device left with queues enabled could keep DMAing to dead IOVAs through Stage A. Clear kCmdBusMaster in Start next to the Memory Space set."
+    },
+    {
+      "severity": "non-blocking",
+      "confidence": "confirmed",
+      "title": "PHY semaphore held after a fault",
+      "detail": "setupLink calls phyRelease only when ok(v), so an MDIC READY timeout or all-ones read mid-burst leaves SW_FW_SYNC.SW_PHY_SM set for the next driver. Accept and document it as part of the fault-latch contract, or allow the single release write after a fault."
+    }
+  ],
+  "reviewDoc": "/Users/dexter/AVB-Audio/.agents/tasks/phase0b-review.md"
+}
