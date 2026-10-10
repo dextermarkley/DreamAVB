@@ -1,0 +1,114 @@
+# AVB-Audio: context handoff (2026-10-10)
+
+Native macOS AVB audio bridge. Our own NIC driver plus a Rust stack exposes a PreSonus StudioLive 16R (Milan firmware 3.3.0.109659) to DAWs (Pro Tools, Reaper) as a Core Audio device. Apple's AVB stack is bypassed entirely.
+
+Read this file first, then `AGENTS.md` (rules) and the docs it points to.
+
+## Where things stand
+
+- Phase 0 is done: the Broadcom BCM57762 in Apple's Thunderbolt Gigabit adapter is rejected. RX PTP timestamps never latch. See `docs/phase0-results.md`.
+- Phase 0b is done: the Intel I210 passes every hardware gate against the 16R. Link delay is about 143 ns ± 2.5 ns and NRR is stable. See `docs/phase0b-i210-results.md`.
+- Phase 1a (16R → Mac recording to WAV, listener only) is in progress on branch `phase1a-listener`.
+  - The design is approved at rev 5: `.agents/tasks/phase1a-design.md`. Design review pass 5 is APPROVED.
+  - The plan is `.agents/tasks/phase1a-plan.md`. It is split into FEAT files under `.agents/tasks/task-phase1a-listener/`.
+
+| FEAT | Scope | Status | Commit |
+|---|---|---|---|
+| 001 | Dext ABI v3: shared RX rings, classifier, StepClock, counters, stream filter (C++) | done | `013d733` |
+| 002 | `avb-core`, `avb-dext` (ABI mirror, shm consumer), probe `counters` | done | `b002a39` |
+| 003 | `avb-gptp` (slave-only 802.1AS, servo), `avb-srp` (MRP/MSRP/MVRP) | done | `ffb83e3` |
+| 004 | `avb-avtp` (AAF, stream format) + `avb-avdecc` (ADP/AECP/ACMP, controller, listener entity, ListenerSm) | **in progress, WIP commit** | see `git log` |
+| 005 | `avb-mediaclock`, `avb-audioring`, `avb-daemon` (`record` CLI), packaging | pending | |
+
+After FEAT-005 the plan is:
+- An implement-and-review loop over the whole diff. The reviewer always runs last and gates the loop.
+- Four hardware milestones, in order:
+  1. hw-gptp: lock to the 16R as GM for at least 5 minutes, with asCapable true.
+  2. hw-avdecc: dump the full AEM to JSON.
+  3. hw-streams: bind all of the 16R's STREAM_OUTPUTs and confirm 8000 pkt/s per stream.
+  4. hw-audio: a 600 s multichannel WAV with no sequence gaps and the media-clock drift in ppm. Pause and ask the user to feed signal into specific 16R inputs so channel mapping can be checked.
+- `docs/phase1a-results.md`.
+
+Phase 1b (next) covers three things. The first is a Rust Core Audio AudioServerPlugIn, an input-only device fed from the audio ring. The second is a small macOS app showing status and a sample-rate selector driven by the 16R's AEM. Rate changes go through the daemon, then AVDECC, then `RequestDeviceConfigurationChange`. The third is validation in Reaper, then Pro Tools. The feasibility report covers the model under "Sample rates".
+
+### FEAT-004 resume point
+
+- `crates/avb-avtp/` is drafted: `common.rs`, `aaf.rs`, `stream_format.rs` and `lib.rs`, about 800 lines. It is untested and unreviewed.
+- `crates/avb-avdecc/` has only `Cargo.toml` and `src/wire.rs`.
+- Neither crate is in the workspace `members` yet, so the workspace gate below still passes.
+
+Resume from `.agents/tasks/task-phase1a-listener/features/FEAT-004.json`:
+1. Check `avb-avtp` against design §10.1/§10.2.
+2. Add its tests.
+3. Continue at step 2 (the `avb-avdecc` crates).
+4. Add both crates to `Cargo.toml` members as the last step.
+
+## Verified at handoff
+
+This was run on the `phase1a-listener` HEAD before the WIP commit:
+- `cargo test --workspace --locked`: all pass. That covers core 22, dext 28, gptp 59, probe 16 and srp 30.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- C++ host tests: 341 i210 checks and 97 tg3 checks pass.
+
+The xcodebuild and package steps were not re-run at handoff. They last passed in FEAT-001.
+
+## Gate commands
+
+Run all of these from the repo root with absolute paths. Never `cd`.
+
+```
+TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ cargo fmt    --manifest-path /Users/dexter/AVB-Audio/Cargo.toml --all --check
+TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ cargo clippy --manifest-path /Users/dexter/AVB-Audio/Cargo.toml --workspace --all-targets --locked -- -D warnings
+TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ cargo test   --manifest-path /Users/dexter/AVB-Audio/Cargo.toml --workspace --locked
+TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ make -C /Users/dexter/AVB-Audio/driver/tests test
+/usr/bin/xcodebuild -project /Users/dexter/AVB-Audio/driver/AVBI210Driver.xcodeproj -scheme AVBI210Driver -configuration Debug -sdk driverkit \
+  -derivedDataPath /Users/dexter/AVB-Audio/.agents/tmp/DerivedData SYMROOT=/Users/dexter/AVB-Audio/build/driver \
+  OBJROOT=/Users/dexter/AVB-Audio/build/driver/obj CODE_SIGNING_ALLOWED=NO build
+/Users/dexter/AVB-Audio/scripts/package.sh          # signed; --adhoc for an unsigned build check
+```
+
+## Repo map
+
+- `driver/AVBShared.h`: the C++ ABI (v3), mirrored in `crates/avb-dext/src/abi.rs` with offset tests.
+- `driver/AVBI210Driver/`: the I210 PCIDriverKit dext. `I210Regs.h` and `I210Logic.hpp` hold pure helpers with host tests.
+- `driver/AVBBcmDriver/`: the Broadcom dext. Shelved, but kept in the repo.
+- `driver/tests/`: C++ host tests (`make`).
+- `crates/`:
+  - `avb-core`, `avb-dext`, `avb-gptp`, `avb-srp`: done.
+  - `avb-avtp`, `avb-avdecc`: WIP.
+  - `avb-probe`: the hardware test CLI.
+  - `avb-installer`: the `OSSystemExtensionRequest` activate/deactivate tool.
+- `scripts/package.sh`: builds, signs and stamps the version, then produces `build/AVBInstaller.app`.
+- `docs/`: hardware results.
+- `.agents/tasks/`: requirements, design, reviews, plans, verification evidence and raw hardware JSON.
+
+## Host and hardware state
+
+- Mac16,8 (Apple Silicon), macOS 26.5.2.
+- SIP is **disabled**, `boot-args=amfi_get_out_of_my_way=1` is set, and `systemextensionsctl developer on`.
+- To undo: `sudo nvram -d boot-args`, `systemextensionsctl developer off`, then `csrutil enable` from Recovery.
+- Signing uses "Apple Development: armitage787@gmail.com", Team `8NG8NMGYVF`. This is a free personal team with no DriverKit profile. That is why AMFI is disabled.
+- Our dext `com.avbaudio.installer.i210` (282.7.31, the Phase 0b build) owns the I210, 8086:1533 / subsystem 1ab6:0214, behind Thunderbolt. en7 is gone while we own it.
+  - The ABI v3 dext from FEAT-001 has **not** been activated on hardware yet.
+- The I210 is cabled directly to the 16R. There is no switch. The 16R's gPTP port identity is `00:0a:92:ff:fe:03:3b:a9/1`.
+- The Broadcom adapter (en8) is back on Apple's `BCM5701Enet`. Never touch it.
+- The user's LAN is Wi-Fi.
+
+## Hard-won lessons
+
+- The dext `CFBundleVersion` must be a kext-style version. `package.sh` stamps `<days since 2026-01-01>.<UTC hour>.<UTC minute>`. Bump it on every rebuild.
+- The dext binary must be **arm64e**. A plain arm64 DriverKit binary gets matched, then refused at exec, and Apple's driver takes the device instead.
+- Upgrading an already-approved dext activates without re-approval. A replug of the I210 adapter may be needed to rematch. Run `avb-installer activate` yourself and check `ioreg` and the kernelmanagerd log before asking the user to do anything.
+- I210: RX timestamps are in-buffer (TSIP), with TSYNCRXCTL 0x19, ETQF3 0x440088F7 and SRRCTL0 0xC2000402. The TIMINCA base is 0x00346dc6. The 1000 Mb/s latency constants are TX 178 ns and RX 448 ns. RQDPC(0) wraps instead of clearing on read. The adapter's crystal runs about +75 ppm against mach.
+- 16R / Milan streams are AAF PCM 32-bit, 8 ch per stream, 6 samples/frame at 48 kHz, class A. Rates and channel counts must come from the AEM, never be hardcoded.
+- GPL/LGPL references (Linux tg3/igb, igb_avb kernel part, L-Acoustics avdecc) may be used for behavior only. Never copy their code.
+- Distribution later needs a paid Apple Developer account plus a DriverKit PCI entitlement request for 8086:1533. The odds are better than for the Broadcom.
+
+## User decisions
+
+- Listener only (record 16R → Mac) until Phase 1 works. Keep the design talker-ready.
+- I210 first. Switches and other mixer models come later.
+- Start at 48 kHz. Add 44.1 kHz only if the AEM advertises it. The sample rate must be selectable in a macOS app.
+- Receive all of the 16R's output streams. Our daemon is the AVDECC controller, so no Hive is needed.
+- gPTP priority1 = 255, so the 16R is grandmaster.
+- Pin dependency versions exactly. Commit locally only and never push. Never change boot security or NVRAM yourself; give the user the commands.

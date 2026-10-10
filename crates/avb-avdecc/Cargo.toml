@@ -1,0 +1,17 @@
+[package]
+name = "avb-avdecc"
+description = "Sans-IO IEEE 1722.1-2021 / Milan v1.2 AVDECC: ADP, AECP AEM + MVU, ACMP, AEM model and dump, controller, our listener entity, derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "avb_avdecc"
+path = "src/lib.rs"
+
+[dependencies]
+avb-core = { path = "../avb-core" }
+avb-avtp = { path = "../avb-avtp" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
