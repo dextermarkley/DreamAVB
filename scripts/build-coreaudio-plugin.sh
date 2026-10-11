@@ -31,19 +31,27 @@ cp "$ROOT/crates/avb-coreaudio/Info.plist" "$BUNDLE/Contents/Info.plist"
 # CFBundleExecutable is "AVBAudio".
 cp "$DYLIB" "$BUNDLE/Contents/MacOS/AVBAudio"
 
-# Sign with a real signing identity, not ad-hoc. On macOS 11+ the sandboxed HAL
-# host (library validation) silently refuses to load an ad-hoc AudioServerPlugIn
-# — no log, no device. Every other HAL plug-in on a stock machine is Developer-ID
-# signed; ours must be signed with a real identity too. Override the identity with
-# CODESIGN_IDENTITY; defaults to the Apple Development cert on this machine.
-CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-Apple Development: armitage787@gmail.com (32P75VK9W8)}"
-echo "signing as: $CODESIGN_IDENTITY"
-# Plain hardened-runtime signing, NO entitlements. An Apple Development cert
+# Sign AD-HOC, WITHOUT hardened runtime. This is the form the sandboxed HAL
+# host (com.apple.audio.Core-Audio-Driver-Service.helper) actually dlopens for
+# a locally-installed plug-in.
+#
+# Do NOT sign with an Apple Development cert + --options runtime: hardened
+# runtime turns on library validation in the helper, and a Development cert
 # cannot grant com.apple.security.cs.disable-library-validation without a
-# provisioning profile — codesign silently drops it and the resulting state is
-# SIGKILLed "Code Signature Invalid" at dlopen. This plain form loads cleanly.
-codesign --force --options runtime --timestamp=none \
-  --sign "$CODESIGN_IDENTITY" "$BUNDLE"
+# provisioning profile. The helper then SIGKILLs the load with
+# "EXC_BAD_ACCESS (Code Signature Invalid) / CODESIGNING Invalid Page" at
+# dlopen — the device silently never appears. (Observed 2026-10-11: the
+# Development+runtime form crashed the helper three times; adhoc loads cleanly.)
+# Override with CODESIGN_IDENTITY only for a Developer-ID distribution build.
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+echo "signing as: ${CODESIGN_IDENTITY} (adhoc = '-')"
+if [ "$CODESIGN_IDENTITY" = "-" ]; then
+  codesign --force --sign - "$BUNDLE"
+else
+  # A real distribution identity: Developer-ID style, hardened runtime is fine.
+  codesign --force --options runtime --timestamp=none \
+    --sign "$CODESIGN_IDENTITY" "$BUNDLE"
+fi
 
 echo "done: $BUNDLE"
 echo
