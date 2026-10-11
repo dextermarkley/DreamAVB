@@ -90,6 +90,33 @@ impl AudioRing {
         Ok(ring)
     }
 
+    /// Attach to a borrowed mapping and INITIALISE its header from `config`
+    /// (the shm creator / producer side, Phase 1b-1). Like `new_anonymous` but
+    /// over memory the caller mapped (e.g. an `shm_open`ed segment). Does not
+    /// own the mapping — the caller unmaps it.
+    ///
+    /// # Safety
+    /// `ptr` must point to at least `config.total_bytes()` writable bytes that
+    /// stay valid for the ring's lifetime, and `len >= config.total_bytes()`.
+    pub unsafe fn init_raw(
+        ptr: *mut u8,
+        len: usize,
+        config: &RingConfig,
+    ) -> Result<Self, RingError> {
+        if !config.is_valid() || len < config.total_bytes() {
+            return Err(RingError::BadConfig);
+        }
+        let ring = Self {
+            owning: Owning::Borrowed { ptr, len },
+            capacity_frames: u64::from(config.capacity_frames),
+            frame_bytes: config.frame_bytes() as usize,
+            channels: config.channels,
+            data_offset: layout::HEADER_SIZE,
+        };
+        ring.init_header(config);
+        Ok(ring)
+    }
+
     /// Attach to an existing mapping (Phase 1b). Validates magic, version and
     /// sizes; does NOT write the header.
     ///

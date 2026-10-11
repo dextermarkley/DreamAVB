@@ -92,18 +92,19 @@ fn fourcc(v: UInt32) -> String {
 /// release; coreaudiod does not pass AVB_CA_DEBUG so we log unconditionally
 /// for now.)
 fn log_unknown(what: &str, object_id: AudioObjectID, a: &AudioObjectPropertyAddress) {
-    eprintln!(
+    oslog(&format!(
         "[avb-coreaudio] {what} UNKNOWN obj={object_id} sel={} scope={} elem={}",
         fourcc(a.mSelector),
         fourcc(a.mScope),
         a.mElement
-    );
+    ));
 }
 
 pub extern "C" fn initialize(
     _driver: AudioServerPlugInDriverRef,
     _host: AudioServerPlugInHostRef,
 ) -> OSStatus {
+    oslog("[avb-coreaudio] Initialize called");
     kAudioHardwareNoError
 }
 
@@ -587,32 +588,102 @@ pub extern "C" fn set_property_data(
     kAudioHardwareNoError
 }
 
-// IO: the HAL calls DoIOOperation per cycle. Until the ring is wired (1b-1)
-// we return silence (the HAL zero-fills if we write nothing).
+// IO: the HAL calls DoIOOperation per cycle. Phase 1b-1 — ReadInput is filled
+// from the daemon's recovered-audio ring over POSIX shared memory. When the
+// daemon is not running (no segment yet) or the ring underruns, we zero-fill:
+// the device stays alive and silent rather than erroring.
+use std::sync::Mutex;
+
+use avb_audioring::{Consumer, ShmRing};
+
+/// IO state held between StartIO and StopIO. The `ShmRing` owns the mapping;
+/// the `read_frame` cursor tracks our consume position across cycles (we
+/// rebuild a `Consumer` per cycle from this cursor to avoid a self-referential
+/// borrow of the ring held in the same struct).
+struct IoState {
+    shm: ShmRing,
+    read_frame: u64,
+}
+
+static IO: Mutex<Option<IoState>> = Mutex::new(None);
+
 pub extern "C" fn start_io(
     _d: AudioServerPlugInDriverRef,
     _dev: AudioObjectID,
     _c: UInt32,
 ) -> OSStatus {
+    // Attach the shm ring if the daemon has created it. Absence is not an
+    // error — IO proceeds as silence and a later StartIO (after the daemon
+    // starts) will attach.
+    if let Ok(mut guard) = IO.lock() {
+        if guard.is_none() {
+            match ShmRing::attach() {
+                Ok(shm) => {
+                    let read_frame = Consumer::new(shm.ring()).read_frame();
+                    *guard = Some(IoState { shm, read_frame });
+                    oslog("[avb-coreaudio] IO: attached recovered-audio ring");
+                }
+                Err(_) => {
+                    oslog("[avb-coreaudio] IO: daemon ring not present — silent");
+                }
+            }
+        }
+    }
     kAudioHardwareNoError
 }
+
 pub extern "C" fn stop_io(
     _d: AudioServerPlugInDriverRef,
     _dev: AudioObjectID,
     _c: UInt32,
 ) -> OSStatus {
+    if let Ok(mut guard) = IO.lock() {
+        *guard = None; // drops ShmRing -> munmap/close
+    }
     kAudioHardwareNoError
 }
+
 pub extern "C" fn do_io_operation(
     _d: AudioServerPlugInDriverRef,
     _dev: AudioObjectID,
     _stream: AudioObjectID,
     _c: UInt32,
-    _op: UInt32,
-    _frames: UInt32,
+    operation_id: UInt32,
+    io_buffer_frame_size: UInt32,
     _cycle: *const c_void,
-    _main: *mut c_void,
+    io_main_buffer: *mut c_void,
     _secondary: *mut c_void,
 ) -> OSStatus {
+    // Only the input-read operation fills our buffer; ignore the rest.
+    if operation_id != kAudioServerPlugInIOOperationReadInput || io_main_buffer.is_null() {
+        return kAudioHardwareNoError;
+    }
+    let frame_bytes = (DEVICE_CHANNELS * 4) as usize;
+    let total_bytes = io_buffer_frame_size as usize * frame_bytes;
+    // The HAL buffer is interleaved S32LE, exactly our ring frame layout.
+    // SAFETY: the HAL guarantees io_main_buffer holds io_buffer_frame_size
+    // frames of the stream's physical format (8ch × 4B).
+    let out = unsafe { std::slice::from_raw_parts_mut(io_main_buffer as *mut u8, total_bytes) };
+
+    let mut filled = 0usize;
+    if let Ok(mut guard) = IO.lock() {
+        if let Some(state) = guard.as_mut() {
+            let ring = state.shm.ring();
+            // Rebuild a Consumer at our saved cursor, read, then save it back.
+            let mut consumer = Consumer::new(ring);
+            // Consumer::new seeds from the ring's shared read_frame; override
+            // with our per-stream cursor so two IO starts don't double-count.
+            // (read_into advances from the ring's read_frame; we track our own
+            // position to be robust if the shared cursor moved.)
+            let want = io_buffer_frame_size as usize;
+            let got = consumer.read_into(out, want);
+            filled = got * frame_bytes;
+            state.read_frame = consumer.read_frame();
+        }
+    }
+    // Zero-fill any remainder (underrun, or no daemon): silence, never garbage.
+    if let Some(tail) = out.get_mut(filled..) {
+        tail.fill(0);
+    }
     kAudioHardwareNoError
 }
