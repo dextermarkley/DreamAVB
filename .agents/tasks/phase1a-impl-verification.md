@@ -615,3 +615,55 @@ enable/arm step on the device rather than a listener-presence condition.
 
 Gate (green): fmt, `clippy --workspace --all-targets -D warnings`, 320 workspace
 tests, C++ tg3 97 + i210 341, `package.sh --adhoc`.
+
+## hw-streams — PASSED (8 × 8000 pkt/s, 0 loss, on the live 16R)
+
+The `streams` runner receives all of the 16R's AAF output streams end to end:
+gPTP lock → AEM enumeration → Milan settled-state connect → MSRP/MVRP
+reservation → AAF audio. Final hardware result (`hw-streams-pass.json`):
+
+- **8 streams** (`0x000a92033ba9_0001 … _0008`), each **7999–8000 pkt/s** — the
+  Class A rate — with **0 sequence gaps**.
+- dext counters: `rx_stream=967433` over 15 s = 64,495/s = 8 × 8000/s;
+  `drop_unbound_stream=0`, `drop_untagged_stream=0`, `ring_overrun_audio=0`.
+- Stream `_0000` is the 16R's one IEC-61883/AM824 output (not AAF); correctly
+  not counted as an AAF stream.
+
+### The three root causes fixed to get here
+
+1. **Milan settled-state ordering (the headline).** Per Milan v1.2 tables
+   5.28-5.30 (kebag-logic/milan-fpga #54 defect 5), the Listener Ready
+   attribute must be declared ONLY after the stream settles — i.e. after the
+   talker registers a Talker Advertise — not proactively at bind. We had been
+   declaring it proactively; the strict Milan talker (16R) responded with only
+   empty Talker-Advertise LeaveAll. Declaring VID+Domain first, waiting for the
+   16R to register our Domain, letting ACMP CONNECT_TX prompt the talker, and
+   declaring Listener Ready only on the registered Talker Advertise made the
+   16R advertise and stream.
+
+2. **AAF decode was fed the whole Ethernet frame.** The audio ring delivers the
+   full L2 frame (dest/src/VLAN/ethertype then the AVTP payload); we passed
+   `slot.data` straight to `aaf::decode`, so every frame "failed" to decode even
+   though the dext was delivering them (`rx_stream` climbing while the JSON
+   showed 0). Fixed by stripping the Ethernet/VLAN header
+   (`EthFrame::parse(...).payload`) before `aaf::decode`.
+
+3. **1 ms drain throttle caused ring overrun.** At 8 × 8000 pkt/s (~64k/s) a
+   per-iteration 1 ms sleep let the dext audio ring overflow (counted ~2184/s
+   with huge seq_gaps). Busy-draining the audio ring closed the gaps to 0 and
+   brought every stream to the full 8000/s.
+
+### Diagnosis aids added (kept as operator diagnostics)
+
+- GET_STREAM_INFO per STREAM_OUTPUT; explicit Talker Failed handling (code 8 =
+  "egress port not AVB-capable" when the SR domain is not yet settled on the
+  link — a domain-timing race, resolved by waiting for DomainRegistered before
+  connecting; our gPTP is stably asCapable, path_delay ~150 ns).
+- dext RX counter dump (rx_stream / drops / ring overrun) and an audio-ring
+  raw-vs-decoded tally.
+- `AVB_TXCAP=<path>` env writes a libpcap of every transmitted frame (the I210
+  cannot be tcpdump'd while our dext owns it) — used to byte-diff our ACMP/MSRP
+  against a known-good Apple AVB capture taken on the Broadcom NIC.
+
+Gate green: fmt, `clippy --workspace --all-targets -D warnings`, 321 workspace
+tests, C++ tg3 97 + i210 341, `package.sh --adhoc`.

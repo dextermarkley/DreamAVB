@@ -1,0 +1,57 @@
+{
+  "elapsed_s": 15.00005775,
+  "schema": "avb-streams/1",
+  "settled_streams": 4,
+  "streams": [
+    {
+      "packets": 119993,
+      "packets_per_s": 7999.502535248573,
+      "seq_gaps": 0,
+      "stream_id": "0x000a92033ba90001"
+    },
+    {
+      "packets": 119992,
+      "packets_per_s": 7999.435868838572,
+      "seq_gaps": 0,
+      "stream_id": "0x000a92033ba90002"
+    },
+    {
+      "packets": 119992,
+      "packets_per_s": 7999.435868838572,
+      "seq_gaps": 0,
+      "stream_id": "0x000a92033ba90003"
+    },
+    {
+      "packets": 119992,
+      "packets_per_s": 7999.435868838572,
+      "seq_gaps": 0,
+      "stream_id": "0x000a92033ba90004"
+    },
+    {
+      "packets": 119992,
+      "packets_per_s": 7999.435868838572,
+      "seq_gaps": 0,
+      "stream_id": "0x000a92033ba90005"
+    },
+    {
+      "packets": 119991,
+      "packets_per_s": 7999.369202428571,
+      "seq_gaps": 0,
+      "stream_id": "0x000a92033ba90006"
+    },
+    {
+      "packets": 119991,
+      "packets_per_s": 7999.369202428571,
+      "seq_gaps": 0,
+      "stream_id": "0x000a92033ba90007"
+    },
+    {
+      "packets": 119991,
+      "packets_per_s": 7999.369202428571,
+      "seq_gaps": 0,
+      "stream_id": "0x000a92033ba90008"
+    }
+  ],
+  "streams_with_traffic": 8,
+  "talker": "0x000a92fffe033ba9"
+}

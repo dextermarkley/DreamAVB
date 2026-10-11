@@ -49,13 +49,16 @@ match over Apple's generic E1000 driver. The 16R is cabled to the I210.
 
 What is left in Phase 1a:
 
-1. **hw-streams** — bind all STREAM_OUTPUTs, confirm 8000 pkt/s per stream.
-   Reuses the hw-gptp bring-up + ADP/AECP path and the fixed avdecc codecs; the
-   `streams` runner's loop body still needs implementing like `gptp`/`aem-dump`.
+1. **hw-streams** — DONE. The `streams` runner receives all 8 of the 16R's AAF
+   output streams at 8000 pkt/s each, 0 sequence gaps, on the live 16R. Three
+   root causes fixed (Milan settled-state order: Listener Ready only after a
+   Talker Advertise; AAF decode must strip the Ethernet/VLAN header; busy-drain
+   the audio ring to avoid overrun at ~64k pkt/s). Evidence:
+   `.agents/tasks/hw-streams-pass.json`. See `phase1a-impl-verification.md`.
 2. **hw-audio** — a 600 s multichannel WAV, no sequence gaps, media-clock drift
    in ppm. The `record` runner's loop still needs implementing. **This one needs
    the user**: pause and ask them to feed signal into specific 16R inputs so the
-   channel map can be checked.
+   channel map can be checked. (The stream RX path is now proven by hw-streams.)
 3. `docs/phase1a-results.md` from the milestone runs.
 
 ### Hardware bugs fixed (all in `phase1a-impl-verification.md`)

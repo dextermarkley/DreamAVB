@@ -1565,6 +1565,50 @@ fn streams_loop(
         "declared VID + Domain; awaiting Talker Advertise before Listener Ready",
     );
 
+    // Wait for the 16R to REGISTER our MSRP Domain before prompting the talker.
+    // A Talker Failed code 8 ("egress port not AVB-capable") appears when the
+    // talker is evaluated before the SR domain is established on the link; our
+    // gPTP is stably asCapable (path_delay ~150 ns), so the flapping is a
+    // domain-timing race, not a timestamp-quality problem. Establish the SR
+    // domain first (up to ~5 s), then connect.
+    {
+        let domain_deadline = ns_since(start).saturating_add(5_000_000_000);
+        let mut domain_ok = false;
+        while ns_since(start) < domain_deadline && !shutdown_requested() {
+            srp.poll(srp_now(), &mut srp_out);
+            drain_srp(dext, &mut srp_out);
+            for slot in dext.rx_ctl() {
+                if let Ok(p) = EthFrame::parse(&slot.data) {
+                    if matches!(p.hdr.ethertype, ETHERTYPE_MSRP | ETHERTYPE_MVRP) {
+                        let meta = RxMeta {
+                            desc_vlan_tci: slot.desc_vlan_tci,
+                            ..Default::default()
+                        };
+                        let _ = srp.handle_rx(srp_now(), &slot.data, meta);
+                    }
+                }
+            }
+            while let Some(ev) = srp.pop_event() {
+                if matches!(ev, SrpEvent::DomainRegistered(_)) {
+                    domain_ok = true;
+                }
+            }
+            if domain_ok {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        log.log(
+            Level::Info,
+            "srp",
+            if domain_ok {
+                "16R registered our SR Domain; proceeding to connect"
+            } else {
+                "SR Domain not confirmed within 5 s; proceeding anyway"
+            },
+        );
+    }
+
     // Drive ACMP (probe) and SRP (reservation) together until every stream
     // has a Listener Ready declared and its filter installed, or the deadline
     // passes. The SRP Talker Advertise is the authoritative source of
@@ -1873,6 +1917,9 @@ fn streams_loop(
     let mut counts: std::collections::BTreeMap<u64, u64> = Default::default();
     let mut gaps: std::collections::BTreeMap<u64, u64> = Default::default();
     let mut last_seq: std::collections::BTreeMap<u64, u8> = Default::default();
+    let mut raw_audio_slots: u64 = 0;
+    let mut aaf_decode_fail: u64 = 0;
+    let mut first_slot_dump: Option<Vec<u8>> = None;
     let run_ns = seconds.saturating_mul(1_000_000_000);
     let interval_ns = interval.max(1).saturating_mul(1_000_000_000);
     let count_start = now_mach();
@@ -1971,7 +2018,20 @@ fn streams_loop(
             }
         }
         for slot in dext.rx_audio() {
-            if let Ok(pdu) = avb_avtp::aaf::decode(&slot.data) {
+            raw_audio_slots += 1;
+            if first_slot_dump.is_none() {
+                first_slot_dump = Some(slot.data.iter().take(32).copied().collect::<Vec<_>>());
+            }
+            // The audio ring delivers the full Ethernet frame; AAF decode wants
+            // the AVTP payload. Strip the Ethernet (and VLAN) header first.
+            let payload = match EthFrame::parse(&slot.data) {
+                Ok(p) => p.payload,
+                Err(_) => {
+                    aaf_decode_fail += 1;
+                    continue;
+                }
+            };
+            if let Ok(pdu) = avb_avtp::aaf::decode(payload) {
                 let sid = pdu.hdr.stream.stream_id.0;
                 *counts.entry(sid).or_insert(0) += 1;
                 let seq = pdu.hdr.stream.seq;
@@ -1982,6 +2042,8 @@ fn streams_loop(
                     }
                 }
                 last_seq.insert(sid, seq);
+            } else {
+                aaf_decode_fail += 1;
             }
         }
         if ns_since(last_report) >= interval_ns {
@@ -1999,11 +2061,45 @@ fn streams_loop(
             }
             last_report = now_mach();
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // No sleep here: at Class A (8000 pkt/s per stream, 9 streams ->
+        // ~64k/s) a 1 ms nap lets the dext audio ring overrun. Busy-drain
+        // instead; the SRP maintenance above is gated on its own interval.
     }
 
     // --- Report ---
+    // Dext RX counters: rx_stream (delivered to the audio ring), and the two
+    // stream drops. This tells us whether the 16R is transmitting at all:
+    //   rx_stream>0            -> frames delivered (but AAF decode failed?)
+    //   drop_unbound>0         -> frames arrive but MAC/VID not in our filter
+    //   drop_untagged>0        -> stream frames arrive UNtagged (vid mismatch)
+    //   all zero               -> the 16R is not transmitting to us at all
+    if let Ok(c) = dext.device().get_counters() {
+        let rx_stream = c.c.get(6).copied().unwrap_or(0);
+        let drop_unbound =
+            c.c.get(avb_dext::abi::ctr::RX_DROP_UNBOUND_STREAM)
+                .copied()
+                .unwrap_or(0);
+        let drop_untagged =
+            c.c.get(avb_dext::abi::ctr::RX_DROP_UNTAGGED_STREAM)
+                .copied()
+                .unwrap_or(0);
+        let rx_frames = c.c.first().copied().unwrap_or(0);
+        let ring_overrun_audio = c.c.get(14).copied().unwrap_or(0);
+        log.log(
+            Level::Info,
+            "streams",
+            &format!(
+                "dext counters: rx_frames={rx_frames} rx_stream={rx_stream} drop_unbound_stream={drop_unbound} drop_untagged_stream={drop_untagged} ring_overrun_audio={ring_overrun_audio}"
+            ),
+        );
+    }
     let elapsed_s = (ns_since(count_start) as f64) / 1e9;
+    log.log(
+        Level::Info,
+        "streams",
+        &format!("audio ring: raw_slots={raw_audio_slots} non_aaf_or_undecoded={aaf_decode_fail}"),
+    );
+    let _ = first_slot_dump;
     // Report every stream_id actually observed on the wire (the AAF header's
     // real stream_id), not the probe-reported one which a Milan talker may
     // leave 0. `bound_ids` records which listener_unique_ids settled.
