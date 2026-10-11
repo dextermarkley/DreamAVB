@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The cross-platform guard: the portable, sans-IO crates (the AVB standards
+  # stack) must build and test on LINUX. If this job stays green, the core is
+  # genuinely OS-independent and a future Linux/Windows NIC+audio shim can reuse
+  # it. The macOS-only crates (the DriverKit dext mirror, the CoreAudio plug-in)
+  # are deliberately NOT in this list.
+  portable-linux:
+    name: portable crates (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: fmt
+        run: cargo fmt --manifest-path Cargo.toml -p avb-core -p avb-gptp -p avb-srp -p avb-avtp -p avb-avdecc -p avb-mediaclock -p avb-audioring -- --check
+      - name: clippy
+        run: cargo clippy -p avb-core -p avb-gptp -p avb-srp -p avb-avtp -p avb-avdecc -p avb-mediaclock -p avb-audioring --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test -p avb-core -p avb-gptp -p avb-srp -p avb-avtp -p avb-avdecc -p avb-mediaclock -p avb-audioring --locked
+
+  # Full workspace gate on macOS (where the dext + CoreAudio plug-in crates
+  # compile). The C++ dext build + xcodebuild run locally per HANDOFF.md and are
+  # not reproduced here (no DriverKit SDK on hosted runners).
+  workspace-macos:
+    name: full workspace (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --workspace --exclude avb-coreaudio --locked
