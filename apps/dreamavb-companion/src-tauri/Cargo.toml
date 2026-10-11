@@ -23,6 +23,9 @@ tauri = { version = "=2.5.1", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-shell = "=2.2.0"
 serde = { version = "=1.0.210", features = ["derive"] }
 serde_json = "=1.0.128"
+# The recovered-audio ring crate (reused from the stack) to read live media-
+# clock + counter stats straight from the shared ring, no daemon IPC needed.
+avb-audioring = { path = "../../../crates/avb-audioring" }
 
 # Cap the runtime/windowing crates to the tauri 2.5 wave. Cargo otherwise floats
 # every transitive ^2 dep to its newest minor (tauri-runtime 2.12, wry 0.57),

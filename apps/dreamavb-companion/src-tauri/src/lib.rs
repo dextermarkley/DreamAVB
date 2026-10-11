@@ -309,36 +309,75 @@ fn probe_fault() -> bool {
     }
 }
 
-/// Live stats snapshot (read-only). Parses `avb-probe counters --json`.
+/// Live stats snapshot (read-only). Two live sources, no daemon IPC:
+///   * the recovered-audio ring (`/Users/Shared/avb16r.ring`): its ClockBlock
+///     gives media-clock lock + drift ppm, its counters give ring
+///     under/overruns, and its write frontier gives the stream rate. Read
+///     directly via `avb-audioring`.
+///   * `avb-probe counters --json`: the dext-side rx_frames + hardware rev.
 #[tauri::command]
 fn stats() -> Stats {
+    let mut s = Stats::default();
+
+    // Live ring read (media clock + ring counters + stream rate).
+    if let Ok(shm) = avb_audioring::ShmRing::attach() {
+        let ring = shm.ring();
+        use avb_audioring::layout::counter;
+        s.ring_overruns = ring.counter(counter::OVERRUN_EVENTS);
+        s.ring_underruns = ring.counter(counter::UNDERRUNS);
+        if let Some(cb) = ring.read_clock() {
+            s.as_capable = cb.locked;
+            if cb.media_ppm_vs_gptp.is_finite() {
+                s.media_drift_ppm = cb.media_ppm_vs_gptp;
+            }
+        }
+        s.stream_pkts_per_s = sample_stream_rate(ring);
+    }
+
+    // Dext-side counters (rx_frames, hardware) from the probe JSON.
     let tmp = std::env::temp_dir().join("dreamavb-counters.json");
-    let ran = Command::new(helper_path("avb-probe"))
+    if let Ok(o) = Command::new(helper_path("avb-probe"))
         .arg("counters")
         .arg("--json")
         .arg(&tmp)
-        .output();
-    if let Ok(o) = ran {
+        .output()
+    {
         if o.status.success() {
             if let Ok(txt) = std::fs::read_to_string(&tmp) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                    return parse_stats(&v);
+                    let probe = parse_stats(&v);
+                    s.rx_frames = probe.rx_frames;
+                    s.hw_rev = probe.hw_rev;
+                    s.abi_version = probe.abi_version;
+                    // Fall back to the probe's values if the ring was absent.
+                    if s.media_drift_ppm == 0.0 {
+                        s.media_drift_ppm = probe.media_drift_ppm;
+                    }
                 }
             }
         }
     }
-    Stats::default()
+    s
+}
+
+/// Estimate committed stream rate (frames/s) by sampling the ring's write
+/// frontier over a 100 ms window. Read-only.
+fn sample_stream_rate(ring: &avb_audioring::AudioRing) -> u64 {
+    let c0 = avb_audioring::Consumer::new(ring).write_frame();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let c1 = avb_audioring::Consumer::new(ring).write_frame();
+    c1.saturating_sub(c0).saturating_mul(10)
 }
 
 /// Map the probe's counters JSON into the UI Stats shape. Tolerant of missing
 /// keys so a partial probe still renders.
 fn parse_stats(v: &serde_json::Value) -> Stats {
-    let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-    let gf = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let g = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let gf = |k: &str| v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
     Stats {
         as_capable: v
             .get("as_capable")
-            .and_then(|x| x.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         gptp_offset_ns: gf("gptp_offset_ns"),
         stream_pkts_per_s: g("stream_pkts_per_s"),
