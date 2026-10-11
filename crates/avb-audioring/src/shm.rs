@@ -60,12 +60,17 @@ impl ShmRing {
             libc::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
-                0o600,
+                0o666,
             )
         };
         if fd < 0 {
             return Err(RingError::MapFailed);
         }
+        // shm_open's mode is masked by umask, so a 0o666 request can land as
+        // 0o644. The daemon runs as root but the CoreAudio plug-in runs as
+        // _coreaudiod (a different, non-root user) and must open this segment
+        // O_RDWR — so force world read/write past umask with fchmod.
+        unsafe { libc::fchmod(fd, 0o666) };
         // SAFETY: fd is a valid shm fd; sizing it to the full ring length.
         if unsafe { libc::ftruncate(fd, len as libc::off_t) } != 0 {
             unsafe {
