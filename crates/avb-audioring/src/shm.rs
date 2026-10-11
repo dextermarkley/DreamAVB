@@ -347,4 +347,86 @@ mod tests {
         // Little-endian of the big-endian wire value lands in ch0.
         assert_eq!(&out[0..4], &0x1122_3344u32.to_le_bytes());
     }
+
+    /// The OUTPUT path contract, end to end across two mappings: the daemon
+    /// creates the ring exactly as `play` does, the plug-in attaches with
+    /// exactly the spec `attach_out()` uses, writes, and the daemon's consumer
+    /// reads it back.
+    ///
+    /// The suite had no test for this direction. On the real hardware the
+    /// talker sent 1,437,707 PDUs and counted 1,437,707 underruns — the ring
+    /// was empty for every single packet — so this pins the half of that
+    /// failure that lives in the ring API, separating it from "the HAL never
+    /// called WriteMix".
+    #[test]
+    fn output_ring_daemon_creates_plugin_attaches_and_writes() {
+        // The daemon's `play` config, field for field (stack.rs): a non-zero
+        // stream id from our MAC, 8 channels, 32-bit, 48 kHz, 65536 frames.
+        let path = format!("/Users/Shared/avb16r-out-test-{}.ring", std::process::id());
+        let cfg = RingConfig {
+            channels: 8,
+            valid_bits: 32,
+            nominal_rate_hz: 48_000,
+            capacity_frames: 65_536,
+            streams: vec![StreamSlot {
+                stream_id: 0x644b_f012_73b8_0000,
+                first_channel: 0,
+                channels: 8,
+                bit_depth: 32,
+            }],
+            channel_map: (0..8).map(|c| (0u16, c as u16)).collect(),
+        };
+        let daemon_side = match ShmRing::create_at(&path, &cfg) {
+            Ok(r) => r,
+            // Sandboxes without shm (CI) — skip rather than fail the gate.
+            Err(RingError::MapFailed) => return,
+            Err(e) => panic!("daemon-side create failed: {e}"),
+        };
+
+        // The plug-in's attach_out() spec: (first_channel, channels, bit_depth)
+        // with no lag, as a SEPARATE mapping of the same file.
+        let mut plugin_side = ShmProducer::attach_at(&path, &[(0, 8, 32)], 0, 0)
+            .expect("plug-in could not attach the daemon's output ring");
+        assert_eq!(
+            plugin_side.ring().channels(),
+            8,
+            "channel count the plug-in checks before attaching"
+        );
+
+        // write_mix's job: place S32 frames at the live frontier and commit.
+        let frames = 4usize;
+        let mut data = vec![0u8; frames * 8 * 4];
+        for fr in 0..frames {
+            let v = (0x0100_0000u32 + fr as u32).to_be_bytes();
+            let off = fr * 8 * 4;
+            data[off..off + 4].copy_from_slice(&v);
+        }
+        let start = plugin_side.ring().write_frame();
+        assert!(
+            plugin_side
+                .producer()
+                .place(0, start as i128, frames, SampleFormat::Int32, &data),
+            "place rejected at the ring's own live frontier"
+        );
+        plugin_side.producer().commit(false, None);
+
+        // The daemon's talker loop consumes from its own mapping.
+        let mut c = Consumer::with_read_frame(daemon_side.ring(), start);
+        let fb = daemon_side.ring().frame_bytes();
+        let mut out = vec![0u8; frames * fb];
+        assert_eq!(
+            c.read_into(&mut out, frames),
+            frames,
+            "daemon read nothing the plug-in committed — this is the underrun"
+        );
+        for fr in 0..frames {
+            let got = u32::from_le_bytes([
+                out[fr * fb],
+                out[fr * fb + 1],
+                out[fr * fb + 2],
+                out[fr * fb + 3],
+            ]);
+            assert_eq!(got, 0x0100_0000 + fr as u32, "frame {fr} corrupted");
+        }
+    }
 }

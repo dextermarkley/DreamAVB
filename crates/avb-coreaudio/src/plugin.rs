@@ -31,7 +31,16 @@ const DEVICE_RATE: f64 = 48_000.0;
 const DEVICE_BITS: u32 = 32;
 const DEVICE_UID: &str = "com.avbaudio.16r.input";
 const DEVICE_MODEL_UID: &str = "com.avbaudio.16r.model";
-const DEVICE_NAME: &str = "AVB StudioLive 16R (Input)";
+/// User-visible device name. NOT "… (Input)" any more: the device carries an
+/// input AND an output stream (Phase 1b-2), and the old name made it look
+/// input-only in System Settings → Sound → Output, where it is a valid output
+/// device offering 8 channels. The stale name actively misled a hardware test
+/// session into reading "(Input)" as a scope rather than a label.
+///
+/// `DEVICE_UID` deliberately keeps its `.input` suffix: macOS persists the
+/// user's default-device choice by UID, so changing it would silently reset
+/// their selection. It is an internal identifier and never shown.
+const DEVICE_NAME: &str = "AVB StudioLive 16R";
 const BOX_UID: &str = "com.avbaudio.16r.box";
 const BOX_NAME: &str = "AVB-Audio Box";
 const MANUFACTURER: &str = "AVB-Audio";
