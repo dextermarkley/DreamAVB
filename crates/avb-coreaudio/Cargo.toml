@@ -1,0 +1,18 @@
+[package]
+name = "avb-coreaudio"
+description = "CoreAudio AudioServerPlugIn exposing the 16R AVB streams as a macOS input device (Phase 1b)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A HAL plug-in is a C-ABI dynamic library loaded by coreaudiod, packaged as a
+# `.driver` bundle under /Library/Audio/Plug-Ins/HAL/.
+[lib]
+name = "avb_coreaudio"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The recovered-audio ring ABI (mapped read-only from the daemon's shm).
+avb-audioring = { path = "../avb-audioring" }
+libc = "=0.2.190"

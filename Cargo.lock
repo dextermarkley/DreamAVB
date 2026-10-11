@@ -88,6 +88,14 @@ name = "avb-core"
 version = "0.1.0"
 
 [[package]]
+name = "avb-coreaudio"
+version = "0.1.0"
+dependencies = [
+ "avb-audioring",
+ "libc",
+]
+
+[[package]]
 name = "avb-daemon"
 version = "0.1.0"
 dependencies = [

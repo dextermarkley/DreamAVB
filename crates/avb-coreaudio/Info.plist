@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for the AVB-Audio AudioServerPlugIn (.driver bundle).
+
+  coreaudiod loads /Library/Audio/Plug-Ins/HAL/AVBAudio.driver, reads
+  CFPlugInFactories (factory-UUID -> exported C function name) and
+  CFPlugInTypes (the AudioServerPlugIn type UUID -> [factory UUID]), and calls
+  our factory `avb_coreaudio_factory`.
+
+  The AudioServerPlugIn type UUID is Apple's constant
+  kAudioServerPlugInTypeUUID = 443ABAB8-E7B3-491A-B985-BEB9187030DB
+  (from <CoreAudio/AudioServerPlugIn.h>). Our factory UUID is project-owned.
+
+  package.sh assembles the bundle: this plist, the built dylib as the bundle's
+  executable (CFBundleExecutable), and code signing.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>English</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.avbaudio.coreaudio</string>
+  <key>CFBundleName</key>
+  <string>AVBAudio</string>
+  <key>CFBundlePackageType</key>
+  <string>BNDL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>CFBundleExecutable</key>
+  <string>AVBAudio</string>
+  <key>CFPlugInFactories</key>
+  <dict>
+    <key>8E303148-8E87-45BB-811F-464ECEF949FF</key>
+    <string>avb_coreaudio_factory</string>
+  </dict>
+  <key>CFPlugInTypes</key>
+  <dict>
+    <!-- kAudioServerPlugInTypeUUID -->
+    <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+    <array>
+      <string>8E303148-8E87-45BB-811F-464ECEF949FF</string>
+    </array>
+  </dict>
+</dict>
+</plist>
