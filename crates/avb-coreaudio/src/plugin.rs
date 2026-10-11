@@ -619,7 +619,10 @@ pub extern "C" fn start_io(
         if guard.is_none() {
             match ShmRing::attach() {
                 Ok(shm) => {
-                    let read_frame = Consumer::new(shm.ring()).read_frame();
+                    // Start LIVE: seek to the current write frontier so the
+                    // device plays current audio, not the whole committed
+                    // backlog the daemon produced before IO started.
+                    let read_frame = Consumer::new(shm.ring()).write_frame();
                     *guard = Some(IoState { shm, read_frame });
                     oslog("[avb-coreaudio] IO: attached recovered-audio ring");
                 }
@@ -669,12 +672,11 @@ pub extern "C" fn do_io_operation(
     if let Ok(mut guard) = IO.lock() {
         if let Some(state) = guard.as_mut() {
             let ring = state.shm.ring();
-            // Rebuild a Consumer at our saved cursor, read, then save it back.
-            let mut consumer = Consumer::new(ring);
-            // Consumer::new seeds from the ring's shared read_frame; override
-            // with our per-stream cursor so two IO starts don't double-count.
-            // (read_into advances from the ring's read_frame; we track our own
-            // position to be robust if the shared cursor moved.)
+            // Seed from OUR saved cursor (set live on StartIO), not the ring's
+            // shared read_frame — the daemon never advances that, so reading it
+            // would replay the whole backlog each cycle (= latency / no live
+            // signal). read_into advances from here and we save it back.
+            let mut consumer = Consumer::with_read_frame(ring, state.read_frame);
             let want = io_buffer_frame_size as usize;
             let got = consumer.read_into(out, want);
             filled = got * frame_bytes;

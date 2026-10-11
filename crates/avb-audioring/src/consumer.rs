@@ -17,6 +17,18 @@ impl<'a> Consumer<'a> {
         Self { ring, read_frame }
     }
 
+    /// Build a consumer at an explicit absolute read position (Phase 1b: the
+    /// plug-in seeks to the live write frontier on StartIO so it plays current
+    /// audio, not the whole committed backlog).
+    pub fn with_read_frame(ring: &'a AudioRing, read_frame: u64) -> Self {
+        Self { ring, read_frame }
+    }
+
+    /// The ring's current committed write frontier (absolute frame).
+    pub fn write_frame(&self) -> u64 {
+        self.ring.write_frame()
+    }
+
     pub fn read_frame(&self) -> u64 {
         self.read_frame
     }
