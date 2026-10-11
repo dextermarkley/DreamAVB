@@ -557,3 +557,61 @@ path fires the instant AAF arrives.
 
 Gate (green): fmt, `clippy --workspace --all-targets -D warnings`, 320 workspace
 tests, C++ tg3 97 + i210 341, `package.sh --adhoc`.
+
+## hw-streams (cont.) — GET_STREAM_INFO + CONNECT_TX prove the 16R outputs are dormant
+
+After the empty Talker-Advertise finding, two more AECP probes were added to the
+`streams` runner, and they settle the question of why no AAF flows.
+
+### GET_STREAM_INFO on every STREAM_OUTPUT (Phase 1b)
+
+Querying `GET_STREAM_INFO` (0x000F) on each of the 9 STREAM_OUTPUTs returns, for
+all nine:
+
+```
+flags=0xf2000000  id=0x000a92033ba9000j  dest=91:e0:f0:00:b6:e(6+j)  vid=0  connected=false
+```
+
+- The stream_id is the MAC+index derivation (`stream_id_for`) — so our Listener
+  Ready stream_ids were correct all along; that was never the problem.
+- `flags=0xf2000000`: the "valid" high bits are set but **CONNECTED (bit 27),
+  STREAM_ID_VALID (3), STREAM_DEST_MAC_VALID (5) and STREAM_VLAN_ID_VALID (7)
+  are all clear**. The 16R reports each output as **not connected, with no
+  committed addressing** — i.e. the talker is dormant, not streaming.
+
+### ACMP CONNECT_TX to the talker (Phase 1c/1d)
+
+Sent `CONNECT_TX_COMMAND` (the listener→talker leg the PROBE_TX-only flow omits)
+for each output. **All 9 returned `CONNECT_TX_RESPONSE status=SUCCESS`** with the
+real stream_id, dest MAC and `vid=2`. Yet an immediate re-query of
+`GET_STREAM_INFO` shows the flags **unchanged (`0xf2000000`, connected=false)**:
+the 16R acknowledges the connect but does **not** transition its output to
+CONNECTED or begin egress. 0 AAF packets over the run.
+
+### Conclusion — the blocker is device-side, not protocol-side
+
+With gPTP locked, the AEM enumerated, the MSRP Domain mutually registered, our
+Listener Ready declared with the correct stream_ids, and a SUCCESS CONNECT_TX
+for every output, the 16R's own AVDECC state still reports every output
+`connected=false`. There is no further frame our controller/listener/SRP stack
+can send to force the transition. The gating condition lives inside the 16R:
+its AVB **output streams are not enabled/committed to transmit** in the device's
+current configuration. Internal mixer channel→AVB routing is not the same as the
+output stream being enabled as an AVB *send* — the latter is set in PreSonus's
+control software (UC Surface / Universal Control), a device-side action.
+
+The daemon's path is complete and correct up to this wall: discovery, AEM,
+GET_STREAM_INFO, CONNECT_TX, the Milan PROBE_TX bind, and the MSRP/MVRP
+reservation all succeed, the dext filter installs with the right dest_mac+vid=2,
+and the AAF counter fires the instant frames arrive.
+
+### Open question for the device
+
+Confirm in the 16R's control software that each output stream is **enabled as an
+AVB transmit stream** (not merely routed internally). If PreSonus only streams an
+output when a *remote listener it recognizes* has connected, note that our
+CONNECT_TX already returns SUCCESS without effect — which points at an
+enable/arm step on the device rather than a listener-presence condition.
+
+Gate (green): fmt, `clippy --workspace --all-targets -D warnings`, 320 workspace
+tests, C++ tg3 97 + i210 341, `package.sh --adhoc`.

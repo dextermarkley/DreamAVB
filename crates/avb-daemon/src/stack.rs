@@ -1051,6 +1051,293 @@ fn streams_loop(
         ),
     );
 
+    // --- Phase 1b: GET_STREAM_INFO on each STREAM_OUTPUT ---
+    // Learn the 16R's authoritative per-output stream_id, dest_mac, vlan and
+    // its streaming/connected flags. A Milan talker's stream_id is NOT the
+    // MAC+index our probe guesses; this is the real one, and the CONNECTED /
+    // probing flags tell us whether the output is active.
+    let mut gsi: std::collections::BTreeMap<u16, (u64, [u8; 6], u16, u32)> = Default::default();
+    {
+        use avb_avdecc::aecp::{AecpEngine, AecpOutcome, AemPdu};
+        use avb_avdecc::constants::aecp_msg as am;
+        use avb_avdecc::constants::aem_cmd;
+        let mut eng = AecpEngine::new(our_id);
+        for uid in 0..n_streams {
+            let mut pl = Vec::with_capacity(4);
+            pl.extend_from_slice(&avb_avdecc::constants::desc::STREAM_OUTPUT.to_be_bytes());
+            pl.extend_from_slice(&uid.to_be_bytes());
+            eng.enqueue(talker, talker_mac, aem_cmd::GET_STREAM_INFO, pl);
+        }
+        let deadline = ns_since(start).saturating_add(6_000_000_000);
+        let mut last = ns_since(start);
+        loop {
+            if shutdown_requested() {
+                return Err(Exit::Interrupted);
+            }
+            let busy = eng.queued_count() > 0 || eng.in_flight_count() > 0;
+            if (!busy && ns_since(start).saturating_sub(last) >= 400_000_000)
+                || ns_since(start) >= deadline
+            {
+                break;
+            }
+            let now = ns_since(start);
+            if let Some(send) = eng.poll(now) {
+                let hdr = EthHeader {
+                    dst: send.target_mac,
+                    src: our_mac,
+                    vlan: None,
+                    ethertype: ETHERTYPE_AVTP,
+                };
+                if let Ok(f) = TxFrame::build(&hdr, &send.frame, false, 0) {
+                    let _ = dext.send(f.bytes(), false, 0);
+                    last = now;
+                }
+            }
+            for slot in dext.rx_ctl() {
+                let Ok(p) = EthFrame::parse(&slot.data) else {
+                    continue;
+                };
+                if p.hdr.ethertype != ETHERTYPE_AVTP
+                    || p.payload.first().copied() != Some(subtype::AECP)
+                {
+                    continue;
+                }
+                let Some(resp) = AemPdu::decode(p.payload) else {
+                    continue;
+                };
+                if resp.message_type != am::AEM_RESPONSE {
+                    continue;
+                }
+                if let Some(AecpOutcome::Response(r)) = eng.on_rx(&resp, now) {
+                    last = now;
+                    if r.command_type == aem_cmd::GET_STREAM_INFO {
+                        // §7.4.16: desc_type(2) desc_index(2) flags(4)
+                        // stream_format(8) stream_id(8) msrp_acc_lat(4)
+                        // stream_dest_mac(6) ...
+                        let b = &r.payload;
+                        let idx = b
+                            .get(2..4)
+                            .and_then(|x| x.try_into().ok())
+                            .map(u16::from_be_bytes)
+                            .unwrap_or(0);
+                        let flags = b
+                            .get(4..8)
+                            .and_then(|x| x.try_into().ok())
+                            .map(u32::from_be_bytes)
+                            .unwrap_or(0);
+                        let sid = b
+                            .get(16..24)
+                            .and_then(|x| x.try_into().ok())
+                            .map(u64::from_be_bytes)
+                            .unwrap_or(0);
+                        let mut dmac = [0u8; 6];
+                        if let Some(m) = b.get(28..34) {
+                            dmac.copy_from_slice(m);
+                        }
+                        let vid = b
+                            .get(44..46)
+                            .and_then(|x| x.try_into().ok())
+                            .map(u16::from_be_bytes)
+                            .unwrap_or(0);
+                        gsi.insert(idx, (sid, dmac, vid, flags));
+                        log.log(
+                            Level::Info,
+                            "aecp",
+                            &format!(
+                                "GET_STREAM_INFO out[{idx}]: flags=0x{flags:08x} id=0x{sid:016x} dest={dmac:02x?} vid={vid} (connected={})",
+                                flags & avb_avdecc::milan::stream_info_flags::CONNECTED != 0
+                            ),
+                        );
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        log.log(
+            Level::Info,
+            "aecp",
+            &format!(
+                "GET_STREAM_INFO: {} of {n_streams} output(s) answered",
+                gsi.len()
+            ),
+        );
+    }
+
+    // Per-stream filter params (dest_mac+vid), shared across the connect,
+    // bind and count phases.
+    let mut filter: Vec<(u64, [u8; 6], u16)> = Vec::new();
+    let mut bound_ids: std::collections::BTreeMap<u16, StreamId> = Default::default();
+
+    // --- Phase 1c: ACMP CONNECT_TX to the talker ---
+    // GET_STREAM_INFO shows the 16R's outputs are NOT connected (flags bit 27
+    // clear). A Milan talker transitions its STREAM_OUTPUT to CONNECTED and
+    // begins egress when a listener issues CONNECT_TX_COMMAND (IEEE 1722.1
+    // §8.2.1). We send one per output naming our listener; the response (and
+    // a follow-up GET_STREAM_INFO showing CONNECTED) confirms it. This is the
+    // leg the PROBE_TX-only flow omits, and the one the 16R actually needs.
+    {
+        use avb_avdecc::acmp::Acmpdu;
+        use avb_avdecc::constants::{acmp_msg, acmp_status, subtype as sub};
+        let mut acmp_seq: u16 = 0;
+        for uid in 0..n_streams {
+            let sid = gsi
+                .get(&uid)
+                .map(|&(id, _, _, _)| StreamId(id))
+                .unwrap_or_else(|| stream_id_for(talker_mac, uid));
+            let pdu = Acmpdu {
+                message_type: acmp_msg::CONNECT_TX_COMMAND,
+                status: acmp_status::SUCCESS,
+                stream_id: sid,
+                controller_entity_id: our_id,
+                talker_entity_id: talker,
+                listener_entity_id: our_id,
+                talker_unique_id: uid,
+                listener_unique_id: uid,
+                sequence_id: acmp_seq,
+                ..Default::default()
+            };
+            acmp_seq = acmp_seq.wrapping_add(1);
+            let hdr = EthHeader {
+                dst: avb_core::AVDECC_MULTICAST,
+                src: our_mac,
+                vlan: None,
+                ethertype: ETHERTYPE_AVTP,
+            };
+            if let Ok(f) = TxFrame::build(&hdr, &pdu.encode(), false, 0) {
+                let _ = dext.send(f.bytes(), false, 0);
+            }
+        }
+        // Collect CONNECT_TX_RESPONSEs for ~2 s.
+        let deadline = ns_since(start).saturating_add(2_000_000_000);
+        while ns_since(start) < deadline {
+            if shutdown_requested() {
+                return Err(Exit::Interrupted);
+            }
+            for slot in dext.rx_ctl() {
+                let Ok(p) = EthFrame::parse(&slot.data) else {
+                    continue;
+                };
+                if p.hdr.ethertype != ETHERTYPE_AVTP
+                    || p.payload.first().copied() != Some(sub::ACMP)
+                {
+                    continue;
+                }
+                if let Some(a) = Acmpdu::decode(p.payload) {
+                    if a.message_type == acmp_msg::CONNECT_TX_RESPONSE
+                        && a.talker_entity_id == talker
+                    {
+                        log.log(
+                            Level::Info,
+                            "acmp",
+                            &format!(
+                                "CONNECT_TX_RESPONSE uid={} status={} id=0x{:016x} dest={:02x?} vid={}",
+                                a.talker_unique_id,
+                                a.status,
+                                a.stream_id.0,
+                                a.stream_dest_mac.octets(),
+                                a.stream_vlan_id
+                            ),
+                        );
+                        if a.status == acmp_status::SUCCESS
+                            && a.stream_dest_mac.octets()[0] & 1 == 1
+                        {
+                            let v = if a.stream_vlan_id == 0 {
+                                avb_srp::attr::DEFAULT_DOMAIN.vid
+                            } else {
+                                a.stream_vlan_id
+                            };
+                            let dmac = a.stream_dest_mac.octets();
+                            filter.retain(|(_, m, _)| *m != dmac);
+                            filter.push((a.stream_id.0, dmac, v));
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    // --- Phase 1d: re-query GET_STREAM_INFO to confirm the connect stuck ---
+    {
+        use avb_avdecc::aecp::{AecpEngine, AecpOutcome, AemPdu};
+        use avb_avdecc::constants::aecp_msg as am;
+        use avb_avdecc::constants::aem_cmd;
+        let mut eng = AecpEngine::new(our_id);
+        for uid in 0..n_streams {
+            let mut pl = Vec::with_capacity(4);
+            pl.extend_from_slice(&avb_avdecc::constants::desc::STREAM_OUTPUT.to_be_bytes());
+            pl.extend_from_slice(&uid.to_be_bytes());
+            eng.enqueue(talker, talker_mac, aem_cmd::GET_STREAM_INFO, pl);
+        }
+        let deadline = ns_since(start).saturating_add(3_000_000_000);
+        let mut last = ns_since(start);
+        loop {
+            if shutdown_requested() {
+                return Err(Exit::Interrupted);
+            }
+            let busy = eng.queued_count() > 0 || eng.in_flight_count() > 0;
+            if (!busy && ns_since(start).saturating_sub(last) >= 400_000_000)
+                || ns_since(start) >= deadline
+            {
+                break;
+            }
+            let now = ns_since(start);
+            if let Some(send) = eng.poll(now) {
+                let hdr = EthHeader {
+                    dst: send.target_mac,
+                    src: our_mac,
+                    vlan: None,
+                    ethertype: ETHERTYPE_AVTP,
+                };
+                if let Ok(f) = TxFrame::build(&hdr, &send.frame, false, 0) {
+                    let _ = dext.send(f.bytes(), false, 0);
+                    last = now;
+                }
+            }
+            for slot in dext.rx_ctl() {
+                let Ok(p) = EthFrame::parse(&slot.data) else {
+                    continue;
+                };
+                if p.hdr.ethertype != ETHERTYPE_AVTP
+                    || p.payload.first().copied() != Some(subtype::AECP)
+                {
+                    continue;
+                }
+                let Some(resp) = AemPdu::decode(p.payload) else {
+                    continue;
+                };
+                if resp.message_type != am::AEM_RESPONSE {
+                    continue;
+                }
+                if let Some(AecpOutcome::Response(r)) = eng.on_rx(&resp, now) {
+                    last = now;
+                    if r.command_type == aem_cmd::GET_STREAM_INFO {
+                        let b = &r.payload;
+                        let idx = b
+                            .get(2..4)
+                            .and_then(|x| x.try_into().ok())
+                            .map(u16::from_be_bytes)
+                            .unwrap_or(0);
+                        let flags = b
+                            .get(4..8)
+                            .and_then(|x| x.try_into().ok())
+                            .map(u32::from_be_bytes)
+                            .unwrap_or(0);
+                        log.log(
+                            Level::Info,
+                            "aecp",
+                            &format!(
+                                "post-connect out[{idx}]: flags=0x{flags:08x} connected={}",
+                                flags & avb_avdecc::milan::stream_info_flags::CONNECTED != 0
+                            ),
+                        );
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     // --- Phase 2: bind every talker stream via the Milan listener SM ---
     //
     // We are the controller AND the listener (same station). The classic
@@ -1063,9 +1350,6 @@ fn streams_loop(
     // stream_id/dest_mac/vlan it learned from the talker.
     let mut sms: Vec<ListenerSm> = (0..n_streams).map(ListenerSm::new).collect();
     let mut probe_seq: u16 = 0;
-    // Per-stream filter params learned from each SetStreamFilter action.
-    let mut filter: Vec<(u64, [u8; 6], u16)> = Vec::new();
-    let mut bound_ids: std::collections::BTreeMap<u16, StreamId> = Default::default();
     // In-flight GET_TX_STATE: talker_unique_id -> listener_unique_id, so a
     // response (which carries talker ids, not our listener_unique_id) can be
     // routed back to the SM that probed.
@@ -1215,8 +1499,30 @@ fn streams_loop(
     // Listener declaration for its stream — waiting for the Talker Advertise
     // first would deadlock, since the 16R does not advertise unsolicited.
     for uid in 0..n_streams {
-        let sid = stream_id_for(talker_mac, uid);
+        // Prefer the authoritative stream_id from GET_STREAM_INFO; fall back
+        // to the MAC+index derivation only if the talker did not answer.
+        let sid = match gsi.get(&uid) {
+            Some(&(id, dmac, vid, flags)) if id != 0 => {
+                if flags & avb_avdecc::milan::stream_info_flags::STREAM_DEST_MAC_VALID != 0
+                    && dmac[0] & 1 == 1
+                {
+                    let v = if vid == 0 { DEFAULT_DOMAIN.vid } else { vid };
+                    filter.retain(|(_, m, _)| *m != dmac);
+                    filter.push((id, dmac, v));
+                }
+                StreamId(id)
+            }
+            _ => stream_id_for(talker_mac, uid),
+        };
         if listener_declared.insert(sid.0) {
+            log.log(
+                Level::Debug,
+                "srp",
+                &format!(
+                    "declare Listener Ready uid={uid} stream_id=0x{:016x}",
+                    sid.0
+                ),
+            );
             srp.declare(
                 now_mach(),
                 Attribute::Listener(Listener {
@@ -1399,7 +1705,7 @@ fn streams_loop(
         // Hold the handshake open for a minimum window regardless of the ACMP
         // probe finishing: MRP Join bursts and the 16R's Talker Advertise /
         // reservation take several seconds, and the probe settles in ~2 s.
-        let min_handshake = now >= 8_000_000_000;
+        let min_handshake = now >= 15_000_000_000;
         if (acmp_settled && all_addressed && min_handshake) || now >= bind_deadline_ns {
             // Flush any pending SRP sends before counting.
             srp.poll(srp_now(), &mut srp_out);
