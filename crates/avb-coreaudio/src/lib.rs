@@ -110,45 +110,39 @@ extern "C" fn get_zero_time_stamp(
     out_seed: *mut u64,
 ) -> OSStatus {
     // The HAL models device timing as (sampleTime, hostTime) pairs spaced
-    // RING_FRAMES apart. Both are computed as a pure function of `now` and a
-    // single captured anchor, so the returned pair is always mutually
-    // consistent even under concurrent calls (no per-call counter to race on).
+    // ZeroTimeStampPeriod apart. They come from ZtsClock, which keeps the
+    // timeline continuous across media-clock rate changes; the lock makes the
+    // pair consistent under concurrent calls.
     //
     // Cross-clock correction: frames arrive on the 16R MEDIA clock (disciplined
     // rate_hz_vs_mach, e.g. ~47994 Hz at −118 ppm), not the Mac host clock's
     // nominal 48 kHz. Reporting the true rate keeps the HAL's device timeline
     // aligned with actual data arrival; falls back to nominal when the ring is
     // unattached or the media clock is not yet locked.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static ANCHOR_HOST: AtomicU64 = AtomicU64::new(0);
-
-    const RING_FRAMES: f64 = 8192.0;
     const NOMINAL_RATE_HZ: f64 = 48_000.0;
 
-    let now = unsafe { mach_absolute_time() };
-    let (numer, denom) = timebase();
-
-    // True media-clock rate from the ring when locked, else nominal.
+    // True media-clock rate from the ring when locked, else nominal. Read
+    // BEFORE taking the clock lock (it takes the IO lock internally).
     let rate_hz = match crate::plugin::ring_disciplined_rate_hz() {
-        Some(r) if r > 0.0 => r,
+        Some(r) if r.is_finite() && r > 0.0 => r,
         _ => NOMINAL_RATE_HZ,
     };
 
-    let anchor = match ANCHOR_HOST.compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst) {
-        Ok(_) => now,              // first call: we just set it
-        Err(existing) => existing, // subsequent calls
+    let (numer, denom) = timebase();
+    let (sample_time, host_time) = {
+        let Ok(mut clk) = ZTS_CLOCK.lock() else {
+            // Only reachable if a prior holder panicked (poisoned mutex).
+            return kAudioHardwareBadObjectError;
+        };
+        // `now` is read under the lock so concurrent callers are serialised in
+        // time order and the timeline can never be observed going backwards.
+        let now = unsafe { mach_absolute_time() };
+        let base = *clk.base_ticks.get_or_insert(now);
+        let now_ns = now.wrapping_sub(base) as f64 * numer as f64 / denom as f64;
+        let (st, boundary_ns) = clk.clock.step(now_ns, rate_hz);
+        let ticks = (boundary_ns * denom as f64 / numer as f64).max(0.0) as u64;
+        (st, base.wrapping_add(ticks))
     };
-    // host ticks -> nanoseconds elapsed since the anchor.
-    let elapsed_ns = (now.wrapping_sub(anchor)) as f64 * numer as f64 / denom as f64;
-    // frames elapsed at the TRUE rate.
-    let elapsed_frames = elapsed_ns * rate_hz / 1_000_000_000.0;
-    // Round DOWN to the start of the current ring period.
-    let periods = (elapsed_frames / RING_FRAMES).floor();
-    let sample_time = periods * RING_FRAMES;
-    // Host time of that period boundary, back-converted at the SAME true rate
-    // so (sampleTime, hostTime) stay consistent.
-    let period_ns = periods * RING_FRAMES / rate_hz * 1_000_000_000.0;
-    let host_time = anchor + (period_ns * denom as f64 / numer as f64) as u64;
 
     unsafe {
         if !out_sample_time.is_null() {
@@ -158,10 +152,86 @@ extern "C" fn get_zero_time_stamp(
             *out_host_time = host_time;
         }
         if !out_seed.is_null() {
+            // The timeline is continuous across rate changes (ZtsClock
+            // re-anchors), so there is never a discontinuity to signal.
             *out_seed = 1;
         }
     }
     kAudioHardwareNoError
+}
+
+/// Shared zero-timestamp state: the mach tick of the first call (all math is
+/// in ns relative to it, keeping f64 precision) and the timeline clock.
+struct ZtsState {
+    base_ticks: Option<u64>,
+    clock: ZtsClock,
+}
+
+static ZTS_CLOCK: std::sync::Mutex<ZtsState> = std::sync::Mutex::new(ZtsState {
+    base_ticks: None,
+    clock: ZtsClock::new(),
+});
+
+/// The device timeline behind GetZeroTimeStamp (review H3).
+///
+/// The old code computed `sample_time = elapsed_since_anchor × rate_now`, so
+/// any change in the ring's disciplined rate retroactively rewrote ALL past
+/// time — at −100 ppm after an hour it jumped back 16384 frames (two periods),
+/// a discontinuity the HAL was never told about. This clock instead keeps an
+/// (anchor_ns, anchor_frames, rate) basis and, when the rate changes,
+/// re-anchors at the current position computed with the OLD rate. Position is
+/// therefore continuous and non-decreasing; a rate change only bends the slope
+/// from now on. Pure (no clock reads) so it is unit-testable.
+struct ZtsClock {
+    init: bool,
+    anchor_ns: f64,
+    anchor_frames: f64,
+    rate_hz: f64,
+}
+
+/// ZeroTimeStampPeriod (frames). Must match the device property.
+const ZTS_PERIOD: f64 = 8192.0;
+/// Ignore rate changes below this relative size (0.1 ppm) so DLL jitter does
+/// not re-anchor on every call.
+const ZTS_RATE_EPS: f64 = 1e-7;
+
+impl ZtsClock {
+    const fn new() -> Self {
+        Self {
+            init: false,
+            anchor_ns: 0.0,
+            anchor_frames: 0.0,
+            rate_hz: 48_000.0,
+        }
+    }
+
+    /// Advance to `now_ns` at `rate_hz`. Returns (sample_time of the current
+    /// period boundary, the ns time of that boundary on the same timeline).
+    fn step(&mut self, now_ns: f64, rate_hz: f64) -> (f64, f64) {
+        if !self.init {
+            self.init = true;
+            self.anchor_ns = now_ns;
+            self.anchor_frames = 0.0;
+            self.rate_hz = rate_hz;
+        } else if (rate_hz - self.rate_hz).abs() > self.rate_hz * ZTS_RATE_EPS {
+            // Re-anchor at the current position under the OLD rate, then adopt
+            // the new rate going forward.
+            let pos = self.position(now_ns);
+            self.anchor_ns = now_ns.max(self.anchor_ns);
+            self.anchor_frames = pos;
+            self.rate_hz = rate_hz;
+        }
+        let pos = self.position(now_ns);
+        let sample_time = (pos / ZTS_PERIOD).floor() * ZTS_PERIOD;
+        let boundary_ns =
+            self.anchor_ns + (sample_time - self.anchor_frames) * 1_000_000_000.0 / self.rate_hz;
+        (sample_time, boundary_ns)
+    }
+
+    fn position(&self, now_ns: f64) -> f64 {
+        let dt = (now_ns - self.anchor_ns).max(0.0);
+        self.anchor_frames + dt * self.rate_hz / 1_000_000_000.0
+    }
 }
 
 extern "C" {
@@ -191,20 +261,31 @@ extern "C" fn will_do_io_operation(
     _d: AudioServerPlugInDriverRef,
     _dev: AudioObjectID,
     _c: UInt32,
-    _op: UInt32,
+    op: UInt32,
     out_will_do: *mut Boolean,
     out_in_place: *mut Boolean,
 ) -> OSStatus {
+    // Claim ONLY the operations DoIOOperation implements (review C2). Saying
+    // yes to everything made the HAL hand us ops like ProcessOutput/ConvertMix
+    // that we silently ignored, leaving any non-in-place buffer unfilled.
+    let will = op_is_handled(op);
     unsafe {
         if !out_will_do.is_null() {
-            *out_will_do = 1;
+            *out_will_do = Boolean::from(will);
         }
         if !out_in_place.is_null() {
-            *out_in_place = 1;
+            *out_in_place = Boolean::from(will);
         }
     }
     kAudioHardwareNoError
 }
+
+/// The IO operations this plug-in performs: ReadInput (input stream) and
+/// WriteMix (output stream). Both run in place on the HAL's buffer.
+fn op_is_handled(op: UInt32) -> bool {
+    op == kAudioServerPlugInIOOperationReadInput || op == kAudioServerPlugInIOOperationWriteMix
+}
+
 extern "C" fn begin_io_operation(
     _d: AudioServerPlugInDriverRef,
     _dev: AudioObjectID,
@@ -275,4 +356,58 @@ pub extern "C" fn avb_coreaudio_factory(
     // Return &(&DRIVER_INTERFACE): the HAL dereferences once to reach the
     // vtable, matching the COM `IUnknown**` convention.
     &DRIVER_INTERFACE_PTR as *const _ as *mut c_void
+}
+
+#[cfg(test)]
+mod io_op_tests {
+    use super::*;
+
+    /// Regression (review H3): with the old stateless math a rate change
+    /// recomputed all elapsed time at the new rate, so sample_time jumped
+    /// backwards. The timeline must stay non-decreasing and continuous.
+    #[test]
+    fn zts_timeline_never_goes_backwards_on_rate_change() {
+        let mut c = ZtsClock::new();
+        let hour_ns = 3_600.0e9;
+        let (st0, _) = c.step(0.0, 48_000.0);
+        assert_eq!(st0, 0.0);
+        let (st1, b1) = c.step(hour_ns, 48_000.0);
+        // Media clock locks at -100 ppm: the old code jumped back 2 periods.
+        let slow = 48_000.0 * (1.0 - 100e-6);
+        let (st2, _) = c.step(hour_ns + 1.0, slow);
+        assert!(st2 >= st1, "sample_time went backwards: {st1} -> {st2}");
+        assert!(st2 - st1 <= ZTS_PERIOD, "sample_time jumped forward");
+        // Fallback to nominal (unlock) must not jump forward either.
+        let (st3, _) = c.step(hour_ns + 2.0, 48_000.0);
+        assert!(st3 >= st2 && st3 - st2 <= ZTS_PERIOD);
+        // The boundary pair is self-consistent: boundary precedes/equals now.
+        assert!(b1 <= hour_ns);
+    }
+
+    #[test]
+    fn zts_advances_one_period_per_period_of_time() {
+        let mut c = ZtsClock::new();
+        c.step(0.0, 48_000.0);
+        let period_ns = ZTS_PERIOD / 48_000.0 * 1e9;
+        let (st, b) = c.step(period_ns * 3.5, 48_000.0);
+        assert_eq!(st, 3.0 * ZTS_PERIOD);
+        assert!((b - 3.0 * period_ns).abs() < 1.0);
+    }
+
+    #[test]
+    fn zts_ignores_sub_eps_rate_jitter() {
+        let mut c = ZtsClock::new();
+        c.step(0.0, 48_000.0);
+        c.step(1e9, 48_000.0 * (1.0 + 1e-9));
+        assert_eq!(c.anchor_ns, 0.0, "tiny jitter must not re-anchor");
+    }
+
+    #[test]
+    fn only_read_input_and_write_mix_are_claimed() {
+        assert!(op_is_handled(kAudioServerPlugInIOOperationReadInput));
+        assert!(op_is_handled(kAudioServerPlugInIOOperationWriteMix));
+        for other in [b"thrd", b"cycl", b"proc", b"mixo", b"cvtm", b"cvti"] {
+            assert!(!op_is_handled(u32::from_be_bytes(*other)));
+        }
+    }
 }

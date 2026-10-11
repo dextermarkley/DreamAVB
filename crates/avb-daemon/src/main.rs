@@ -77,10 +77,7 @@ enum Command {
     },
     /// Data path + ADP + AECP walk only; write the 16R AEM to JSON.
     AemDump {
-        #[arg(
-            long,
-            default_value = "/Users/dexter/AVB-Audio/.agents/tasks/phase1a-aem-16r.json"
-        )]
+        #[arg(long, default_value = "phase1a-aem-16r.json")]
         out: PathBuf,
         #[arg(long)]
         talker: Option<String>,

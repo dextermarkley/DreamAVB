@@ -66,18 +66,29 @@ function fmt(n) {
   return new Intl.NumberFormat().format(n);
 }
 
+/// Show a transient error in the status sub-line (no modal).
+function showError(msg) {
+  const sub = el("stateSub");
+  sub.textContent = msg;
+  sub.style.color = "#ef4444";
+  setTimeout(() => {
+    sub.style.color = "";
+    refreshStatus();
+  }, 6000);
+}
+
 async function refreshStats() {
   try {
     const s = await invoke("stats");
     const lock = el("s_ascap");
-    lock.textContent = s.as_capable ? "locked" : "unlocked";
-    lock.className = "v " + (s.as_capable ? "good" : "");
-    el("s_pkts").textContent = `${fmt(s.stream_pkts_per_s)}/s`;
+    lock.textContent = s.clock_locked ? "locked" : "unlocked";
+    lock.className = "v " + (s.clock_locked ? "good" : "");
+    el("s_pkts").textContent = `${fmt(s.stream_frames_per_s)}/s`;
     const drift = el("s_drift");
     drift.textContent = `${s.media_drift_ppm.toFixed(1)} ppm`;
     drift.className = "v " + (Math.abs(s.media_drift_ppm) < 100 ? "good" : "warn");
-    el("s_under").textContent = fmt(s.ring_underruns);
-    el("s_over").textContent = fmt(s.ring_overruns);
+    el("s_under").textContent = fmt(s.zero_fill_frames);
+    el("s_over").textContent = fmt(s.overrun_frames);
     el("s_rx").textContent = fmt(s.rx_frames);
     el("s_hw").textContent = s.hw_rev ? `rev ${s.hw_rev} · ABI ${s.abi_version}` : "—";
   } catch (e) {
@@ -99,7 +110,9 @@ el("power").addEventListener("change", async (ev) => {
       await invoke("disable_driver");
     }
   } catch (e) {
-    alert(`DreamAVB: ${e}`);
+    // Inline, not alert(): a modal blocks the webview and is wrong for a
+    // menu-bar popover.
+    showError(String(e));
   } finally {
     ev.target.disabled = false;
     busy = false;
@@ -114,9 +127,7 @@ el("statsToggle").addEventListener("click", () => {
 });
 
 el("link").addEventListener("click", () => {
-  if (window.__TAURI__.shell) {
-    window.__TAURI__.shell.open("https://github.com/dextermarkley/DreamAVB");
-  }
+  invoke("open_project_page");
 });
 
 // Boot.

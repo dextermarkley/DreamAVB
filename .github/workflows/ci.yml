@@ -46,4 +46,4 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
-        run: cargo test --workspace --exclude avb-coreaudio --locked
+        run: cargo test --workspace --locked

@@ -15,10 +15,15 @@
 //! `-Wl,-bundle` is not needed because rustc invokes `cc`/`ld` directly.
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        // Scope to the cdylib: apply these ONLY to the plug-in artifact. A plain
+        // `rustc-link-arg` also hit the `cargo test` harness, linking it as a
+        // bundle too, so the unit-test binary failed with "cannot execute
+        // binary file" and this crate's tests never ran.
+        //
         // Emit a bundle, not a dynamic library.
-        println!("cargo:rustc-link-arg=-Wl,-bundle");
+        println!("cargo:rustc-link-arg-cdylib=-Wl,-bundle");
         // Undefined symbols (CoreFoundation etc.) are resolved by the host at
         // load time, matching how coreaudiod loads the plug-in.
-        println!("cargo:rustc-link-arg=-Wl,-undefined,dynamic_lookup");
+        println!("cargo:rustc-link-arg-cdylib=-Wl,-undefined,dynamic_lookup");
     }
 }

@@ -195,7 +195,6 @@ fn property_known(object_id: AudioObjectID, selector: UInt32) -> bool {
                 || x == kAudioDevicePropertyIsHidden
                 || x == kAudioDevicePropertyZeroTimeStampPeriod
                 || x == kAudioDevicePropertyPreferredChannelsForStereo
-                || x == kAudioDevicePropertyPreferredChannelLayout
         ),
         K_STREAM_OBJECT | K_STREAM_OUT_OBJECT => matches!(
             selector,
@@ -315,14 +314,27 @@ pub extern "C" fn get_property_data_size(
         }
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyRelatedDevices => oidsz,
         (K_DEVICE_OBJECT, s) if s == kAudioObjectPropertyControlList => 0,
-        (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyStreams => 2 * oidsz,
+        // Scope-aware, matching the DATA handler exactly (review M1): input or
+        // output scope has ONE stream, global/wildcard has both. Returning
+        // 2 ids here regardless of scope told a client to expect two and then
+        // handed it one, so it read a stale id.
+        (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyStreams => {
+            if a.mScope == kAudioObjectPropertyScopeInput
+                || a.mScope == kAudioObjectPropertyScopeOutput
+            {
+                oidsz
+            } else {
+                2 * oidsz
+            }
+        }
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyNominalSampleRate => f64sz,
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyAvailableNominalSampleRates => rangesz,
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyPreferredChannelsForStereo => 2 * u32sz,
-        (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyPreferredChannelLayout => {
-            // AudioChannelLayout header (12 bytes) + N descriptions (20 bytes).
-            12 + DEVICE_CHANNELS * 20
-        }
+        // NOTE: kAudioDevicePropertyPreferredChannelLayout is deliberately NOT
+        // advertised. It was listed as known and sized here but had no case in
+        // GetPropertyData, so HasProperty said yes and the get returned
+        // UnknownProperty (review M2). The HAL derives a sensible default
+        // layout from the channel count when the property is absent.
         // Stream.
         (K_STREAM_OBJECT | K_STREAM_OUT_OBJECT, s)
             if s == kAudioStreamPropertyDirection
@@ -674,15 +686,47 @@ struct IoState {
 static IO: Mutex<Option<IoState>> = Mutex::new(None);
 
 /// Output (playback) IO state (Phase 1b-2). The plug-in is the PRODUCER on the
-/// output ring: WriteMix hands us mixed f32 samples, we convert to S32LE and
+/// output ring: WriteMix hands us mixed f32 samples, we convert to S32 and
 /// place them into the ring the daemon's talker loop consumes. The daemon
-/// creates `SHM_NAME_OUT`; we attach it. `write_frame` is our place cursor.
+/// creates `SHM_NAME_OUT`; we attach it.
+///
+/// ONE long-lived producer per attach (review C1): it resumes at the ring's
+/// live write frontier and keeps its committed/written bookkeeping across IO
+/// cycles. Building a fresh `Producer` every cycle started `committed` at 0,
+/// which rejected every place beyond cap/2 and reset the shared frontier —
+/// playback was silent. `scratch` is the f32→S32 conversion buffer, allocated
+/// once at attach so the realtime path never allocates or grows its stack.
 struct OutIoState {
-    shm: ShmRing,
-    write_frame: u64,
+    prod: avb_audioring::ShmProducer,
+    scratch: Vec<u8>,
 }
 
+/// Frames converted per inner step of `write_mix` (bounds the scratch buffer;
+/// a HAL IO buffer is typically 64–1024 frames and is processed in chunks).
+const OUT_CHUNK_FRAMES: usize = 512;
+
 static OUT_IO: Mutex<Option<OutIoState>> = Mutex::new(None);
+
+/// Attach the daemon's output ring and build the long-lived producer. Returns
+/// `None` if the ring is absent or its geometry does not match this device.
+fn attach_out() -> Option<OutIoState> {
+    let channels = DEVICE_CHANNELS as usize;
+    let prod = avb_audioring::ShmProducer::attach_at(
+        avb_audioring::SHM_NAME_OUT,
+        &[(0, channels, 32)],
+        0,
+        0,
+    )
+    .ok()?;
+    if prod.ring().channels() != DEVICE_CHANNELS {
+        oslog("[avb-coreaudio] IO: output ring channel count mismatch — not attaching");
+        return None;
+    }
+    Some(OutIoState {
+        prod,
+        scratch: vec![0u8; OUT_CHUNK_FRAMES * channels * 4],
+    })
+}
 
 pub extern "C" fn start_io(
     _d: AudioServerPlugInDriverRef,
@@ -709,20 +753,16 @@ pub extern "C" fn start_io(
             }
         }
     }
-    // Attach the OUTPUT ring (playback). Absence is not an error — WriteMix is
-    // dropped until the daemon's `play` loop has created the ring.
+    // Attach the OUTPUT ring (playback). Absence is not an error — write_mix
+    // retries the attach (throttled) until the daemon's `play` loop creates it.
     if let Ok(mut guard) = OUT_IO.lock() {
         if guard.is_none() {
-            match ShmRing::attach_at(avb_audioring::SHM_NAME_OUT) {
-                Ok(shm) => {
-                    let write_frame = Consumer::new(shm.ring()).write_frame();
-                    *guard = Some(OutIoState { shm, write_frame });
-                    oslog("[avb-coreaudio] IO: attached output ring");
-                }
-                Err(_) => {
-                    oslog("[avb-coreaudio] IO: output ring not present — playback muted");
-                }
-            }
+            *guard = attach_out();
+            oslog(if guard.is_some() {
+                "[avb-coreaudio] IO: attached output ring"
+            } else {
+                "[avb-coreaudio] IO: output ring not present — playback muted"
+            });
         }
     }
     kAudioHardwareNoError
@@ -892,7 +932,8 @@ pub extern "C" fn do_io_operation(
 /// `place` takes big-endian wire bytes and stores little-endian, so the daemon
 /// reads LE S32 — the same container the input ring uses.
 fn write_mix(frames: UInt32, io_main_buffer: *mut c_void) -> OSStatus {
-    use avb_audioring::{Producer, SampleFormat};
+    use avb_audioring::SampleFormat;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     let channels = DEVICE_CHANNELS as usize;
     let frame_bytes = channels * 4;
@@ -905,33 +946,73 @@ fn write_mix(frames: UInt32, io_main_buffer: *mut c_void) -> OSStatus {
     let Ok(mut guard) = OUT_IO.lock() else {
         return kAudioHardwareNoError;
     };
+    // Lazy attach (review H2): coreaudiod usually starts IO before the daemon
+    // creates the output ring, so retry here — throttled to once per second so
+    // a missing ring costs one failed open() per second, not one per cycle.
+    if guard.is_none() {
+        static LAST_TRY: AtomicU64 = AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if LAST_TRY.swap(now, Ordering::Relaxed) != now {
+            *guard = attach_out();
+            if guard.is_some() {
+                oslog("[avb-coreaudio] IO: attached output ring (lazy retry in WriteMix)");
+            }
+        }
+    }
     let Some(state) = guard.as_mut() else {
         return kAudioHardwareNoError; // ring not attached yet — drop (muted)
     };
-    let ring = state.shm.ring();
 
-    // Convert f32 → S32 big-endian into a scratch, then place one frame-group.
-    // Max buffer: a HAL IO buffer is small (hundreds of frames); cap the
-    // scratch at a generous bound and process in that unit.
-    const MAX_FR: usize = 4096;
-    let mut be = [0u8; MAX_FR * 8 * 4]; // 8ch × 4B, up to MAX_FR frames
-    let fr_this = n_frames.min(MAX_FR);
-    let want_bytes = fr_this * frame_bytes;
-    let (src_chunks, _r) = inp.get(..want_bytes).unwrap_or(&[]).as_chunks::<4>();
-    let be_slice = be.get_mut(..want_bytes).unwrap_or(&mut []);
-    let (be_chunks, _r2) = be_slice.as_chunks_mut::<4>();
-    for (dst, src) in be_chunks.iter_mut().zip(src_chunks.iter()) {
-        let f = f32::from_le_bytes(*src);
-        // ±1.0 full scale → S32. Clamp to avoid overflow on >1.0 peaks.
-        let scaled = (f as f64 * 2_147_483_648.0).clamp(-2_147_483_648.0, 2_147_483_647.0);
-        *dst = (scaled as i32).to_be_bytes();
-    }
-
-    let mut producer = Producer::new(ring, &[(0, channels, 32)], 0, 0);
-    let f = state.write_frame;
-    if producer.place(0, f as i128, fr_this, SampleFormat::Int32, be_slice) {
-        producer.commit(false, None);
-        state.write_frame = f + fr_this as u64;
+    // Convert f32 → S32 big-endian in fixed chunks into the preallocated
+    // scratch (no per-cycle stack array or allocation, review H1), and place
+    // each chunk at the producer's committed frontier. `place` takes BE wire
+    // bytes and stores LE S32 — the same container the input ring uses.
+    let mut done = 0usize;
+    while done < n_frames {
+        let fr = (n_frames - done).min(OUT_CHUNK_FRAMES);
+        let bytes = fr * frame_bytes;
+        let src = inp
+            .get(done * frame_bytes..done * frame_bytes + bytes)
+            .unwrap_or(&[]);
+        let Some(dst) = state.scratch.get_mut(..bytes) else {
+            break;
+        };
+        let (src_chunks, _) = src.as_chunks::<4>();
+        let (dst_chunks, _) = dst.as_chunks_mut::<4>();
+        for (d, s) in dst_chunks.iter_mut().zip(src_chunks.iter()) {
+            *d = f32_to_s32(f32::from_le_bytes(*s)).to_be_bytes();
+        }
+        let p = state.prod.producer();
+        let at = p.committed();
+        if p.place(0, i128::from(at), fr, SampleFormat::Int32, dst) {
+            p.commit(false, None);
+        }
+        done += fr;
     }
     kAudioHardwareNoError
+}
+
+/// ±1.0 full-scale f32 → S32, clamped (the inverse of the ReadInput s/2^31).
+fn f32_to_s32(f: f32) -> i32 {
+    (f64::from(f) * 2_147_483_648.0).clamp(-2_147_483_648.0, 2_147_483_647.0) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f32_s32_round_trip_and_clamp() {
+        assert_eq!(f32_to_s32(0.0), 0);
+        assert_eq!(f32_to_s32(1.0), i32::MAX); // clamped, not wrapped
+        assert_eq!(f32_to_s32(-1.0), i32::MIN);
+        assert_eq!(f32_to_s32(4.0), i32::MAX); // over-range peak clamps
+                                               // Inverse of the ReadInput conversion within one S32 LSB of f32 precision.
+        let s = 123_456_789i32;
+        let back = f32_to_s32(s as f32 / 2_147_483_648.0);
+        assert!((i64::from(back) - i64::from(s)).abs() <= 64);
+    }
 }
