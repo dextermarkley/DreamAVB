@@ -1548,73 +1548,21 @@ fn streams_loop(
         );
     }
 
-    // Proactively declare an MSRP Listener Ready for each of the talker's
-    // derived stream ids (talker MAC + unique id, IEEE 1722.1 §8.2 / design
-    // §12). A Milan talker advertises and begins egress once it registers a
-    // Listener declaration for its stream — waiting for the Talker Advertise
-    // first would deadlock, since the 16R does not advertise unsolicited.
-    for uid in 0..n_streams {
-        // Prefer the authoritative stream_id from GET_STREAM_INFO; fall back
-        // to the MAC+index derivation only if the talker did not answer.
-        let sid = match gsi.get(&uid) {
-            Some(&(id, dmac, vid, flags)) if id != 0 => {
-                if flags & avb_avdecc::milan::stream_info_flags::STREAM_DEST_MAC_VALID != 0
-                    && dmac[0] & 1 == 1
-                {
-                    let v = if vid == 0 { DEFAULT_DOMAIN.vid } else { vid };
-                    filter.retain(|(_, m, _)| *m != dmac);
-                    filter.push((id, dmac, v));
-                }
-                StreamId(id)
-            }
-            _ => stream_id_for(talker_mac, uid),
-        };
-        if listener_declared.insert(sid.0) {
-            log.log(
-                Level::Debug,
-                "srp",
-                &format!(
-                    "declare Listener Ready uid={uid} stream_id=0x{:016x}",
-                    sid.0
-                ),
-            );
-            srp.declare_new(
-                now_mach(),
-                Attribute::Listener(Listener {
-                    stream_id: sid,
-                    decl: ListenerDecl::Ready,
-                }),
-            );
-        }
-    }
+    // Milan settled-state law (v1.2 tables 5.28-5.30, kebag-logic milan-fpga
+    // #54 defect 5): the Listener Ready attribute is declared ONLY AFTER the
+    // stream settles -- i.e. after the talker registers a Talker Advertise --
+    // NOT proactively at bind. Declaring it early is a spec deviation and a
+    // strict Milan talker (the 16R) may refuse to advertise. So here we only
+    // establish MVRP VID + MSRP Domain and let the ACMP CONNECT_TX (re-sent in
+    // the loop below) prompt the 16R's Talker Advertise; the TalkerRegistered
+    // handler then declares Listener Ready in response.
+    srp.force_leave_all();
     srp.poll(srp_now(), &mut srp_out);
-    // One-shot trace of what we actually transmit for the reservation.
-    while let Some(f) = srp_out.pop() {
-        let b = f.bytes();
-        // eth(14) + MRPDU: ProtocolVersion(1) then AttributeType(1)...
-        let et = b
-            .get(12..14)
-            .map(|x| (u16::from(x[0]) << 8) | u16::from(x[1]));
-        let atype = b.get(15).copied();
-        let alen = b.get(16).copied();
-        log.log(
-            Level::Debug,
-            "srp",
-            &format!(
-                "TX et={:?} first_attr_type={:?} attr_len={:?} len={} head={:02x?}",
-                et.map(|e| format!("0x{e:04x}")),
-                atype,
-                alen,
-                b.len(),
-                b.iter().take(28).copied().collect::<Vec<_>>()
-            ),
-        );
-        let _ = dext.send(b, false, 0);
-    }
+    drain_srp(dext, &mut srp_out);
     log.log(
         Level::Info,
         "srp",
-        &format!("declared Listener Ready for {n_streams} stream(s)"),
+        "declared VID + Domain; awaiting Talker Advertise before Listener Ready",
     );
 
     // Drive ACMP (probe) and SRP (reservation) together until every stream
@@ -1778,12 +1726,44 @@ fn streams_loop(
                 talker: t,
             } = ev
             {
+                // A Talker FAILED means the talker will not stream this source
+                // (e.g. code 8 = egress port not AVB-capable: the 16R does not
+                // consider our link AVB-capable, typically its asCapable toward
+                // us is false / peer-delay over threshold). Record and skip --
+                // it is NOT a usable advertise.
+                if let Some(code) = t.failure_code() {
+                    log.log(
+                        Level::Warn,
+                        "srp",
+                        &format!(
+                            "TALKER FAILED id=0x{:016x} code={code} ({}): 16R refuses to stream this source",
+                            stream_id.0,
+                            match code {
+                                1 => "insufficient bandwidth",
+                                2 => "insufficient bridge resources",
+                                3 => "insufficient bandwidth for traffic class",
+                                6 => "stream preempted",
+                                8 => "egress port not AVB-capable",
+                                9 => "use a different destination",
+                                _ => "other",
+                            }
+                        ),
+                    );
+                    continue;
+                }
                 let adv = t.advertise();
                 let dmac = adv.dest_mac.octets();
                 ta_seen.insert(stream_id.0);
-                // Install/refresh the dext filter for this stream.
+                // Install/refresh the dext filter for this stream (match on
+                // stream_id + dest_mac + VLAN; defect 4). The dext rejects
+                // vid 0, so fall back to the SR class A VID.
+                let ta_vid = if adv.vlan_id == 0 {
+                    DEFAULT_DOMAIN.vid
+                } else {
+                    adv.vlan_id
+                };
                 filter.retain(|(_, m, _)| *m != dmac);
-                filter.push((stream_id.0, dmac, adv.vlan_id));
+                filter.push((stream_id.0, dmac, ta_vid));
                 // Declare Listener Ready so the 16R starts streaming (once).
                 if listener_declared.insert(stream_id.0) {
                     srp.declare_new(
