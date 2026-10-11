@@ -619,10 +619,10 @@ pub extern "C" fn start_io(
         if guard.is_none() {
             match ShmRing::attach() {
                 Ok(shm) => {
-                    // Start LIVE: seek to the current write frontier so the
-                    // device plays current audio, not the whole committed
-                    // backlog the daemon produced before IO started.
-                    let read_frame = Consumer::new(shm.ring()).write_frame();
+                    // Start a small margin behind the write frontier (see the
+                    // DoIO retry path) so the first reads have committed data.
+                    let w = Consumer::new(shm.ring()).write_frame();
+                    let read_frame = w.saturating_sub(2048);
                     *guard = Some(IoState { shm, read_frame });
                     oslog("[avb-coreaudio] IO: attached recovered-audio ring");
                 }
@@ -675,7 +675,11 @@ pub extern "C" fn do_io_operation(
         // pick it up whenever the daemon appears — regardless of start order.
         if guard.is_none() {
             if let Ok(shm) = ShmRing::attach() {
-                let read_frame = Consumer::new(shm.ring()).write_frame();
+                // Start a small margin BEHIND the write frontier so the first
+                // reads have committed data (avoids immediate underrun) while
+                // keeping latency low. ~2048 frames ≈ 43 ms at 48 kHz.
+                let w = Consumer::new(shm.ring()).write_frame();
+                let read_frame = w.saturating_sub(2048);
                 *guard = Some(IoState { shm, read_frame });
                 oslog("[avb-coreaudio] IO: attached ring (lazy retry in DoIO)");
             }

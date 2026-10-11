@@ -21,7 +21,7 @@
 		<string>MacOSX</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>12</string>
+	<string>13</string>
 	<key>CFPlugInFactories</key>
 	<dict>
 		<key>8E303148-8E87-45BB-811F-464ECEF949FF</key>

@@ -1948,6 +1948,9 @@ fn streams_loop(
     let mut mclk: Option<avb_mediaclock::MediaClock> = None;
     let mut ring_stream_id: u64 = 0;
     let mut ring_spf: usize = 0;
+    // Sequential write cursor for the ring FIFO (frames). Advanced by spf per
+    // placed packet; the plug-in's Consumer drains it in order.
+    let mut ring_write_pos: u64 = 0;
     let run_ns = seconds.saturating_mul(1_000_000_000);
     let interval_ns = interval.max(1).saturating_mul(1_000_000_000);
     let count_start = now_mach();
@@ -2155,15 +2158,22 @@ fn streams_loop(
                                 arrival,
                             );
                         }
-                        if let Some(rf) = mc.ring_frame(pt) {
-                            let fmt = if pdu.hdr.format == avb_avtp::aaf::format::INT_24BIT {
-                                avb_audioring::SampleFormat::Int24
-                            } else {
-                                avb_audioring::SampleFormat::Int32
-                            };
-                            rp.producer().place(0, rf, ring_spf, fmt, pdu.data);
-                            rp.producer().commit(false, None);
-                        }
+                        // Place samples SEQUENTIALLY at a running frame counter,
+                        // not at the media-clock's absolute ring_frame. The ring
+                        // is a FIFO the plug-in drains in order; clock-derived
+                        // absolute frames grow on a wall-clock timeline the
+                        // consumer can't track, lapping it by millions of frames
+                        // (= overrun garble). The media clock still timestamps
+                        // the clock block below for the plug-in's timebase.
+                        let fmt = if pdu.hdr.format == avb_avtp::aaf::format::INT_24BIT {
+                            avb_audioring::SampleFormat::Int24
+                        } else {
+                            avb_audioring::SampleFormat::Int32
+                        };
+                        rp.producer()
+                            .place(0, ring_write_pos as i128, ring_spf, fmt, pdu.data);
+                        rp.producer().commit(false, None);
+                        ring_write_pos += ring_spf as u64;
                         if mc.should_publish() {
                             let model = mc.clock_model(arrival as f64, 0.0, 0.0);
                             rp.ring().publish_clock(&avb_audioring::ClockBlock {
