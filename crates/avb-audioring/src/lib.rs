@@ -177,39 +177,70 @@ mod tests {
     #[test]
     fn spsc_producer_consumer_stress() {
         // One producer writes an increasing ramp; one consumer verifies it in
-        // order with no torn frames. Capacity large enough to avoid overrun at
-        // this cadence.
-        let r = Arc::new(AudioRing::new_anonymous(&test_config(4096)).unwrap());
+        // order with no torn frames.
+        //
+        // The ring stays small (4096 frames) so the ramp wraps it ~73 times and
+        // the modulo/wrap path is exercised, and the producer is held back by the
+        // consumer's published progress so it can never lap it.
+        //
+        // It used to rely on a comment claiming 4096 was "large enough to avoid
+        // overrun at this cadence" — a scheduling assumption, not a fact. On a
+        // 2-core CI runner the producer ran unimpeded before the consumer was
+        // first scheduled, lapped the ring, and the consumer's first read
+        // correctly returned the oldest surviving frame (6516) instead of 0, so
+        // the test failed with "frame out of order" on an overrun that is CORRECT
+        // behaviour (covered deliberately by consumer::tests::overrun_skips).
+        // Simply enlarging the ring to hold the whole ramp would also have been
+        // deterministic, but would have stopped it wrapping at all. This test is
+        // about ordering and tearing, so bound the producer instead of asserting
+        // against the scheduler.
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let capacity = 4096u32;
         let total_packets = 50_000u64;
         let spf = 6usize;
+        let total_frames = total_packets * spf as u64;
+        let r = Arc::new(AudioRing::new_anonymous(&test_config(capacity)).unwrap());
+        // Frames the consumer has verified, published for flow control.
+        let consumed = Arc::new(AtomicU64::new(0));
+        // Stay a margin below capacity so a batch in flight cannot tip into
+        // overrun.
+        let high_water = u64::from(capacity) - 512;
+
         let producer = {
             let r = Arc::clone(&r);
+            let consumed = Arc::clone(&consumed);
             std::thread::spawn(move || {
                 let mut p = Producer::new(&r, &[(0, 4, 24)], 192, 192);
                 for pkt in 0..total_packets {
+                    let first = pkt * spf as u64;
+                    // Backpressure: never get further ahead of the consumer than
+                    // the ring can hold.
+                    while first.saturating_sub(consumed.load(Ordering::Acquire)) > high_water {
+                        std::hint::spin_loop();
+                    }
                     // Each sample encodes its absolute frame index in ch 0.
                     let mut data = vec![0u8; spf * 4 * 4];
                     for fr in 0..spf {
-                        let frame = pkt * spf as u64 + fr as u64;
+                        let frame = first + fr as u64;
                         let v = (frame as u32).to_be_bytes();
                         let off = fr * 4 * 4;
                         data[off..off + 4].copy_from_slice(&v);
                     }
-                    let f = (pkt * spf as u64) as i128;
-                    p.place(0, f, spf, SampleFormat::Int32, &data);
+                    p.place(0, first as i128, spf, SampleFormat::Int32, &data);
                     p.commit(false, None);
                 }
             })
         };
         let consumer = {
             let r = Arc::clone(&r);
+            let consumed = Arc::clone(&consumed);
             std::thread::spawn(move || {
                 let mut c = Consumer::new(&r);
                 let mut next = 0u64;
                 let frame_bytes = r.frame_bytes();
                 let mut out = vec![0u8; 256 * frame_bytes];
-                let target = total_packets * spf as u64;
-                while next < target {
+                while next < total_frames {
                     let got = c.read_into(&mut out, 256);
                     if got == 0 {
                         std::hint::spin_loop();
@@ -221,11 +252,64 @@ mod tests {
                         assert_eq!(u64::from(v), next, "frame out of order");
                         next += 1;
                     }
+                    consumed.store(next, Ordering::Release);
                 }
                 next
             })
         };
         producer.join().unwrap();
-        assert_eq!(consumer.join().unwrap(), total_packets * spf as u64);
+        assert_eq!(consumer.join().unwrap(), total_frames);
+        // Prove the premise the ordering assertions rely on, instead of assuming
+        // it: nothing was dropped or skipped, so in-order delivery was the only
+        // correct outcome. Without the backpressure above these fire on a loaded
+        // machine.
+        assert_eq!(
+            r.counter(crate::layout::counter::OVERRUN_EVENTS),
+            0,
+            "ring overran"
+        );
+        assert_eq!(
+            r.counter(crate::layout::counter::CONSUMER_SKIPS),
+            0,
+            "consumer skipped"
+        );
+        // The ramp is far larger than the ring, so the wrap path was exercised.
+        assert!(total_frames > u64::from(capacity) * 50);
+    }
+
+    /// Regression (review C1): a producer that attaches to a ring another
+    /// process has already advanced must RESUME at the live frontier. A fresh
+    /// `Producer::new` per call starts `committed` at 0, so it rejected every
+    /// place beyond cap/2 and reset the shared frontier — silent playback.
+    #[test]
+    fn resumed_producer_advances_live_frontier() {
+        let r = AudioRing::new_anonymous(&test_config(1024)).unwrap();
+        // Another producer advances the ring well past cap/2.
+        let mut first = Producer::new(&r, &[(0, 4, 24)], 0, 0);
+        let data = vec![0u8; 4 * 4 * 64];
+        for i in 0..20u64 {
+            assert!(first.place(0, (i * 64) as i128, 64, SampleFormat::Int32, &data));
+            first.commit(false, None);
+        }
+        let live = r.write_frame();
+        assert_eq!(live, 20 * 64);
+        assert!(
+            live > 1024 / 2,
+            "frontier must be beyond cap/2 for the test to bite"
+        );
+
+        // A per-call fresh producer (the old bug) cannot place at the frontier.
+        let mut fresh = Producer::new(&r, &[(0, 4, 24)], 0, 0);
+        assert!(!fresh.place(0, live as i128, 64, SampleFormat::Int32, &data));
+
+        // A resumed producer places there and advances cumulatively.
+        let mut p = Producer::resume(&r, &[(0, 4, 24)], 0, 0);
+        let mut f = live;
+        for _ in 0..3 {
+            assert!(p.place(0, f as i128, 64, SampleFormat::Int32, &data));
+            p.commit(false, None);
+            f += 64;
+            assert_eq!(r.write_frame(), f, "frontier advances, never resets");
+        }
     }
 }

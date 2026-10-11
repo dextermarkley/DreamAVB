@@ -45,6 +45,12 @@ pub struct ClockModel {
     /// Disciplined sample rate vs mach (Hz).
     pub rate_hz_vs_mach: f64,
     /// Media ppm vs gPTP.
+    /// Media-clock drift in ppm: the DLL's ppm vs nominal, minus the supplied
+    /// `gptp_ppm_vs_mach`. NOTE: the daemon currently passes 0.0 for that term
+    /// (the gPTP↔mach mapping is not plumbed into the audio loop), so in
+    /// practice this reads as **ppm vs nominal**, not vs gPTP. Readers should
+    /// gate it on `locked` and treat it as drift against the nominal rate
+    /// until the servo's term is supplied.
     pub media_ppm_vs_gptp: f64,
     /// Model uncertainty (ns).
     pub uncertainty_ns: f64,

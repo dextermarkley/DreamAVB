@@ -67,7 +67,38 @@ for proj in AVBI210Driver AVBBcmDriver; do
 done
 
 echo "== build Rust (release)"
+# Resolve the pinned toolchain explicitly instead of trusting the ambient PATH.
+# rust-toolchain.toml pins a plain version (it must: a host-qualified channel is
+# rejected by rustup and broke CI), but this machine's rustup default-host is
+# x86_64, so a bare `cargo` here would silently build an x86_64 installer. The
+# shipped probe and installer must be native arm64, so prefer the native
+# toolchain's own bin directory and verify the result below.
+HOST_TC="$(/usr/bin/uname -m)"
+case "$HOST_TC" in
+    arm64) RUST_TC="$HOME/.rustup/toolchains/1.99.0-aarch64-apple-darwin/bin" ;;
+    *)     RUST_TC="" ;;
+esac
+if [ -n "$RUST_TC" ] && [ -x "$RUST_TC/cargo" ]; then
+    # Prepend to PATH rather than calling cargo by absolute path: cargo resolves
+    # rustc from PATH, so an absolute cargo with the bin dir absent fails with
+    # "could not execute process `rustc -vV`".
+    PATH="$RUST_TC:$PATH"
+    export PATH
+else
+    echo "warning: pinned native toolchain not found, using 'cargo' from PATH" >&2
+fi
 cargo build --manifest-path "$ROOT/Cargo.toml" --workspace --release --locked
+
+# The installer and probe are loaded by native arm64 system components; an
+# x86_64 build would fail at load time with a confusing error, so refuse to
+# package one.
+for bin in avb-installer avb-probe avb-daemon; do
+    if ! /usr/bin/file "$ROOT/target/release/$bin" | /usr/bin/grep -q 'arm64'; then
+        echo "error: target/release/$bin is not arm64 (wrong toolchain host?)" >&2
+        /usr/bin/file "$ROOT/target/release/$bin" >&2
+        exit 1
+    fi
+done
 
 # kernelmanagerd requires a kext-style version (major <= 4 digits, minor and
 # revision <= 2 digits), so a raw YYYYMMDDHHMM stamp is rejected. Use

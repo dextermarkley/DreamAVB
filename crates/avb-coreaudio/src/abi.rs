@@ -372,15 +372,21 @@ pub fn cfstring(s: &str) -> CFStringRef {
     }
 }
 
-// --- Diagnostic file log (robust; coreaudiod stderr/os_log are unreliable
-// to capture from a third-party plug-in). Appends to a world-writable path so
-// coreaudiod (_coreaudiod user) can write it. Dev-only. ---
+// --- Diagnostic file log (coreaudiod stderr/os_log are unreliable to capture
+// from a third-party plug-in). OFF unless AVB_CA_LOG names a writable path, so
+// a release plug-in never opens a file from the realtime IO thread and nothing
+// is written to the shared /tmp (which the project's rules forbid and which any
+// local user can pre-create). Set AVB_CA_LOG=/Users/Shared/avb-coreaudio.log in
+// coreaudiod's environment to enable it for debugging. ---
 pub fn oslog(msg: &str) {
     use std::io::Write;
+    let Some(path) = std::env::var_os("AVB_CA_LOG") else {
+        return;
+    };
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/avb-coreaudio.log")
+        .open(path)
     {
         let _ = writeln!(f, "{msg}");
     }

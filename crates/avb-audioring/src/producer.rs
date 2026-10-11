@@ -96,6 +96,29 @@ impl<'a> Producer<'a> {
         self.committed
     }
 
+    /// Build a producer that RESUMES an existing ring at its current committed
+    /// write frontier, instead of starting from frame 0. Use this when attaching
+    /// to a ring another process created (e.g. the CoreAudio plug-in producing
+    /// into the daemon's output ring): `new()` would start `committed` at 0 and
+    /// then reject every `place` beyond `cap/2` as "too far ahead", and its
+    /// `commit` would overwrite the shared frontier with a small value.
+    pub fn resume(
+        ring: &'a AudioRing,
+        streams: &[(usize, usize, u32)],
+        lag_frames: u64,
+        silent_lag: u64,
+    ) -> Self {
+        let mut p = Self::new(ring, streams, lag_frames, silent_lag);
+        let w = ring.write_frame();
+        p.committed = w;
+        p.zeroed_upto = w;
+        p.overrun_counted_upto = w;
+        for s in &mut p.streams {
+            s.written_upto = w;
+        }
+        p
+    }
+
     /// Zero-fill `[zeroed_upto, up_to)` so missing data reads as zero (§10.6).
     fn zero_fill_to(&mut self, up_to: u64) {
         if up_to <= self.zeroed_upto {

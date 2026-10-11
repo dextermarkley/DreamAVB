@@ -130,19 +130,25 @@ mod tests {
         assert_eq!(projected_wav_bytes(10, 48_000, 8), 104 + 15_360_000);
     }
 
+    /// A path whose parent always exists on any checkout (this crate's own
+    /// directory) — never a machine-specific absolute path, so the test passes
+    /// on CI runners and other contributors' machines.
+    fn crate_dir_out() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("out.wav")
+    }
+
     #[test]
     fn out_path_parent_must_exist() {
-        // The workspace tmp dir exists and is writable.
-        let ok = Path::new("/Users/dexter/AVB-Audio/.agents/tmp/out.wav");
-        assert_eq!(validate_out_path(ok), Ok(()));
+        let ok = crate_dir_out();
+        assert_eq!(validate_out_path(&ok), Ok(()));
         let bad = Path::new("/no/such/dir/out.wav");
         assert_eq!(validate_out_path(bad), Err(Exit::DiskOrPath));
     }
 
     #[test]
     fn disk_space_check_runs() {
-        // The tmp dir almost certainly has > 64 MiB + a few bytes free.
-        let p = Path::new("/Users/dexter/AVB-Audio/.agents/tmp/out.wav");
-        assert!(check_disk_space(p, 1024).is_ok());
+        // The checkout volume almost certainly has > 64 MiB + a few bytes free.
+        let p = crate_dir_out();
+        assert!(check_disk_space(&p, 1024).is_ok());
     }
 }
