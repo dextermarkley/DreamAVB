@@ -667,3 +667,33 @@ reservation → AAF audio. Final hardware result (`hw-streams-pass.json`):
 
 Gate green: fmt, `clippy --workspace --all-targets -D warnings`, 321 workspace
 tests, C++ tg3 97 + i210 341, `package.sh --adhoc`.
+
+## hw-audio — PASSED (600 s multichannel WAV, 0 gaps, -7.8 ppm)
+
+The `record` runner reuses the proven streams connect/settle/receive flow
+(`streams_loop` gained `wav_out` + `summary_out`) and writes the primary
+stream's decoded AAF PCM to a 32-bit interleaved WAV (big-endian AAF samples
+byte-swapped to little-endian WAV via `wav::initial_header` / `finalize_header`),
+tracks per-stream sequence gaps, and computes media-clock drift (ppm) from
+frames-written vs elapsed wall time.
+
+Milestone run on the live 16R (`hw-audio-pass.json`), signal fed into 16R input
+channel 5:
+
+- **600.0 s, 8-channel 48 kHz 32-bit WAV, 28,799,778 frames, 921 MB** — valid
+  RIFF/WAVE, header sizes patched exactly (data + 104 B header = file size).
+- **0 sequence gaps** across all streams for the full 10 minutes.
+- **Media-clock drift -7.8 ppm** (measured 47999.63 Hz vs 48000 nominal) — well
+  inside AVB's ±100 ppm, and it tightened as the run lengthened.
+- dext counters: `rx_stream=38,699,692` over 600 s = 64,499/s = 8 × 8000/s;
+  `ring_overrun_audio=0`, `drop_unbound_stream=0`, `drop_untagged_stream=0`.
+
+Channel map confirmed: 16R physical input channel 5 → AVB stream
+`0x000a92033ba9_0001`, channel index 4 (0-based) = the 5th channel; stream 1
+carries 16R channels 1–8 in order.
+
+Gate green: fmt, `clippy --workspace --all-targets -D warnings`, 321 workspace
+tests, C++ tg3 97 + i210 341, `package.sh --adhoc`.
+
+**All four Phase 1a hardware milestones (hw-gptp, hw-avdecc, hw-streams,
+hw-audio) are complete on the real PreSonus StudioLive 16R over the Intel I210.**

@@ -47,19 +47,18 @@ it). It was activated via `avb-installer activate`; a reboot + Thunderbolt
 replug were needed once to clear a tangled sysextd and let the dext win the
 match over Apple's generic E1000 driver. The 16R is cabled to the I210.
 
-What is left in Phase 1a:
+Phase 1a hardware: COMPLETE. All four milestones pass on the live 16R over the
+I210 — see `docs/phase1a-results.md` and `.agents/tasks/phase1a-impl-verification.md`.
 
-1. **hw-streams** — DONE. The `streams` runner receives all 8 of the 16R's AAF
-   output streams at 8000 pkt/s each, 0 sequence gaps, on the live 16R. Three
-   root causes fixed (Milan settled-state order: Listener Ready only after a
-   Talker Advertise; AAF decode must strip the Ethernet/VLAN header; busy-drain
-   the audio ring to avoid overrun at ~64k pkt/s). Evidence:
-   `.agents/tasks/hw-streams-pass.json`. See `phase1a-impl-verification.md`.
-2. **hw-audio** — a 600 s multichannel WAV, no sequence gaps, media-clock drift
-   in ppm. The `record` runner's loop still needs implementing. **This one needs
-   the user**: pause and ask them to feed signal into specific 16R inputs so the
-   channel map can be checked. (The stream RX path is now proven by hw-streams.)
-3. `docs/phase1a-results.md` from the milestone runs.
+1. **hw-gptp** — DONE (`353f662`). gPTP locks to the 16R GM, 5+ min, offset
+   mean 0.05 ns / sd 5.2 ns.
+2. **hw-avdecc** — DONE (`bcfe889`). 21/21 AEM descriptors, 0 timeouts.
+3. **hw-streams** — DONE (`d6ada09`, `0d30231`). 8 streams × 8000 pkt/s, 0
+   sequence gaps. Evidence `hw-streams-pass.json`.
+4. **hw-audio** — DONE (`d3fbfb3`). 600 s 8-ch 48 kHz WAV, 0 gaps, -7.8 ppm
+   drift. Channel map verified (16R ch5 → stream 1 ch4). Evidence
+   `hw-audio-pass.json`.
+5. `docs/phase1a-results.md` — DONE.
 
 ### Hardware bugs fixed (all in `phase1a-impl-verification.md`)
 gPTP: init_datapath flags, mapped ctl-ring RX vs PollRx, TX_TS status polarity,
