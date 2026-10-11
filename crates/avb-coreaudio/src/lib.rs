@@ -107,17 +107,35 @@ extern "C" fn get_zero_time_stamp(
     out_host_time: *mut u64,
     out_seed: *mut u64,
 ) -> OSStatus {
-    // Advance the zero timestamp by whole ring periods against the host clock,
-    // mirroring NullAudio. The anchor is captured on the first call. This is a
-    // stand-in until the recovered-audio ring's ClockModel drives it (1b-1).
+    // Prefer the ring's own clock so the HAL device timeline tracks actual
+    // data arrival (the 16R media clock), not the Mac host clock. Falls back to
+    // the wall-clock stand-in below when the ring is not attached yet.
+    let now = unsafe { mach_absolute_time() };
+    let (numer, denom) = timebase();
+    if let Some((sample_time, host_time)) = crate::plugin::ring_zero_timestamp(now, numer, denom) {
+        unsafe {
+            if !out_sample_time.is_null() {
+                *out_sample_time = sample_time;
+            }
+            if !out_host_time.is_null() {
+                *out_host_time = host_time;
+            }
+            if !out_seed.is_null() {
+                *out_seed = 1;
+            }
+        }
+        return kAudioHardwareNoError;
+    }
+
+    // Wall-clock stand-in (ring not attached): advance the zero timestamp by
+    // whole ring periods against the host clock, mirroring NullAudio, so the
+    // device stays alive and silent until the daemon's ring appears.
     use std::sync::atomic::{AtomicU64, Ordering};
     static ANCHOR_HOST: AtomicU64 = AtomicU64::new(0);
 
     const RING_FRAMES: f64 = 8192.0;
     const RATE_HZ: f64 = 48_000.0;
 
-    let now = unsafe { mach_absolute_time() };
-    let (numer, denom) = timebase();
     // host ticks -> nanoseconds -> frames.
     let anchor = match ANCHOR_HOST.compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst) {
         Ok(_) => now,              // first call: we just set it

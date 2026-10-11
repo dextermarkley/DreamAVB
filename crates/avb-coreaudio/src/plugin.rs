@@ -646,6 +646,57 @@ pub extern "C" fn stop_io(
     kAudioHardwareNoError
 }
 
+/// Device zero-timestamp period (frames). Must equal the value published for
+/// `kAudioDevicePropertyZeroTimeStampPeriod`; the HAL requires GetZeroTimeStamp
+/// to advance `mSampleTime` in whole multiples of this.
+pub const ZERO_TS_PERIOD: u64 = 8192;
+
+/// Ring-clock-driven zero timestamp for `GetZeroTimeStamp`.
+///
+/// The daemon fills the ring on the 16R's MEDIA clock, which is a different
+/// 48 kHz oscillator from the Mac host clock. A wall-clock-anchored timeline
+/// (NullAudio's stand-in) drifts against it in phase, so the HAL reclocks our
+/// FIFO against a timeline that does not match data arrival — audible as
+/// warble / garble even though every ring byte is correct. Here we instead
+/// anchor the device timeline to the ring's own committed frontier: report the
+/// largest whole `ZERO_TS_PERIOD` boundary at or below `write_frame`, with the
+/// host time of that boundary derived from the ring `ClockBlock` when locked.
+///
+/// Returns `None` when the ring is not attached or has produced less than one
+/// period, so the caller falls back to the wall-clock stand-in and the device
+/// stays alive and silent rather than stalling.
+pub fn ring_zero_timestamp(now_mach: u64, numer: u32, denom: u32) -> Option<(f64, u64)> {
+    let guard = IO.lock().ok()?;
+    let state = guard.as_ref()?;
+    let ring = state.shm.ring();
+    let write = Consumer::new(ring).write_frame();
+    if write < ZERO_TS_PERIOD {
+        return None; // not enough committed yet
+    }
+    // Snap down to the current whole-period boundary.
+    let periods = write / ZERO_TS_PERIOD;
+    let sample_time = (periods * ZERO_TS_PERIOD) as f64;
+
+    // Host time of that frame boundary. Prefer the ring's locked ClockBlock
+    // (anchor_frame @ anchor_mach, mach_per_frame) so host_time rides the media
+    // clock; otherwise approximate with `now` (still monotone per period).
+    let host_time = match ring.read_clock() {
+        Some(cb) if cb.locked && cb.mach_per_frame.is_finite() && cb.mach_per_frame > 0.0 => {
+            let boundary = periods * ZERO_TS_PERIOD;
+            let delta_frames = boundary as f64 - cb.anchor_frame as f64;
+            let mach = cb.anchor_mach + delta_frames * cb.mach_per_frame;
+            if mach.is_finite() && mach >= 0.0 {
+                mach as u64
+            } else {
+                now_mach
+            }
+        }
+        _ => now_mach,
+    };
+    let _ = (numer, denom); // host_time already in mach ticks
+    Some((sample_time, host_time))
+}
+
 pub extern "C" fn do_io_operation(
     _d: AudioServerPlugInDriverRef,
     _dev: AudioObjectID,
