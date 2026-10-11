@@ -108,18 +108,23 @@ extern "C" fn get_zero_time_stamp(
     out_seed: *mut u64,
 ) -> OSStatus {
     // The HAL models device timing as (sampleTime, hostTime) pairs spaced
-    // ZeroTimeStampPeriod frames apart (BlackHole_GetZeroTimeStamp). We follow
-    // that model exactly: sampleTime advances by RING_FRAMES each period, and
-    // hostTime advances by RING_FRAMES × hostTicksPerFrame. The ONE correction
-    // for our cross-clock device is hostTicksPerFrame: it must reflect the TRUE
-    // media-clock rate (the ring's disciplined rate_hz_vs_mach, e.g. 47994 Hz),
-    // not nominal 48 kHz — otherwise the HAL reclocks the stream against a
-    // timeline that drifts from data arrival and warbles the audio. When the
-    // ring is unattached or unlocked we fall back to the nominal rate.
+    // ZeroTimeStampPeriod (RING_FRAMES) apart. We compute both as a pure
+    // function of `now` and a single captured anchor, so the returned pair is
+    // always mutually consistent even under concurrent calls (no mutable
+    // per-call counter to race on — unlike BlackHole, which must hold its IO
+    // mutex because it advances a counter).
+    //
+    // The ONE correction for our cross-clock device is the rate: frames arrive
+    // on the 16R MEDIA clock (disciplined rate_hz_vs_mach, e.g. 47994 Hz at
+    // −118 ppm), NOT the Mac host clock's nominal 48 kHz. Reporting nominal
+    // makes the HAL reclock the stream against a timeline that drifts from data
+    // arrival — audible as warble even though every ring byte is correct
+    // (BlackHole avoids this only as a shared-HAL-clock loopback; CamillaDSP's
+    // docs name adjusting the virtual clock rate as the fix). When the ring is
+    // unattached or unlocked we fall back to the nominal rate so the device
+    // stays alive.
     use std::sync::atomic::{AtomicU64, Ordering};
     static ANCHOR_HOST: AtomicU64 = AtomicU64::new(0);
-    static NUMBER_TIME_STAMPS: AtomicU64 = AtomicU64::new(0);
-    static PREVIOUS_TICKS: AtomicU64 = AtomicU64::new(0); // f64 bits
 
     const RING_FRAMES: f64 = 8192.0;
     const NOMINAL_RATE_HZ: f64 = 48_000.0;
@@ -127,36 +132,27 @@ extern "C" fn get_zero_time_stamp(
     let now = unsafe { mach_absolute_time() };
     let (numer, denom) = timebase();
 
-    // host mach ticks per second.
-    let ticks_per_sec = 1_000_000_000.0 * denom as f64 / numer as f64;
-    // True rate from the ring when locked, else nominal.
-    let rate_hz = crate::plugin::ring_disciplined_rate_hz().unwrap_or(NOMINAL_RATE_HZ);
-    let host_ticks_per_frame = if rate_hz > 0.0 {
-        ticks_per_sec / rate_hz
-    } else {
-        ticks_per_sec / NOMINAL_RATE_HZ
+    // True media-clock rate from the ring when locked, else nominal.
+    let rate_hz = match crate::plugin::ring_disciplined_rate_hz() {
+        Some(r) if r > 0.0 => r,
+        _ => NOMINAL_RATE_HZ,
     };
 
     let anchor = match ANCHOR_HOST.compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst) {
-        Ok(_) => now,
-        Err(existing) => existing,
+        Ok(_) => now,              // first call: we just set it
+        Err(existing) => existing, // subsequent calls
     };
-
-    // BlackHole's advance: step one period when the next boundary's host time
-    // has passed. PREVIOUS_TICKS accumulates the (rate-adjusted) tick offset of
-    // the current boundary from the anchor.
-    let ticks_per_ring = RING_FRAMES * host_ticks_per_frame;
-    let prev_ticks = f64::from_bits(PREVIOUS_TICKS.load(Ordering::Relaxed));
-    let next_tick_offset = prev_ticks + ticks_per_ring;
-    let next_host_time = anchor + next_tick_offset as u64;
-    let (sample_time, host_time) = if next_host_time <= now {
-        let n = NUMBER_TIME_STAMPS.fetch_add(1, Ordering::Relaxed) + 1;
-        PREVIOUS_TICKS.store(next_tick_offset.to_bits(), Ordering::Relaxed);
-        (n as f64 * RING_FRAMES, anchor + next_tick_offset as u64)
-    } else {
-        let n = NUMBER_TIME_STAMPS.load(Ordering::Relaxed);
-        (n as f64 * RING_FRAMES, anchor + prev_ticks as u64)
-    };
+    // host ticks -> nanoseconds elapsed since the anchor.
+    let elapsed_ns = (now.wrapping_sub(anchor)) as f64 * numer as f64 / denom as f64;
+    // frames elapsed at the TRUE rate.
+    let elapsed_frames = elapsed_ns * rate_hz / 1_000_000_000.0;
+    // Round DOWN to the start of the current ring period.
+    let periods = (elapsed_frames / RING_FRAMES).floor();
+    let sample_time = periods * RING_FRAMES;
+    // Host time of that period boundary, back-converted at the SAME true rate
+    // so (sampleTime, hostTime) stay consistent.
+    let period_ns = periods * RING_FRAMES / rate_hz * 1_000_000_000.0;
+    let host_time = anchor + (period_ns * denom as f64 / numer as f64) as u64;
 
     unsafe {
         if !out_sample_time.is_null() {
