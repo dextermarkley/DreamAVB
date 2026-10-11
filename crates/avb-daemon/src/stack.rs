@@ -1920,6 +1920,9 @@ fn streams_loop(
     let mut raw_audio_slots: u64 = 0;
     let mut aaf_decode_fail: u64 = 0;
     let mut first_slot_dump: Option<Vec<u8>> = None;
+    // Per-(stream_id, channel) peak |sample| to find which AVB stream+channel
+    // carries a live signal (channel-map check for hw-audio).
+    let mut peak: std::collections::BTreeMap<(u64, u16), i64> = Default::default();
     let run_ns = seconds.saturating_mul(1_000_000_000);
     let interval_ns = interval.max(1).saturating_mul(1_000_000_000);
     let count_start = now_mach();
@@ -2042,6 +2045,24 @@ fn streams_loop(
                     }
                 }
                 last_seq.insert(sid, seq);
+                // Per-channel peak |sample|: 32-bit big-endian interleaved.
+                let ch = pdu.hdr.channels_per_frame.max(1);
+                if pdu.hdr.bit_depth == 32 || pdu.hdr.bit_depth == 24 {
+                    let mut i = 0usize;
+                    let data = pdu.data;
+                    while i + 4 <= data.len() {
+                        if let Some(b) = data.get(i..i + 4) {
+                            let v = i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as i64;
+                            let c = ((i / 4) % usize::from(ch)) as u16;
+                            let e = peak.entry((sid, c)).or_insert(0);
+                            let a = v.abs();
+                            if a > *e {
+                                *e = a;
+                            }
+                        }
+                        i += 4;
+                    }
+                }
             } else {
                 aaf_decode_fail += 1;
             }
@@ -2100,6 +2121,33 @@ fn streams_loop(
         &format!("audio ring: raw_slots={raw_audio_slots} non_aaf_or_undecoded={aaf_decode_fail}"),
     );
     let _ = first_slot_dump;
+    // Channel-map: report channels whose peak |sample| is well above the noise
+    // floor (a live signal). 32-bit full scale is 2^31; use ~0.1% (-60 dBFS).
+    let floor: i64 = 1 << 21;
+    let mut active: Vec<((u64, u16), i64)> = peak
+        .iter()
+        .filter(|(_, &p)| p > floor)
+        .map(|(k, &p)| (*k, p))
+        .collect();
+    active.sort_by_key(|&(_, p)| std::cmp::Reverse(p));
+    if active.is_empty() {
+        log.log(
+            Level::Info,
+            "chan-map",
+            "no channel above the -60 dBFS floor",
+        );
+    } else {
+        for ((sid, c), p) in &active {
+            let dbfs = 20.0 * ((*p as f64) / (i32::MAX as f64)).max(1e-12).log10();
+            log.log(
+                Level::Info,
+                "chan-map",
+                &format!(
+                    "SIGNAL on stream 0x{sid:016x} channel {c} (0-based): peak={p} ({dbfs:.1} dBFS)"
+                ),
+            );
+        }
+    }
     // Report every stream_id actually observed on the wire (the AAF header's
     // real stream_id), not the probe-reported one which a Milan talker may
     // leave 0. `bound_ids` records which listener_unique_ids settled.
