@@ -69,10 +69,9 @@ function fmt(n) {
 async function refreshStats() {
   try {
     const s = await invoke("stats");
-    const ascap = el("s_ascap");
-    ascap.textContent = s.as_capable ? "yes" : "no";
-    ascap.className = "v " + (s.as_capable ? "good" : "");
-    el("s_offset").textContent = `${s.gptp_offset_ns.toFixed(1)} ns`;
+    const lock = el("s_ascap");
+    lock.textContent = s.as_capable ? "locked" : "unlocked";
+    lock.className = "v " + (s.as_capable ? "good" : "");
     el("s_pkts").textContent = `${fmt(s.stream_pkts_per_s)}/s`;
     const drift = el("s_drift");
     drift.textContent = `${s.media_drift_ppm.toFixed(1)} ppm`;
