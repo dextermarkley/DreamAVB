@@ -105,6 +105,13 @@ impl RealDext {
 
 impl DextPort for RealDext {
     fn send(&mut self, frame: &[u8], want_ts: bool, tag: u64) -> SendResult {
+        // Debug self-capture: when AVB_TXCAP names a path, append every frame
+        // we transmit to a pcap (link-type EN10MB), so our on-wire bytes can
+        // be byte-diffed against a known-good capture. The I210 cannot be
+        // tcpdump'd while our dext owns it, so this is our only TX visibility.
+        if let Ok(path) = std::env::var("AVB_TXCAP") {
+            append_pcap(&path, frame);
+        }
         match self.dev.send_frame(frame, want_ts) {
             Ok((seq, _)) => {
                 if want_ts {
@@ -286,4 +293,42 @@ impl DextPort for RealDext {
             },
         }
     }
+}
+
+/// Append one Ethernet frame to a libpcap file (link-type EN10MB, µs ts),
+/// writing the 24-byte global header first if the file does not yet exist.
+/// Debug-only (AVB_TXCAP); best-effort, never fails a send.
+fn append_pcap(path: &str, frame: &[u8]) {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let new = !std::path::Path::new(path).exists();
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    if new {
+        // Global header: magic, ver 2.4, tz 0, sigfig 0, snaplen, EN10MB(1).
+        let mut gh = Vec::with_capacity(24);
+        gh.extend_from_slice(&0xa1b2c3d4u32.to_le_bytes());
+        gh.extend_from_slice(&2u16.to_le_bytes());
+        gh.extend_from_slice(&4u16.to_le_bytes());
+        gh.extend_from_slice(&0i32.to_le_bytes());
+        gh.extend_from_slice(&0u32.to_le_bytes());
+        gh.extend_from_slice(&65535u32.to_le_bytes());
+        gh.extend_from_slice(&1u32.to_le_bytes());
+        let _ = f.write_all(&gh);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut rec = Vec::with_capacity(16 + frame.len());
+    rec.extend_from_slice(&(now.as_secs() as u32).to_le_bytes());
+    rec.extend_from_slice(&now.subsec_micros().to_le_bytes());
+    rec.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    rec.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    rec.extend_from_slice(frame);
+    let _ = f.write_all(&rec);
 }

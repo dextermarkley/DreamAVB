@@ -618,6 +618,17 @@ impl Participant {
 
     // --- timers / TX ---
 
+    /// Force an immediate LeaveAll on the next `poll` for both applications.
+    /// A working Milan controller leads its connection with a LeaveAll so the
+    /// talker's registrar re-synchronizes and re-advertises; our LeaveAllTime
+    /// is otherwise randomized to 10-15 s, far too late. Call right after
+    /// declaring the Listener Ready.
+    pub fn force_leave_all(&mut self) {
+        for app in [App::Msrp, App::Mvrp] {
+            self.st(app).la_at = MachTicks(0);
+        }
+    }
+
     pub fn poll<const N: usize>(&mut self, now: Now, out: &mut Outbox<N>) {
         let now = now.mach;
         for app in [App::Msrp, App::Mvrp] {
