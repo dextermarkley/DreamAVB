@@ -932,6 +932,8 @@ pub fn streams(
         seconds,
         interval,
         json_out.as_deref(),
+        None,
+        None,
     )
 }
 
@@ -939,6 +941,7 @@ pub fn streams(
 /// packets per stream over `seconds`, reporting per-stream pkt/s each
 /// `interval` (design §4 hw-streams; Class A is 8000 pkt/s). Reuses the
 /// ADP/AECP control path and the mapped audio ring.
+#[allow(clippy::too_many_arguments)]
 fn streams_loop(
     opts: &GlobalOpts,
     log: &Logger,
@@ -946,6 +949,8 @@ fn streams_loop(
     seconds: u64,
     interval: u64,
     json_out: Option<&Path>,
+    wav_out: Option<&Path>,
+    summary_out: Option<&Path>,
 ) -> Result<(), Exit> {
     use avb_avdecc::acmp::Acmpdu;
     use avb_avdecc::adp::{stream_id_for, Adpdu};
@@ -1923,6 +1928,16 @@ fn streams_loop(
     // Per-(stream_id, channel) peak |sample| to find which AVB stream+channel
     // carries a live signal (channel-map check for hw-audio).
     let mut peak: std::collections::BTreeMap<(u64, u16), i64> = Default::default();
+    // WAV recording (hw-audio): record the PRIMARY stream (the lowest AAF
+    // stream_id, i.e. the one carrying 16R channels 1..N) to an interleaved
+    // 32-bit WAV. Header is written on first frame once we know the channel
+    // count, data streamed, sizes patched on finalize. Media-clock drift is
+    // measured from the frame count vs elapsed wall time.
+    let mut wav_file: Option<std::fs::File> = None;
+    let mut wav_fmt: Option<crate::wav::WavFormat> = None;
+    let mut wav_stream_id: u64 = 0;
+    let mut wav_data_bytes: u64 = 0;
+    let mut wav_frames: u64 = 0;
     let run_ns = seconds.saturating_mul(1_000_000_000);
     let interval_ns = interval.max(1).saturating_mul(1_000_000_000);
     let count_start = now_mach();
@@ -2045,6 +2060,62 @@ fn streams_loop(
                     }
                 }
                 last_seq.insert(sid, seq);
+                // WAV: record the PRIMARY stream (first AAF stream we see,
+                // which is the lowest stream_id -> 16R channels 1..N).
+                if wav_out.is_some() {
+                    use std::io::Write;
+                    if wav_file.is_none() {
+                        let ch = pdu.hdr.channels_per_frame.max(1);
+                        let fmt = crate::wav::WavFormat {
+                            channels: ch,
+                            sample_rate: avb_avtp::stream_format::nsr_hz(pdu.hdr.nsr)
+                                .unwrap_or(48_000),
+                            bits_per_sample: 32,
+                            valid_bits: if pdu.hdr.bit_depth == 0 {
+                                24
+                            } else {
+                                u16::from(pdu.hdr.bit_depth)
+                            },
+                        };
+                        if let Some(path) = wav_out {
+                            if let Ok(mut f) = std::fs::File::create(path) {
+                                let _ = f.write_all(&crate::wav::initial_header(&fmt));
+                                wav_file = Some(f);
+                                wav_fmt = Some(fmt);
+                                wav_stream_id = sid;
+                                log.log(
+                                    Level::Info,
+                                    "rec",
+                                    &format!(
+                                        "recording stream 0x{sid:016x}: {ch} ch @ {} Hz, 32-bit",
+                                        fmt.sample_rate
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    if sid == wav_stream_id {
+                        if let Some(f) = wav_file.as_mut() {
+                            // AAF data is big-endian interleaved; WAV wants
+                            // little-endian. Byte-swap each 32-bit sample.
+                            let mut le = Vec::with_capacity(pdu.data.len());
+                            let mut i = 0;
+                            while i + 4 <= pdu.data.len() {
+                                if let Some(b) = pdu.data.get(i..i + 4) {
+                                    le.extend_from_slice(&[b[3], b[2], b[1], b[0]]);
+                                }
+                                i += 4;
+                            }
+                            if f.write_all(&le).is_ok() {
+                                wav_data_bytes += le.len() as u64;
+                                if let Some(fmt) = wav_fmt {
+                                    let ba = u64::from(fmt.block_align()).max(1);
+                                    wav_frames = wav_data_bytes / ba;
+                                }
+                            }
+                        }
+                    }
+                }
                 // Per-channel peak |sample|: 32-bit big-endian interleaved.
                 let ch = pdu.hdr.channels_per_frame.max(1);
                 if pdu.hdr.bit_depth == 32 || pdu.hdr.bit_depth == 24 {
@@ -2175,6 +2246,60 @@ fn streams_loop(
             let _ = std::fs::write(path, j);
         }
     }
+
+    // Finalize the WAV: patch the header sizes, and compute media-clock drift
+    // (ppm) from frames-written vs elapsed wall time against the nominal rate.
+    if let (Some(mut f), Some(fmt)) = (wav_file.take(), wav_fmt) {
+        use std::io::{Seek, SeekFrom, Write};
+        let _ = f.seek(SeekFrom::Start(0));
+        let _ = f.write_all(&crate::wav::finalize_header(&fmt, wav_data_bytes));
+        let _ = f.flush();
+        let measured_rate = (wav_frames as f64) / elapsed_s.max(1e-9);
+        let nominal = f64::from(fmt.sample_rate);
+        let drift_ppm = (measured_rate - nominal) / nominal * 1e6;
+        log.log(
+            Level::Info,
+            "rec",
+            &format!(
+                "WAV: {} ch, {} frames, {:.3}s, measured {:.2} Hz vs {} nominal -> {:+.1} ppm",
+                fmt.channels, wav_frames, elapsed_s, measured_rate, fmt.sample_rate, drift_ppm
+            ),
+        );
+        if let Some(spath) = summary_out {
+            let streams_sum: Vec<serde_json::Value> = counts
+                .iter()
+                .map(|(sid, n)| {
+                    crate::report::stream_summary(
+                        0,
+                        *sid,
+                        *n,
+                        gaps.get(sid).copied().unwrap_or(0),
+                        0,
+                        0,
+                        if *sid == wav_stream_id {
+                            drift_ppm
+                        } else {
+                            0.0
+                        },
+                    )
+                })
+                .collect();
+            let summary = serde_json::json!({
+                "schema": "avb-record-summary/1",
+                "seconds": seconds,
+                "rate": fmt.sample_rate,
+                "channels": fmt.channels,
+                "frames": wav_frames,
+                "recorded_stream": format!("0x{wav_stream_id:016x}"),
+                "media_clock": { "measured_hz": measured_rate, "drift_ppm": drift_ppm },
+                "streams": streams_sum,
+            });
+            if let Ok(j) = serde_json::to_string_pretty(&summary) {
+                let _ = std::fs::write(spath, j);
+            }
+        }
+    }
+
     log.log(
         Level::Info,
         "streams",
@@ -2195,19 +2320,28 @@ pub fn record(
     _talker: Option<u64>,
     _allow_partial: bool,
     _start_timeout: u64,
-    _summary_out: Option<PathBuf>,
+    summary_out: Option<PathBuf>,
 ) -> Result<(), Exit> {
     install_signal_handlers();
     let log = Logger::new(opts.level);
-    let _dext = bring_up(opts, &log)?;
-    // Disk check happens after derivation (§11.2); the sans-IO helpers in
-    // `validate` and `wav` do the sizing. The record loop runs on hardware.
+    let mut dext = bring_up(opts, &log)?;
     log.log(
         Level::Info,
         "rec",
         &format!("record {seconds}s -> {}", out.display()),
     );
-    Ok(())
+    // The recorder reuses the proven streams connect/settle/receive flow,
+    // writing the primary stream's decoded PCM to a WAV and a summary JSON.
+    streams_loop(
+        opts,
+        &log,
+        &mut dext,
+        seconds,
+        10,
+        None,
+        Some(out),
+        summary_out.as_deref(),
+    )
 }
 
 pub fn capture(opts: &GlobalOpts, _seconds: u64, out: &Path) -> Result<(), Exit> {
