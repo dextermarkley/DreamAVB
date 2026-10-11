@@ -72,6 +72,34 @@ fn device_asbd(rate: f64) -> AudioStreamBasicDescription {
     }
 }
 
+/// Decode a FourCC selector to a readable string for diagnostics.
+fn fourcc(v: UInt32) -> String {
+    let b = v.to_be_bytes();
+    b.iter()
+        .map(|&c| {
+            if (32..127).contains(&c) {
+                c as char
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// Log an unanswered property probe. coreaudiod captures the plug-in's stderr
+/// into the unified log, so this surfaces exactly which (object, selector) we
+/// are returning UnknownProperty for. (Dev diagnostic — gated off before
+/// release; coreaudiod does not pass AVB_CA_DEBUG so we log unconditionally
+/// for now.)
+fn log_unknown(what: &str, object_id: AudioObjectID, a: &AudioObjectPropertyAddress) {
+    eprintln!(
+        "[avb-coreaudio] {what} UNKNOWN obj={object_id} sel={} scope={} elem={}",
+        fourcc(a.mSelector),
+        fourcc(a.mScope),
+        a.mElement
+    );
+}
+
 pub extern "C" fn initialize(
     _driver: AudioServerPlugInDriverRef,
     _host: AudioServerPlugInHostRef,
@@ -278,14 +306,16 @@ pub extern "C" fn get_property_data_size(
         {
             rangedsz
         }
-        _ => return kAudioHardwareUnknownPropertyError,
+        _ => {
+            log_unknown("size", object_id, a);
+            return kAudioHardwareUnknownPropertyError;
+        }
     };
     unsafe {
         *out_data_size = size;
     }
     kAudioHardwareNoError
 }
-
 pub extern "C" fn get_property_data(
     _driver: AudioServerPlugInDriverRef,
     object_id: AudioObjectID,
@@ -535,7 +565,10 @@ pub extern "C" fn get_property_data(
                     out_data,
                 )
             }
-            _ => kAudioHardwareUnknownPropertyError,
+            _ => {
+                log_unknown("data", object_id, a);
+                kAudioHardwareUnknownPropertyError
+            }
         }
     }
 }
