@@ -21,6 +21,8 @@
   <string>English</string>
   <key>CFBundleIdentifier</key>
   <string>com.avbaudio.coreaudio</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
   <key>CFBundleName</key>
   <string>AVBAudio</string>
   <key>CFBundlePackageType</key>
@@ -28,9 +30,20 @@
   <key>CFBundleShortVersionString</key>
   <string>0.1.0</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>6</string>
   <key>CFBundleExecutable</key>
   <string>AVBAudio</string>
+  <key>CFBundleSupportedPlatforms</key>
+  <array>
+    <string>MacOSX</string>
+  </array>
+  <key>LSMinimumSystemVersion</key>
+  <string>10.13</string>
+  <!-- REQUIRED: the HAL loads AudioServerPlugIns into a sandboxed host and
+       silently skips any bundle not declared sandbox-safe. Without this the
+       plug-in is never scanned and nothing is logged. -->
+  <key>sandboxSafe</key>
+  <true/>
   <key>CFPlugInFactories</key>
   <dict>
     <key>8E303148-8E87-45BB-811F-464ECEF949FF</key>
