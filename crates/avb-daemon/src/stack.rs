@@ -1232,7 +1232,11 @@ fn streams_loop(
             let pdu = Acmpdu {
                 message_type: acmp_msg::CONNECT_TX_COMMAND,
                 status: acmp_status::SUCCESS,
-                stream_id: sid,
+                // CONNECT_TX_COMMAND carries stream_id = 0 (IEEE 1722.1-2021
+                // §8.2.1 / AVDECC clarifications §3.2): the talker fills it in
+                // the response. Sending a non-zero stream_id here is what a
+                // strict talker rejects/ignores.
+                stream_id: StreamId(0),
                 controller_entity_id: our_id,
                 talker_entity_id: talker,
                 listener_entity_id: our_id,
@@ -1241,6 +1245,7 @@ fn streams_loop(
                 sequence_id: acmp_seq,
                 ..Default::default()
             };
+            let _ = sid;
             acmp_seq = acmp_seq.wrapping_add(1);
             let hdr = EthHeader {
                 dst: avb_core::AVDECC_MULTICAST,
@@ -1505,6 +1510,9 @@ fn streams_loop(
     srp.declare(now_mach(), Attribute::Domain(DEFAULT_DOMAIN));
     // Stream ids we have already declared a Listener Ready for.
     let mut listener_declared: std::collections::BTreeSet<u64> = Default::default();
+    // Stream ids the 16R has sent a real Talker Advertise for (the only
+    // source of the true streaming dest_mac/vid).
+    let mut ta_seen: std::collections::BTreeSet<u64> = Default::default();
 
     // Drain the SRP outbox onto the wire.
     let mut srp_out: Outbox<32> = Outbox::new();
@@ -1570,7 +1578,7 @@ fn streams_loop(
                     sid.0
                 ),
             );
-            srp.declare(
+            srp.declare_new(
                 now_mach(),
                 Attribute::Listener(Listener {
                     stream_id: sid,
@@ -1716,12 +1724,13 @@ fn streams_loop(
             {
                 let adv = t.advertise();
                 let dmac = adv.dest_mac.octets();
+                ta_seen.insert(stream_id.0);
                 // Install/refresh the dext filter for this stream.
                 filter.retain(|(_, m, _)| *m != dmac);
                 filter.push((stream_id.0, dmac, adv.vlan_id));
                 // Declare Listener Ready so the 16R starts streaming (once).
                 if listener_declared.insert(stream_id.0) {
-                    srp.declare(
+                    srp.declare_new(
                         now_mach(),
                         Attribute::Listener(Listener {
                             stream_id,
@@ -1779,11 +1788,13 @@ fn streams_loop(
             )
         });
         let all_addressed = filter.len() >= usize::from(n_streams);
-        // Hold the handshake open for a minimum window regardless of the ACMP
-        // probe finishing: MRP Join bursts and the 16R's Talker Advertise /
-        // reservation take several seconds, and the probe settles in ~2 s.
+        // Prefer waiting until the 16R has actually Talker-Advertised every
+        // stream (ta_seen) -- that is the only source of the real streaming
+        // dest_mac. Fall back to probe-addressing + ACMP-settled after the
+        // minimum window so a partially-advertising talker still proceeds.
+        let all_ta = ta_seen.len() >= usize::from(n_streams);
         let min_handshake = now >= 15_000_000_000;
-        if (acmp_settled && all_addressed && min_handshake) || now >= bind_deadline_ns {
+        if all_ta || (acmp_settled && all_addressed && min_handshake) || now >= bind_deadline_ns {
             // Flush any pending SRP sends before counting.
             srp.poll(srp_now(), &mut srp_out);
             drain_srp(dext, &mut srp_out);

@@ -309,6 +309,26 @@ impl Participant {
         self.app_event(app, key, ev, now);
     }
 
+    /// Declare an attribute, forcing a `New!` event even on first declaration
+    /// or re-declaration of the same value. 802.1Q-2018 §35.2.6: `New!`
+    /// signals a fresh registration and forces propagation, where a quiet
+    /// `Join!` may be ignored by a peer that already holds state. A strict
+    /// Milan talker only advertises its stream in response to a Listener
+    /// `New!` declaration (observed against a PreSonus StudioLive 16R: a
+    /// `Join!` Listener Ready drew only an empty LeaveAll, a `New!` drew a
+    /// real Talker Advertise).
+    pub fn declare_new(&mut self, now: MachTicks, attr: Attribute) {
+        let app = attr.app();
+        let key = attr.key();
+        let st = self.st(app);
+        let entry = st.entries.entry(key).or_insert_with(Entry::new);
+        entry.decl = Some(attr);
+        entry.tx_value = Some(attr);
+        self.c.declarations += 1;
+        self.log(now, "declare_new", attr);
+        self.app_event(app, key, AppEvent::New, now);
+    }
+
     /// Withdraw a declaration (Lv!). No effect if it isn't declared.
     pub fn withdraw(&mut self, now: MachTicks, app: App, key: AttrKey) {
         let st = self.st(app);

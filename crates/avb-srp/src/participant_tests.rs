@@ -430,6 +430,32 @@ fn talker_advertise_can_be_declared_for_talker_readiness() {
 }
 
 #[test]
+fn declare_new_forces_new_event_on_first_declaration() {
+    // declare() emits Join on a first declaration; declare_new() forces New!,
+    // which a strict Milan talker requires to react and advertise its stream.
+    let ready = Attribute::Listener(Listener {
+        stream_id: SID,
+        decl: ListenerDecl::Ready,
+    });
+    let mut p = part();
+    p.declare_new(MachTicks(0), ready);
+    let sent = run(&mut p, 0, 100 * MS);
+    let ev = events_of(&sent, ready);
+    assert!(!ev.is_empty(), "declare_new transmits");
+    assert_eq!(ev[0].1, AttrEvent::New, "first declare_new is New!");
+    // A plain declare() of the same key is a Join (not New).
+    let mut p2 = part();
+    p2.declare(MachTicks(0), ready);
+    let sent2 = run(&mut p2, 0, 100 * MS);
+    let plain = events_of(&sent2, ready)[0].1;
+    assert!(
+        matches!(plain, AttrEvent::JoinIn | AttrEvent::JoinMt),
+        "plain declare is a Join, got {plain:?}"
+    );
+    assert_ne!(plain, AttrEvent::New);
+}
+
+#[test]
 fn mvrp_vid_declaration_and_registration_log() {
     let mut p = part();
     p.declare(MachTicks(0), Attribute::Vid { vid: 2 });
