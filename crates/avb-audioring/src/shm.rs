@@ -209,11 +209,12 @@ impl Drop for ShmRing {
 /// unavoidable self-reference — the ring mapping is pinned on the heap for the
 /// producer's lifetime and freed together on drop.
 pub struct ShmProducer {
+    // SAFETY INVARIANT: borrows `*shm`. Declared FIRST so it is dropped first
+    // (Rust drops fields in declaration order), before the mapping it borrows.
+    // Declared 'static and never handed out.
+    producer: crate::producer::Producer<'static>,
     // Boxed so the mapping address is stable while `producer` borrows it.
     shm: Box<ShmRing>,
-    // SAFETY INVARIANT: borrows `*shm`, which outlives it (same struct, dropped
-    // after). Declared 'static and never handed out.
-    producer: crate::producer::Producer<'static>,
 }
 
 impl ShmProducer {
@@ -248,6 +249,24 @@ impl ShmProducer {
 
     pub fn ring(&self) -> &AudioRing {
         self.shm.ring()
+    }
+
+    /// ATTACH to an existing ring at `path` (created by another process) and
+    /// build a producer that resumes at its current write frontier. The ring
+    /// is not unlinked on drop (the creator owns the name). Used by the
+    /// CoreAudio plug-in to produce into the daemon's output ring.
+    pub fn attach_at(
+        path: &str,
+        streams: &[(usize, usize, u32)],
+        lag_frames: u64,
+        silent_lag: u64,
+    ) -> Result<Self, RingError> {
+        let shm = Box::new(ShmRing::attach_at(path)?);
+        // SAFETY: same self-borrow invariant as `create_at` — `shm` is boxed
+        // (stable address) and dropped after `producer` (field order).
+        let ring_ref: &'static AudioRing = unsafe { &*(shm.ring() as *const AudioRing) };
+        let producer = crate::producer::Producer::resume(ring_ref, streams, lag_frames, silent_lag);
+        Ok(Self { shm, producer })
     }
 
     pub fn producer(&mut self) -> &mut crate::producer::Producer<'static> {

@@ -228,4 +228,40 @@ mod tests {
         producer.join().unwrap();
         assert_eq!(consumer.join().unwrap(), total_packets * spf as u64);
     }
+
+    /// Regression (review C1): a producer that attaches to a ring another
+    /// process has already advanced must RESUME at the live frontier. A fresh
+    /// `Producer::new` per call starts `committed` at 0, so it rejected every
+    /// place beyond cap/2 and reset the shared frontier — silent playback.
+    #[test]
+    fn resumed_producer_advances_live_frontier() {
+        let r = AudioRing::new_anonymous(&test_config(1024)).unwrap();
+        // Another producer advances the ring well past cap/2.
+        let mut first = Producer::new(&r, &[(0, 4, 24)], 0, 0);
+        let data = vec![0u8; 4 * 4 * 64];
+        for i in 0..20u64 {
+            assert!(first.place(0, (i * 64) as i128, 64, SampleFormat::Int32, &data));
+            first.commit(false, None);
+        }
+        let live = r.write_frame();
+        assert_eq!(live, 20 * 64);
+        assert!(
+            live > 1024 / 2,
+            "frontier must be beyond cap/2 for the test to bite"
+        );
+
+        // A per-call fresh producer (the old bug) cannot place at the frontier.
+        let mut fresh = Producer::new(&r, &[(0, 4, 24)], 0, 0);
+        assert!(!fresh.place(0, live as i128, 64, SampleFormat::Int32, &data));
+
+        // A resumed producer places there and advances cumulatively.
+        let mut p = Producer::resume(&r, &[(0, 4, 24)], 0, 0);
+        let mut f = live;
+        for _ in 0..3 {
+            assert!(p.place(0, f as i128, 64, SampleFormat::Int32, &data));
+            p.commit(false, None);
+            f += 64;
+            assert_eq!(r.write_frame(), f, "frontier advances, never resets");
+        }
+    }
 }
