@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DreamAVB</title>
+  <style>
+    :root {
+      --bg: rgba(28, 28, 32, 0.86);
+      --panel: rgba(255, 255, 255, 0.04);
+      --panel-border: rgba(255, 255, 255, 0.08);
+      --text: #f2f3f5;
+      --text-dim: #9aa0a9;
+      --accent: #4f8cff;
+      --accent-glow: rgba(79, 140, 255, 0.35);
+      --on: #34d399;
+      --on-glow: rgba(52, 211, 153, 0.3);
+      --off: #6b7280;
+      --warn: #f59e0b;
+      --radius: 14px;
+      --shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: rgba(248, 249, 251, 0.9);
+        --panel: rgba(0, 0, 0, 0.03);
+        --panel-border: rgba(0, 0, 0, 0.08);
+        --text: #16181d;
+        --text-dim: #6b7280;
+      }
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      height: 100%;
+      font: 13px/1.5 -apple-system, "SF Pro Text", system-ui, sans-serif;
+      color: var(--text);
+      background: transparent;
+      -webkit-font-smoothing: antialiased;
+      user-select: none;
+      cursor: default;
+    }
+    .frame {
+      height: 100vh;
+      margin: 8px;
+      background: var(--bg);
+      backdrop-filter: blur(30px) saturate(160%);
+      -webkit-backdrop-filter: blur(30px) saturate(160%);
+      border: 1px solid var(--panel-border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    header {
+      padding: 16px 18px 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      -webkit-app-region: drag;
+    }
+    .logo {
+      width: 26px; height: 26px; border-radius: 7px;
+      background: linear-gradient(135deg, var(--accent), #7c5cff);
+      display: grid; place-items: center;
+      box-shadow: 0 2px 10px var(--accent-glow);
+      flex: none;
+    }
+    .logo svg { width: 15px; height: 15px; }
+    .title { font-weight: 600; font-size: 14px; letter-spacing: 0.2px; }
+    .title small { display: block; font-weight: 400; color: var(--text-dim); font-size: 11px; }
+
+    .body { padding: 4px 18px 18px; display: flex; flex-direction: column; gap: 14px; flex: 1; overflow-y: auto; }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 11px;
+      padding: 14px;
+    }
+    .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-dim); margin-bottom: 8px; }
+
+    select {
+      width: 100%; appearance: none;
+      background: var(--panel); color: var(--text);
+      border: 1px solid var(--panel-border); border-radius: 8px;
+      padding: 9px 11px; font: inherit; cursor: pointer;
+    }
+    .nic-badge { display: inline-block; font-size: 10px; padding: 1px 7px; border-radius: 20px; margin-left: 6px; }
+    .nic-badge.ok { background: var(--on-glow); color: var(--on); }
+    .nic-badge.no { background: rgba(107,114,128,0.25); color: var(--off); }
+
+    .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .state-text { display: flex; flex-direction: column; }
+    .state-main { font-weight: 600; font-size: 14px; }
+    .state-sub { color: var(--text-dim); font-size: 11.5px; }
+
+    .switch { position: relative; width: 52px; height: 30px; flex: none; cursor: pointer; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .track {
+      position: absolute; inset: 0; border-radius: 30px;
+      background: var(--off); transition: background 0.25s, box-shadow 0.25s;
+    }
+    .track::before {
+      content: ""; position: absolute; height: 24px; width: 24px; left: 3px; top: 3px;
+      background: #fff; border-radius: 50%; transition: transform 0.25s cubic-bezier(0.3,1.3,0.6,1);
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    }
+    .switch input:checked + .track { background: var(--on); box-shadow: 0 0 0 4px var(--on-glow); }
+    .switch input:checked + .track::before { transform: translateX(22px); }
+    .switch input:disabled + .track { opacity: 0.4; cursor: not-allowed; }
+
+    .status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
+    .status-dot.active { background: var(--on); box-shadow: 0 0 10px var(--on-glow); animation: pulse 2s infinite; }
+    .status-dot.pending { background: var(--warn); animation: pulse 1s infinite; }
+    .status-dot.fault { background: #ef4444; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+    .stats-toggle {
+      display: flex; align-items: center; justify-content: space-between;
+      cursor: pointer; color: var(--text-dim); font-size: 12px; padding: 2px;
+    }
+    .stats-toggle:hover { color: var(--text); }
+    .chevron { transition: transform 0.25s; }
+    .stats-toggle.open .chevron { transform: rotate(90deg); }
+    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; max-height: 0; overflow: hidden; transition: max-height 0.3s ease, margin 0.3s; }
+    .stats.open { max-height: 300px; margin-top: 10px; }
+    .stat { }
+    .stat .k { color: var(--text-dim); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.4px; }
+    .stat .v { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 1px; }
+    .stat .v.good { color: var(--on); }
+    .stat .v.warn { color: var(--warn); }
+
+    footer { padding: 10px 18px; border-top: 1px solid var(--panel-border); display: flex; justify-content: space-between; color: var(--text-dim); font-size: 11px; }
+    footer a { color: var(--text-dim); cursor: pointer; }
+    footer a:hover { color: var(--text); }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <header>
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 12h3l2-7 4 14 3-10 2 3h4" />
+        </svg>
+      </div>
+      <div class="title">DreamAVB<small id="headline">Default driver in control</small></div>
+    </header>
+
+    <div class="body">
+      <div class="card">
+        <div class="label">Network interface</div>
+        <select id="nic"></select>
+      </div>
+
+      <div class="card">
+        <div class="toggle-row">
+          <div class="state-text">
+            <span class="state-main"><span class="status-dot" id="dot"></span> <span id="stateMain">Hands off</span></span>
+            <span class="state-sub" id="stateSub">The OS default driver owns this NIC</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="power" />
+            <span class="track"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="stats-toggle" id="statsToggle">
+          <span>Under the hood</span>
+          <svg class="chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>
+        </div>
+        <div class="stats" id="stats">
+          <div class="stat"><div class="k">asCapable</div><div class="v" id="s_ascap">—</div></div>
+          <div class="stat"><div class="k">gPTP offset</div><div class="v" id="s_offset">—</div></div>
+          <div class="stat"><div class="k">Stream rate</div><div class="v" id="s_pkts">—</div></div>
+          <div class="stat"><div class="k">Clock drift</div><div class="v" id="s_drift">—</div></div>
+          <div class="stat"><div class="k">Underruns</div><div class="v" id="s_under">—</div></div>
+          <div class="stat"><div class="k">Overruns</div><div class="v" id="s_over">—</div></div>
+          <div class="stat"><div class="k">RX frames</div><div class="v" id="s_rx">—</div></div>
+          <div class="stat"><div class="k">Hardware</div><div class="v" id="s_hw">—</div></div>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <span>DreamAVB 0.1.0</span>
+      <a id="link">github.com/dextermarkley/DreamAVB</a>
+    </footer>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>
