@@ -1,4 +1,9 @@
 //! Bounds-checked big-endian cursors (`clippy::indexing_slicing` is denied).
+//!
+//! A small general-purpose read/write API shared by every codec in this
+//! crate; a few helpers (e.g. [`Rd::remaining`]) are used by the daemon's
+//! enumeration walk rather than by the codecs here.
+#![allow(dead_code)]
 
 pub(crate) struct Rd<'a> {
     b: &'a [u8],

@@ -84,14 +84,10 @@ pub fn decode(pdu: &[u8]) -> Result<AafPdu<'_>, DropReason> {
         return Err(DropReason::Unsupported);
     }
     let rest = pdu.get(STREAM_HEADER_LEN..).ok_or(DropReason::TooShort)?;
-    let (f, data) = rest
-        .split_first_chunk::<8>()
-        .ok_or(DropReason::TooShort)?;
+    let (f, data) = rest.split_first_chunk::<8>().ok_or(DropReason::TooShort)?;
     let [fmt, b17, b18, depth, l0, l1, b22, _] = *f;
     let sdl = u16::from_be_bytes([l0, l1]);
-    let data = data
-        .get(..usize::from(sdl))
-        .ok_or(DropReason::TooShort)?;
+    let data = data.get(..usize::from(sdl)).ok_or(DropReason::TooShort)?;
     Ok(AafPdu {
         hdr: AafHeader {
             stream,
@@ -118,7 +114,10 @@ pub fn encode(hdr: &AafHeader, data: &[u8], out: &mut [u8]) -> Option<usize> {
     sh.subtype = subtype::AAF;
     sh.encode(out)?;
     let [l0, l1] = sdl.to_be_bytes();
-    let f: &mut [u8; 8] = out.get_mut(STREAM_HEADER_LEN..AAF_HEADER_LEN)?.try_into().ok()?;
+    let f: &mut [u8; 8] = out
+        .get_mut(STREAM_HEADER_LEN..AAF_HEADER_LEN)?
+        .try_into()
+        .ok()?;
     *f = [
         hdr.format,
         ((hdr.nsr & 0x0f) << 4) | ((hdr.channels_per_frame >> 8) as u8 & 0x03),

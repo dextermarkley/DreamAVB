@@ -163,3 +163,111 @@ Not verified (hardware, later hw steps):
    - A Lv for the talker type that isn't the registered one, after an Advertise ↔ Failed switch, is ignored.
    - Optional sends ([s]/[sJ]) are never sent, because we encode one value per vector.
    - Table 10-3 note 8 (AN tx! → QA) is implemented as printed and marked *(verify)*.
+
+## FEAT-004: avb-avtp (AAF / stream-format) and avb-avdecc (controller + listener entity)
+
+Two sans-IO crates (design §9, §10.1, §10.2). No I/O, no clocks, no threads: time
+enters as `now_ns` values and frames as byte slices (acceptance criterion 4).
+
+Gate at this checkpoint (all green):
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo test --workspace --locked`: avb-avtp 11, avb-avdecc 87, plus the
+  unchanged core 22 / dext 28 / gptp 59 / probe 16 / srp 30.
+- C++ host tests: tg3 97, i210 341.
+- `xcodebuild … AVBI210Driver`: BUILD SUCCEEDED, 0 compiler warnings.
+- `scripts/package.sh --adhoc`: both dexts built, Rust release built, package
+  assembled and ad-hoc signed (CFBundleVersion 283.0.1).
+
+### avb-avtp (§10.1, §10.2)
+
+- `common`: AVTP EtherType, subtype table, the 16-byte common stream header
+  (parse/encode, byte-exact vector).
+- `aaf`: AAF PCM header decode with the §10.2 step-2 checks (subtype 0x02,
+  `sv=1`, version 0); `encode` for test vectors only; `bytes_per_sample`.
+- `stream_format`: the 64-bit AEM format codec. AAF fields, CRF and IEC 61883
+  decode for the dump; `nsr` code table; `decodable()` (INT_32BIT 1–32 or
+  INT_24BIT ≤24, nsr ∈ {44.1,48,88.2,96,176.4,192 kHz}, 1–64 ch, 1–64 spf,
+  `ut=0`). Pinned vectors `0x0205022002006000` and `0x0205021802006000`, and
+  the full `decodable()` matrix.
+
+### avb-avdecc (§9)
+
+- `constants` / `milan`: every command/status/descriptor/message code as a
+  named const with an IEEE 1722.1-2021 / Milan v1.2 citation and a pinning
+  test; MVU protocol id `00-1B-C5-0A-C1-00`.
+- `adp`: ADPDU codec (68 B, trailing reserved(32)); entity table with
+  `valid_time × 2` expiry, reboot detection (available_index backwards or
+  AVAILABLE-after-DEPARTING), loopback flag, sole-talker selection.
+- `acmp`: ACMPDU codec (56 B, trailing reserved(16)); `A5_RESOURCE_STATUSES`
+  cited to Table 8.2; a test asserts every emitted ACMPDU targets
+  `91:E0:F0:01:00:00`.
+- `aecp`: AEM + MVU codecs; the in-flight/retry engine (one per target,
+  ≤200 cmd/s pacing via `MIN_SEND_GAP_NS`, per-controller wrapping u16 seq,
+  match on (target, seq, command_type), 250 ms + 1 retry, IN_PROGRESS re-arm
+  to 1 s capped at 10 s, final timeouts reported).
+- `aem::{model, desc, json}`: descriptor codecs (round-trip tested for ENTITY,
+  CONFIGURATION, AUDIO_UNIT, STREAM_INPUT/OUTPUT, AVB_INTERFACE, CLOCK_SOURCE,
+  CLOCK_DOMAIN, STREAM_PORT, AUDIO_CLUSTER, AUDIO_MAP; unknown types kept raw);
+  the dump builder with schema `avb-aem-dump/1` and exactly the §9.2 top-level
+  keys.
+- `derive`: `listener_model` is the ONLY constructor of `ListenerModel`
+  (acceptance criterion 3). A = AAF STREAM_OUTPUTs; non-AAF `unbound_by_design`;
+  >S_MAX refused; B dense in j; rates copied from the 16R AUDIO_UNIT; rate-vs-nsr
+  mismatch is an error; channel names via AUDIO_MAP/cluster else "<name> chN";
+  reference index = lowest j with CLOCK_SYNC_SOURCE else 0;
+  `entity_model_id = 0x02415601 || fnv1a32(canonical model)` (stable across runs,
+  changes iff the model changes).
+- `controller`: the sequential ACMP binder — separate wrapping u16 ACMP seq
+  counter, CONNECT_RX for j+1 only after j's final outcome, the §9.2 response
+  matching rule (`acmp_ctrl_unmatched` for wrong seq / luid / controller / the
+  loopback command echo), 4500 ms × up to 3 attempts, A-5 classification on a
+  resource status, `build_get_tx_state` for the ADC-15 check.
+- `entity` + `entity::acmp_listener`: ADP advertise (valid_time 10, the §9.3
+  capabilities, GM from gPTP) and ENTITY_DEPARTING; the AECP responder for every
+  listed command (unlisted → NOT_IMPLEMENTED); the Milan ACMP listener SM with
+  **one test per §9.4 table row** (named after it), plus the 9.2–12.2 s fallback
+  window, two successive reboots (5→1→6→0), and the rev-5 entry rows.
+
+### AS-7 decisions (recorded as required by §9.3)
+
+Two responder behaviors the design left to the implementer, decided from the
+Milan v1.2 text with a citation comment and a unit test:
+
+1. **ACQUIRE_ENTITY** → `NOT_IMPLEMENTED`. Milan v1.2 §5.4.2.1: a Milan audio
+   endpoint (PAAD-AE) does not implement ACQUIRE_ENTITY; exclusive control is
+   via LOCK_ENTITY only. Const `ACQUIRE_ENTITY_IMPLEMENTED = false` in
+   `entity`; test `acquire_entity_not_implemented_milan`.
+2. **ENTITY GET_COUNTERS** → `NOT_IMPLEMENTED`. Milan v1.2 §5.4.3 mandates
+   GET_COUNTERS for AVB_INTERFACE, CLOCK_DOMAIN and STREAM_INPUT, but not for
+   the ENTITY descriptor. Const `ENTITY_GET_COUNTERS_IMPLEMENTED = false`;
+   test `entity_get_counters_not_implemented_milan`. (STREAM_INPUT /
+   AVB_INTERFACE / CLOCK_DOMAIN GET_COUNTERS return SUCCESS; the daemon fills
+   the atomic values.)
+
+Both citations are *(verify against the exact Milan v1.2 clause numbers at the
+M2/hardware step)* — the structure (NOT_IMPLEMENTED for both) is what the SM
+and tests pin; if the clause text differs the constants flip without changing
+the responder's shape.
+
+### Deviations
+
+1. `PROBE_TX_COMMAND`/`_RESPONSE` are encoded on the wire as `GET_TX_STATE`
+   message types (Milan uses GET_TX_STATE as the listener probe); the design's
+   "PROBE_TX" maps to that message type. The listener SM keeps the probe its own
+   named events for clarity, with a shared wrapping u16 PROBE_TX sequence counter
+   separate from the controller ACMP and AECP counters.
+2. The ACMP listener SM takes the random 0–1 s pre-probe delay as a
+   caller-supplied `rand01_ns` argument rather than drawing it itself, so the SM
+   stays deterministic and sans-IO; the daemon supplies the randomness.
+3. `GET_COUNTERS` for the mandated descriptor types returns a zeroed counter
+   block from the responder; the daemon overwrites the values from the AAF-5
+   atomics before the frame goes out (the entity crate holds no atomics).
+4. The AVTP/ADP/ACMP control-header `control_data_length` high bits and the
+   trailing reserved fields (ADPDU reserved(32), ACMPDU reserved(16)) are written
+   as zero and ignored on decode; the decoders read fixed field offsets, so
+   trailing bytes do not affect round-trips.
+5. `read_name` decodes the 64-byte descriptor name fields as NUL-terminated
+   UTF-8 with lossy fallback; `write_name` truncates to 64 bytes on a char
+   boundary (the derived STREAM_INPUT "→Mac …" names are truncated the same way
+   in `derive`).

@@ -17,7 +17,7 @@ pub mod time;
 
 pub use counter::Counter;
 pub use eth::{EthFrame, EthHeader, VlanSource, VlanTag};
-pub use mac::{is_avdecc_dest, Eui64, MacAddr, StreamId};
+pub use mac::{is_avdecc_dest, Eui64, MacAddr, StreamId, AVDECC_MULTICAST};
 pub use outbox::{FrameTooLong, Outbox, TxFrame, TxFull};
 pub use rx::{DropReason, Now, RxMeta};
 pub use seqlock::{Contended, SeqLock, SeqWords};

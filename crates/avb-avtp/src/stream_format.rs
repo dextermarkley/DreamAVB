@@ -42,7 +42,10 @@ pub const MAX_BINDABLE_SPF: u16 = 64;
 
 /// Hz for an nsr code.
 pub fn nsr_hz(code: u8) -> Option<u32> {
-    NSR_TABLE.iter().find(|(c, _)| *c == code).map(|(_, hz)| *hz)
+    NSR_TABLE
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, hz)| *hz)
 }
 
 /// nsr code for a rate in Hz.
@@ -51,7 +54,7 @@ pub fn nsr_code(hz: u32) -> Option<u8> {
 }
 
 /// AAF fields of a stream format.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AafFormat {
     /// Upto ("up to") bit: channels/spf are maxima, not exact.
     pub ut: bool,
@@ -78,7 +81,7 @@ impl AafFormat {
 }
 
 /// CRF fields (decoded for the dump only).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CrfFormat {
     pub crf_type: u8,
     pub timestamp_interval: u16,
@@ -88,7 +91,7 @@ pub struct CrfFormat {
 }
 
 /// IEC 61883 fields (decoded for the dump only).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Iec61883Format {
     pub sf: bool,
     pub fmt: u8,
@@ -108,7 +111,9 @@ pub enum Decoded {
     Crf(CrfFormat),
     Iec61883(Iec61883Format),
     /// Any other subtype (vendor-specific, video, …): raw only.
-    Other { subtype: u8 },
+    Other {
+        subtype: u8,
+    },
 }
 
 /// The AEM 64-bit stream format value.
@@ -335,7 +340,11 @@ mod tests {
         ];
         for &(f, d, n, c, s, ut, want) in cases {
             let sf = aaf(f, d, n, c, s, ut);
-            assert_eq!(sf.decodable(), want, "{sf} fmt {f} depth {d} nsr {n} ch {c} spf {s} ut {ut}");
+            assert_eq!(
+                sf.decodable(),
+                want,
+                "{sf} fmt {f} depth {d} nsr {n} ch {c} spf {s} ut {ut}"
+            );
         }
         // Non-AAF formats never bind.
         assert!(!StreamFormat(0x0410_6001_0000_BB80).decodable());
