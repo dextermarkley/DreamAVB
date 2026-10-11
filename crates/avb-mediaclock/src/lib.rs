@@ -213,14 +213,15 @@ impl MediaClock {
             anchor_frame,
             anchor_mach,
             mach_per_frame,
-            rate_hz_vs_mach: if mach_per_frame > 0.0 {
-                // ticks/s ÷ ticks/frame = frames/s, but mach_per_frame is in
-                // ticks; the caller supplies the tick rate via the mapping, so
-                // we report the disciplined rate relative to nominal here.
-                f64::from(self.consts.rate) * self.dll.rate_ratio()
-            } else {
-                0.0
-            },
+            // Disciplined sample rate in Hz = nominal × the DLL's rate ratio.
+            // This is the TRUE measured media-clock rate (e.g. 47994 Hz at
+            // −118 ppm). The plug-in's GetZeroTimeStamp needs it to run the HAL
+            // device timeline at data-arrival rate rather than nominal, which
+            // is what otherwise warbles the audio. Always well-defined (the
+            // DLL's rate_ratio starts at 1.0 ⇒ nominal before lock), and
+            // reported independent of `mach_per_frame` (which the ring producer
+            // does not currently supply). The consumer gates on `locked`.
+            rate_hz_vs_mach: f64::from(self.consts.rate) * self.dll.rate_ratio(),
             media_ppm_vs_gptp: self.dll.ppm_vs_nominal() - gptp_ppm_vs_mach,
             uncertainty_ns: self.dll.last_error_ns().abs(),
             locked: self.lock.is_locked(),
