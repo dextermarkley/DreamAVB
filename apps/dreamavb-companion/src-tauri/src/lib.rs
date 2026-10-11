@@ -278,11 +278,22 @@ fn ethernet_ports() -> Vec<EthPort> {
 /// True if OUR dext is the registered driver for the I210 (so the device has
 /// no enX interface). Narrow `ioreg` query, not a whole-registry dump.
 fn dext_owns_i210() -> bool {
+    // `-rn <name>` only. Combining `-c IOUserService` with `-n AVBI210Driver`
+    // returns NOTHING even when the dext is attached and driving the device
+    // (verified against a live I210 whose dext answered avb-probe): ioreg does
+    // not intersect the two filters the way it reads like it should, so the
+    // class filter silently discarded the name match and this reported that the
+    // default driver owned the NIC while ours actually did.
     Command::new("/usr/sbin/ioreg")
-        .args(["-r", "-c", "IOUserService", "-n", "AVBI210Driver"])
+        .args(["-rn", "AVBI210Driver"])
         .output()
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("AVBI210Driver"))
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            // Require the bundle id too, so a stray name match elsewhere in the
+            // registry cannot be mistaken for our attached service.
+            s.contains("AVBI210Driver") && s.contains("com.avbaudio.installer.i210")
+        })
         .unwrap_or(false)
 }
 
