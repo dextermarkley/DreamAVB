@@ -492,3 +492,68 @@ stream counts match the device's advertised ADP capabilities.
 Post-milestone gate (green): fmt, `clippy --workspace --all-targets -D
 warnings`, 320 workspace tests (avdecc 88), C++ tg3 97 + i210 341,
 `package.sh --adhoc`.
+
+## hw-streams (partial) — the `streams` runner, Milan listener flow, and U-8
+
+The `streams` runner was reimplemented from the (wrong) classic-ACMP approach to
+the correct Milan listener flow, and three hardware-only bugs plus one open
+hardware question (U-8) were resolved/answered against the live 16R.
+
+### What was wrong, and fixed
+
+1. **CONNECT_RX is controller→listener, not controller→talker.** The first
+   implementation ran `controller::Binder`, which emits `CONNECT_RX_COMMAND`.
+   That is a controller→*listener* message; since we are both controller and
+   listener (one station), it never reaches the 16R and the 16R (a Milan
+   talker) ignored it — all 9 binds timed out. Replaced with the §9.4
+   `ListenerSm` PROBE_TX flow: `BindRx` → (random delay) → `SendProbeTx` → we
+   emit `GET_TX_STATE_COMMAND` to the talker → `GET_TX_STATE_RESPONSE` →
+   `ProbeTxResponse` → `SetStreamFilter`. All 9 streams then settled with the
+   16R's real MAAP dest MACs `91:e0:f0:00:b6:e6…ee`.
+
+2. **The dext filter is keyed on dest_mac+vid and rejects vid 0.** The dext's
+   `classifyRx` only returns `Stream` for a *tagged* frame whose VID equals the
+   filter entry, and `streamFilterValid` rejects `vid < 1`. The 16R's
+   GET_TX_STATE_RESPONSE reports `vid 0` (until reserved), so the installed
+   filter was invalid and matched nothing. Fixed to use the SR class A VID
+   (`DEFAULT_DOMAIN.vid = 2`) when the probe reports 0, and to dedup filter
+   entries on dest_mac (not the probe's 0 stream_id, which collapsed all 9 to 1).
+
+3. **SRP time was passed in ns, not mach ticks.** `Participant` converts its
+   ns timer durations to ticks against the timebase and adds them to
+   `now.mach`, so `now` must be raw `mach_absolute_time()` ticks. Feeding
+   ns-valued `MachTicks` broke every MRP timer. Fixed: SRP uses raw mach ticks,
+   the ACMP SMs keep ns (two distinct clocks).
+
+### SRP (MSRP/MVRP) integration
+
+Added the §8 `avb-srp` participant to the runner: declare MVRP `Vid{2}` + MSRP
+`Domain(class 6/prio 3/vid 2)`, declare an MSRP **Listener Ready** for each
+derived stream id (`stream_id_for(talker_mac, j)`), parse the 16R's control
+traffic, and maintain the reservation through the counting phase. On hardware
+the 16R **registers our Domain** (`DomainRegistered(class_id:6, priority:3,
+vid:2)`) — SRP is bidirectional and the SR class A domain is agreed.
+
+### U-8 answered: the 16R does NOT advertise/stream on reservation alone
+
+With gPTP locked, the AEM enumerated, all 9 streams probed, our Listener Ready
+declared and the MSRP Domain mutually registered, the 16R sent **no Talker
+Advertise** and **no AAF** (0 packets over 25 s). So U-8's open question — "does
+it stream only after Listener Ready?" — is answered **no, not on Listener Ready
+alone**: the 16R will not advertise or source an output stream until that output
+is **routed to an active source in the mixer**, a device-side action on the 16R
+itself (consistent with the hw-audio requirement that the user feed/route
+signal). The protocol side is complete and correct up to this wall; the counter
+path fires the instant AAF arrives.
+
+### State
+
+- `streams` runner: ADP discovery → Milan PROBE_TX bind → MSRP/MVRP reservation
+  → per-stream AAF counting, all gate-green. Committed as work-in-progress.
+- Blocked on the user: route the 16R's output streams to sources in the mixer
+  (and/or confirm whether its outputs stream only when fed), so AAF flows and
+  the 8000 pkt/s per-stream check can complete. This is the same visit that
+  hw-audio needs.
+
+Gate (green): fmt, `clippy --workspace --all-targets -D warnings`, 320 workspace
+tests, C++ tg3 97 + i210 341, `package.sh --adhoc`.

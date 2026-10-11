@@ -948,14 +948,20 @@ fn streams_loop(
     json_out: Option<&Path>,
 ) -> Result<(), Exit> {
     use avb_avdecc::acmp::Acmpdu;
-    use avb_avdecc::adp::Adpdu;
+    use avb_avdecc::adp::{stream_id_for, Adpdu};
     use avb_avdecc::constants::{acmp_msg, subtype};
-    use avb_avdecc::controller::{BindOutcome, BindTarget, Binder};
+    use avb_avdecc::controller::build_get_tx_state;
+    use avb_avdecc::entity::acmp_listener::{Action, Event, ListenerSm, State};
     use avb_avdecc::EntityTable;
     use avb_avtp::common::ETHERTYPE_AVTP;
     use avb_core::eth::{EthFrame, EthHeader};
     use avb_core::time::{MachTicks, Timebase};
     use avb_core::{Eui64, MacAddr, StreamId, TxFrame};
+    use avb_core::{Now, Outbox, RxMeta};
+    use avb_srp::attr::{
+        Attribute, Listener, ListenerDecl, DEFAULT_DOMAIN, ETHERTYPE_MSRP, ETHERTYPE_MVRP,
+    };
+    use avb_srp::participant::{Participant, ParticipantConfig, SrpEvent};
 
     use crate::dextio::DextPort;
 
@@ -992,7 +998,7 @@ fn streams_loop(
     };
     let discover_deadline_ns = opts.discover_timeout.saturating_mul(1_000_000_000);
     let mut last_discover = MachTicks(0);
-    let (talker, talker_mac, n_streams) = loop {
+    let (talker, talker_mac, n_streams, talker_avail_index) = loop {
         if shutdown_requested() {
             return Err(Exit::Interrupted);
         }
@@ -1021,7 +1027,12 @@ fn streams_loop(
         }
         if let Ok(Some(id)) = table.sole_talker() {
             if let Some(e) = table.get(id) {
-                break (id, e.mac, e.adp.talker_stream_sources);
+                break (
+                    id,
+                    e.mac,
+                    e.adp.talker_stream_sources,
+                    e.adp.available_index,
+                );
             }
         }
         if ns_since(start) >= discover_deadline_ns {
@@ -1040,101 +1051,360 @@ fn streams_loop(
         ),
     );
 
-    // --- Phase 2: bind every talker stream via ACMP (sequential binder) ---
-    let targets: Vec<BindTarget> = (0..n_streams)
-        .map(|i| BindTarget {
-            listener_unique_id: i,
-            talker_unique_id: i,
-        })
-        .collect();
-    let mut binder = Binder::new(our_id, talker, our_id, talker_mac, targets);
-    // Per-stream filter params learned from each successful CONNECT_RX response.
+    // --- Phase 2: bind every talker stream via the Milan listener SM ---
+    //
+    // We are the controller AND the listener (same station). The classic
+    // CONNECT_RX_COMMAND is a controller->listener message and never reaches
+    // the 16R; the 16R is a Milan talker and is driven by the PROBE_TX
+    // (GET_TX_STATE) cycle in the §9.4 listener SM. So we run one `ListenerSm`
+    // per stream: BindRx -> (random delay) -> SendProbeTx -> we emit
+    // GET_TX_STATE_COMMAND to the talker -> GET_TX_STATE_RESPONSE comes back ->
+    // ProbeTxResponse -> the SM emits SetStreamFilter with the real
+    // stream_id/dest_mac/vlan it learned from the talker.
+    let mut sms: Vec<ListenerSm> = (0..n_streams).map(ListenerSm::new).collect();
+    let mut probe_seq: u16 = 0;
+    // Per-stream filter params learned from each SetStreamFilter action.
     let mut filter: Vec<(u64, [u8; 6], u16)> = Vec::new();
     let mut bound_ids: std::collections::BTreeMap<u16, StreamId> = Default::default();
+    // In-flight GET_TX_STATE: talker_unique_id -> listener_unique_id, so a
+    // response (which carries talker ids, not our listener_unique_id) can be
+    // routed back to the SM that probed.
+    let mut probe_route: std::collections::BTreeMap<u16, u16> = Default::default();
 
-    while !binder.is_done() {
-        if shutdown_requested() {
-            return Err(Exit::Interrupted);
+    // Deterministic-enough random 0..=1s pre-probe delay (we only need it to
+    // be bounded and not synchronized across streams, not cryptographic).
+    let rand01 = |luid: u16| -> u64 { (u64::from(luid) * 137_000_000) % 1_000_000_000 };
+
+    let send_acmp = |dext: &mut RealDext, frame: &[u8]| {
+        let hdr = EthHeader {
+            dst: avb_core::AVDECC_MULTICAST,
+            src: our_mac,
+            vlan: None,
+            ethertype: ETHERTYPE_AVTP,
+        };
+        if let Ok(f) = TxFrame::build(&hdr, frame, false, 0) {
+            let _ = dext.send(f.bytes(), false, 0);
         }
-        let now = ns_since(start);
-        if let Some(send) = binder.poll(now) {
-            let hdr = EthHeader {
-                dst: avb_core::AVDECC_MULTICAST,
-                src: our_mac,
-                vlan: None,
-                ethertype: ETHERTYPE_AVTP,
-            };
-            if let Ok(f) = TxFrame::build(&hdr, &send.frame, false, 0) {
-                let _ = dext.send(f.bytes(), false, 0);
-            }
-        }
-        for slot in dext.rx_ctl() {
-            let Ok(p) = EthFrame::parse(&slot.data) else {
-                continue;
-            };
-            if p.hdr.ethertype != ETHERTYPE_AVTP
-                || p.payload.first().copied() != Some(subtype::ACMP)
-            {
-                continue;
-            }
-            let Some(acmp) = Acmpdu::decode(p.payload) else {
-                continue;
-            };
-            // Only RX_RESPONSEs matter to the binder.
-            if acmp.message_type != acmp_msg::CONNECT_RX_RESPONSE {
-                continue;
-            }
-            if let Some((luid, outcome)) = binder.on_rx(&acmp) {
-                match outcome {
-                    BindOutcome::Success => {
-                        filter.push((
-                            acmp.stream_id.0,
-                            acmp.stream_dest_mac.octets(),
-                            acmp.stream_vlan_id,
-                        ));
-                        bound_ids.insert(luid, acmp.stream_id);
+    };
+
+    // Helper: apply the actions a SM emitted this step.
+    let apply_actions =
+        |dext: &mut RealDext,
+         luid: u16,
+         talker: Eui64,
+         actions: Vec<Action>,
+         probe_seq: &mut u16,
+         probe_route: &mut std::collections::BTreeMap<u16, u16>,
+         filter: &mut Vec<(u64, [u8; 6], u16)>,
+         bound_ids: &mut std::collections::BTreeMap<u16, StreamId>| {
+            for act in actions {
+                match act {
+                    Action::SendProbeTx {
+                        talker_entity_id,
+                        talker_unique_id,
+                    } => {
+                        let seq = *probe_seq;
+                        *probe_seq = probe_seq.wrapping_add(1);
+                        probe_route.insert(talker_unique_id, luid);
+                        let frame =
+                            build_get_tx_state(our_id, talker_entity_id, talker_unique_id, seq);
+                        send_acmp(dext, &frame);
+                    }
+                    Action::SetStreamFilter { effective } => {
+                        // The dext matches AAF on dest_mac+vid, not stream_id
+                        // (a Milan talker's GET_TX_STATE may report stream_id 0
+                        // until the stream is reserved). It also REQUIRES a
+                        // tagged frame whose VID equals the entry and rejects a
+                        // vid-0 entry, so when the probe reports vid 0 we use
+                        // the SR class A VID the stream is actually tagged with.
+                        let dmac = effective.dest_mac.octets();
+                        let vid = if effective.vlan_id == 0 {
+                            DEFAULT_DOMAIN.vid
+                        } else {
+                            effective.vlan_id
+                        };
+                        bound_ids.insert(luid, effective.stream_id);
+                        filter.retain(|(_, m, _)| *m != dmac);
+                        filter.push((effective.stream_id.0, dmac, vid));
                         log.log(
                             Level::Info,
                             "acmp",
                             &format!(
-                                "stream {luid} bound: id=0x{:016x} dest={:02x?} vid={}",
-                                acmp.stream_id.0,
-                                acmp.stream_dest_mac.octets(),
-                                acmp.stream_vlan_id
+                                "stream {luid} settled: id=0x{:016x} dest={:02x?} vid={vid}",
+                                effective.stream_id.0, dmac
                             ),
                         );
                     }
-                    BindOutcome::Failed { status, a5 } => log.log(
-                        Level::Warn,
-                        "acmp",
-                        &format!("stream {luid} bind failed: status={status} a5={a5}"),
-                    ),
-                    BindOutcome::TimedOut => log.log(
-                        Level::Warn,
-                        "acmp",
-                        &format!("stream {luid} bind timed out"),
-                    ),
+                    Action::Log(msg) => {
+                        log.log(Level::Info, "acmp", &format!("stream {luid}: {msg}"))
+                    }
+                    // ReplaceStreamTable/RemoveStreamEntry/Declare/WithdrawListener
+                    // are MSRP/table concerns not needed for the pkt-rate check.
+                    _ => {}
+                }
+            }
+            let _ = talker;
+        };
+
+    // --- SRP (MSRP/MVRP) participant: the reservation that makes the 16R
+    // actually transmit. A Milan talker advertises its streams via MSRP
+    // Talker Advertise (0x22EA) and only begins egress once a Listener
+    // declares Ready for that stream_id. We therefore run the §8 MRP
+    // participant: declare the SR class A VID (MVRP) and Domain (MSRP), learn
+    // each stream's real stream_id/dest/vid from its Talker Advertise, then
+    // declare an MSRP Listener Ready so the 16R streams. The dext filter is
+    // keyed on dest_mac+vid, which the TA (and the ACMP probe) both carry.
+    let srp_cfg = ParticipantConfig {
+        mac: our_mac,
+        timebase: tb,
+        seed: u64::from_be_bytes(our_id.0),
+    };
+    // SRP timers convert ns durations to ticks against `tb` and add them to
+    // `now.mach`, so SRP time MUST be raw mach ticks (not the ns the ACMP SMs
+    // use). Keep the two clocks distinct.
+    let srp_now = || Now::mach_only(now_mach());
+    let mut srp = Participant::new(srp_cfg, now_mach());
+    // Declare the SR class A VID and Domain up front (§8.2 SRP-1).
+    srp.declare(
+        now_mach(),
+        Attribute::Vid {
+            vid: DEFAULT_DOMAIN.vid,
+        },
+    );
+    srp.declare(now_mach(), Attribute::Domain(DEFAULT_DOMAIN));
+    // Stream ids we have already declared a Listener Ready for.
+    let mut listener_declared: std::collections::BTreeSet<u64> = Default::default();
+
+    // Drain the SRP outbox onto the wire.
+    let mut srp_out: Outbox<32> = Outbox::new();
+    let drain_srp = |dext: &mut RealDext, out: &mut Outbox<32>| {
+        while let Some(f) = out.pop() {
+            let _ = dext.send(f.bytes(), false, 0);
+        }
+    };
+
+    // Seed every SM with BindRx (talker is in ADP, so each goes PRB_W_DELAY).
+    for sm in &mut sms {
+        let luid = sm.listener_unique_id;
+        let (_resp, actions) = sm.on_event(
+            Event::BindRx {
+                talker_entity_id: talker,
+                talker_unique_id: luid,
+                controller_entity_id: our_id,
+                talker_in_adp: true,
+                talker_available_index: Some(talker_avail_index),
+            },
+            ns_since(start),
+            rand01(luid),
+        );
+        apply_actions(
+            dext,
+            luid,
+            talker,
+            actions,
+            &mut probe_seq,
+            &mut probe_route,
+            &mut filter,
+            &mut bound_ids,
+        );
+    }
+
+    // Proactively declare an MSRP Listener Ready for each of the talker's
+    // derived stream ids (talker MAC + unique id, IEEE 1722.1 §8.2 / design
+    // §12). A Milan talker advertises and begins egress once it registers a
+    // Listener declaration for its stream — waiting for the Talker Advertise
+    // first would deadlock, since the 16R does not advertise unsolicited.
+    for uid in 0..n_streams {
+        let sid = stream_id_for(talker_mac, uid);
+        if listener_declared.insert(sid.0) {
+            srp.declare(
+                now_mach(),
+                Attribute::Listener(Listener {
+                    stream_id: sid,
+                    decl: ListenerDecl::Ready,
+                }),
+            );
+        }
+    }
+    srp.poll(srp_now(), &mut srp_out);
+    drain_srp(dext, &mut srp_out);
+    log.log(
+        Level::Info,
+        "srp",
+        &format!("declared Listener Ready for {n_streams} stream(s)"),
+    );
+
+    // Drive ACMP (probe) and SRP (reservation) together until every stream
+    // has a Listener Ready declared and its filter installed, or the deadline
+    // passes. The SRP Talker Advertise is the authoritative source of
+    // stream_id/dest/vid and declaring Listener Ready is what makes the 16R
+    // transmit; the ACMP probe runs in parallel for Milan correctness.
+    let bind_deadline_ns = ns_since(start).saturating_add(20_000_000_000);
+    loop {
+        if shutdown_requested() {
+            return Err(Exit::Interrupted);
+        }
+        let now = ns_since(start);
+
+        // Fire any due ACMP SM timers (delay -> probe, probe timeout -> resend).
+        for sm in &mut sms {
+            if let Some(deadline) = sm.timer_deadline_ns() {
+                if now >= deadline {
+                    let luid = sm.listener_unique_id;
+                    let actions = sm.on_timer(now, rand01(luid));
+                    apply_actions(
+                        dext,
+                        luid,
+                        talker,
+                        actions,
+                        &mut probe_seq,
+                        &mut probe_route,
+                        &mut filter,
+                        &mut bound_ids,
+                    );
                 }
             }
         }
-        let (resend, timeout_outcome) = binder.on_tick(now);
-        if let Some(send) = resend {
-            let hdr = EthHeader {
-                dst: avb_core::AVDECC_MULTICAST,
-                src: our_mac,
-                vlan: None,
-                ethertype: ETHERTYPE_AVTP,
+
+        // Drive SRP timers and transmit (JoinTime/LeaveAll).
+        srp.poll(srp_now(), &mut srp_out);
+        drain_srp(dext, &mut srp_out);
+
+        // Drain received control frames: ACMP (GET_TX_STATE_RESPONSE) + SRP.
+        for slot in dext.rx_ctl() {
+            let Ok(p) = EthFrame::parse(&slot.data) else {
+                continue;
             };
-            if let Ok(f) = TxFrame::build(&hdr, &send.frame, false, 0) {
-                let _ = dext.send(f.bytes(), false, 0);
+            match p.hdr.ethertype {
+                ETHERTYPE_AVTP if p.payload.first().copied() == Some(subtype::ACMP) => {
+                    let Some(acmp) = Acmpdu::decode(p.payload) else {
+                        continue;
+                    };
+                    if acmp.message_type != acmp_msg::GET_TX_STATE_RESPONSE
+                        || acmp.talker_entity_id != talker
+                    {
+                        continue;
+                    }
+                    let Some(&luid) = probe_route.get(&acmp.talker_unique_id) else {
+                        continue;
+                    };
+                    if let Some(sm) = sms.iter_mut().find(|s| s.listener_unique_id == luid) {
+                        let (_r, actions) = sm.on_event(
+                            Event::ProbeTxResponse {
+                                status: acmp.status,
+                                stream_id: acmp.stream_id,
+                                dest_mac: acmp.stream_dest_mac,
+                                vlan_id: acmp.stream_vlan_id,
+                            },
+                            now,
+                            rand01(luid),
+                        );
+                        apply_actions(
+                            dext,
+                            luid,
+                            talker,
+                            actions,
+                            &mut probe_seq,
+                            &mut probe_route,
+                            &mut filter,
+                            &mut bound_ids,
+                        );
+                    }
+                }
+                ETHERTYPE_MSRP | ETHERTYPE_MVRP => {
+                    let meta = RxMeta {
+                        desc_vlan_tci: slot.desc_vlan_tci,
+                        ..Default::default()
+                    };
+                    let _ = srp.handle_rx(srp_now(), &slot.data, meta);
+                }
+                _ => {}
             }
         }
-        if let Some((luid, _)) = timeout_outcome {
-            log.log(
-                Level::Warn,
-                "acmp",
-                &format!("stream {luid} bind timed out"),
-            );
+
+        // Process SRP events: a registered Talker Advertise gives us the real
+        // addressing and is our cue to declare Listener Ready.
+        while let Some(ev) = srp.pop_event() {
+            log.log(Level::Debug, "srp", &format!("event: {ev:?}"));
+            if let SrpEvent::TalkerRegistered {
+                stream_id,
+                talker: t,
+            } = ev
+            {
+                let adv = t.advertise();
+                let dmac = adv.dest_mac.octets();
+                // Install/refresh the dext filter for this stream.
+                filter.retain(|(_, m, _)| *m != dmac);
+                filter.push((stream_id.0, dmac, adv.vlan_id));
+                // Declare Listener Ready so the 16R starts streaming (once).
+                if listener_declared.insert(stream_id.0) {
+                    srp.declare(
+                        now_mach(),
+                        Attribute::Listener(Listener {
+                            stream_id,
+                            decl: ListenerDecl::Ready,
+                        }),
+                    );
+                    log.log(
+                        Level::Info,
+                        "srp",
+                        &format!(
+                            "talker advertise: id=0x{:016x} dest={:02x?} vid={} -> Listener Ready",
+                            stream_id.0, dmac, adv.vlan_id
+                        ),
+                    );
+                }
+                // Feed the ACMP SM a TA registration (Milan §9.4).
+                let luid = u16::try_from(filter.len().saturating_sub(1)).unwrap_or(0);
+                if let Some(sm) = sms.iter_mut().find(|s| s.listener_unique_id == luid) {
+                    let (_r, actions) = sm.on_event(
+                        Event::TaRegistered {
+                            dest_mac: adv.dest_mac,
+                            vlan_id: adv.vlan_id,
+                            accumulated_latency_ns: adv.accumulated_latency_ns,
+                        },
+                        now,
+                        rand01(luid),
+                    );
+                    apply_actions(
+                        dext,
+                        luid,
+                        talker,
+                        actions,
+                        &mut probe_seq,
+                        &mut probe_route,
+                        &mut filter,
+                        &mut bound_ids,
+                    );
+                }
+            }
+        }
+
+        // Keep the handshake running for a short settling window so the
+        // Listener Ready declarations reach the 16R, it advertises/reserves,
+        // and the ACMP probes complete. Exit once every stream has a filter
+        // entry (addressing learned) and the ACMP SMs have left the probe
+        // states, or when the deadline passes.
+        let acmp_settled = sms.iter().all(|s| {
+            !matches!(
+                s.state(),
+                State::PrbWAvail
+                    | State::PrbWDelay
+                    | State::PrbWResp
+                    | State::PrbWResp2
+                    | State::PrbWRetry
+            )
+        });
+        let all_addressed = filter.len() >= usize::from(n_streams);
+        // Hold the handshake open for a minimum window regardless of the ACMP
+        // probe finishing: MRP Join bursts and the 16R's Talker Advertise /
+        // reservation take several seconds, and the probe settles in ~2 s.
+        let min_handshake = now >= 8_000_000_000;
+        if (acmp_settled && all_addressed && min_handshake) || now >= bind_deadline_ns {
+            // Flush any pending SRP sends before counting.
+            srp.poll(srp_now(), &mut srp_out);
+            drain_srp(dext, &mut srp_out);
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
@@ -1142,18 +1412,29 @@ fn streams_loop(
     if filter.is_empty() {
         log.log(
             Level::Error,
-            "acmp",
-            "no streams bound; cannot count packets",
+            "srp",
+            "no streams reserved (no Talker Advertise and no PROBE_TX response); cannot count",
         );
         return Err(Exit::StreamRefused);
     }
     // Program the dext stream filter so the audio ring receives these streams.
     dext.set_filter(&filter);
+    {
+        let c = srp.counters();
+        log.log(
+            Level::Info,
+            "srp",
+            &format!(
+                "srp counters: pdu_tx={} pdu_rx={} regs={} dereg={} talker_changed={} own={} tx_full={} dropped={}",
+                c.pdu_tx, c.pdu_rx, c.registrations, c.deregistrations, c.talker_changed, c.own_frames, c.tx_full, c.pdu_dropped
+            ),
+        );
+    }
     log.log(
         Level::Info,
         "acmp",
         &format!(
-            "{} stream(s) bound; counting AAF packets for {seconds}s",
+            "{} stream(s) settled; counting AAF packets for {seconds}s",
             filter.len()
         ),
     );
@@ -1177,6 +1458,53 @@ fn streams_loop(
         if h.fault != 0 {
             log.log(Level::Error, "streams", &format!("dext fault {}", h.fault));
             return Err(Exit::DextFault);
+        }
+        // Maintain the MSRP/MVRP reservation (JoinTime refresh + LeaveAll)
+        // and absorb peer control frames; without this the declaration ages
+        // out and the 16R stops transmitting mid-run.
+        {
+            srp.poll(srp_now(), &mut srp_out);
+            drain_srp(dext, &mut srp_out);
+            for slot in dext.rx_ctl() {
+                if let Ok(p) = EthFrame::parse(&slot.data) {
+                    if matches!(p.hdr.ethertype, ETHERTYPE_MSRP | ETHERTYPE_MVRP) {
+                        let meta = RxMeta {
+                            desc_vlan_tci: slot.desc_vlan_tci,
+                            ..Default::default()
+                        };
+                        let _ = srp.handle_rx(srp_now(), &slot.data, meta);
+                    }
+                }
+            }
+            while let Some(ev) = srp.pop_event() {
+                if let SrpEvent::TalkerRegistered {
+                    stream_id,
+                    talker: t,
+                } = ev
+                {
+                    let adv = t.advertise();
+                    let dmac = adv.dest_mac.octets();
+                    let vid = if adv.vlan_id == 0 {
+                        DEFAULT_DOMAIN.vid
+                    } else {
+                        adv.vlan_id
+                    };
+                    // Refine the filter if the TA addressing differs.
+                    if !filter.iter().any(|(_, m, v)| *m == dmac && *v == vid) {
+                        filter.retain(|(_, m, _)| *m != dmac);
+                        filter.push((stream_id.0, dmac, vid));
+                        dext.set_filter(&filter);
+                        log.log(
+                            Level::Info,
+                            "srp",
+                            &format!(
+                                "talker advertise refined filter: id=0x{:016x} dest={dmac:02x?} vid={vid}",
+                                stream_id.0
+                            ),
+                        );
+                    }
+                }
+            }
         }
         for slot in dext.rx_audio() {
             if let Ok(pdu) = avb_avtp::aaf::decode(&slot.data) {
@@ -1212,22 +1540,25 @@ fn streams_loop(
 
     // --- Report ---
     let elapsed_s = (ns_since(count_start) as f64) / 1e9;
-    let streams_json: Vec<serde_json::Value> = bound_ids
-        .values()
-        .map(|sid| {
-            let n = counts.get(&sid.0).copied().unwrap_or(0);
+    // Report every stream_id actually observed on the wire (the AAF header's
+    // real stream_id), not the probe-reported one which a Milan talker may
+    // leave 0. `bound_ids` records which listener_unique_ids settled.
+    let streams_json: Vec<serde_json::Value> = counts
+        .iter()
+        .map(|(sid, n)| {
             serde_json::json!({
-                "stream_id": format!("0x{:016x}", sid.0),
+                "stream_id": format!("0x{sid:016x}"),
                 "packets": n,
-                "packets_per_s": (n as f64) / elapsed_s.max(1e-9),
-                "seq_gaps": gaps.get(&sid.0).copied().unwrap_or(0),
+                "packets_per_s": (*n as f64) / elapsed_s.max(1e-9),
+                "seq_gaps": gaps.get(sid).copied().unwrap_or(0),
             })
         })
         .collect();
     let report = serde_json::json!({
         "schema": "avb-streams/1",
         "talker": format!("0x{:016x}", u64::from_be_bytes(talker.0)),
-        "bound_streams": filter.len(),
+        "settled_streams": bound_ids.len(),
+        "streams_with_traffic": counts.len(),
         "elapsed_s": elapsed_s,
         "streams": streams_json,
     });
