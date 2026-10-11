@@ -658,6 +658,19 @@ pub extern "C" fn do_io_operation(
     _secondary: *mut c_void,
 ) -> OSStatus {
     // Only the input-read operation fills our buffer; ignore the rest.
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 20 {
+            oslog(&format!(
+                "[avb-coreaudio] DoIO op={} frames={} main_null={}",
+                fourcc(operation_id),
+                io_buffer_frame_size,
+                io_main_buffer.is_null()
+            ));
+        }
+    }
     if operation_id != kAudioServerPlugInIOOperationReadInput || io_main_buffer.is_null() {
         return kAudioHardwareNoError;
     }
@@ -692,9 +705,21 @@ pub extern "C" fn do_io_operation(
             // signal). read_into advances from here and we save it back.
             let mut consumer = Consumer::with_read_frame(ring, state.read_frame);
             let want = io_buffer_frame_size as usize;
+            let avail = consumer.available();
             let got = consumer.read_into(out, want);
             filled = got * frame_bytes;
             state.read_frame = consumer.read_frame();
+            {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static M: AtomicU32 = AtomicU32::new(0);
+                let m = M.fetch_add(1, Ordering::Relaxed);
+                if m < 20 {
+                    oslog(&format!(
+                        "[avb-coreaudio] read got={got} want={want} avail={avail} cursor={}",
+                        state.read_frame
+                    ));
+                }
+            }
         }
     }
     // Zero-fill any remainder (underrun, or no daemon): silence, never garbage.
