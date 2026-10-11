@@ -1,8 +1,17 @@
-# Pinned toolchain. The host-qualified name is deliberate: the rustup proxy on
-# this machine runs under Rosetta (default host x86_64-apple-darwin), so a bare
-# "1.99.0" would resolve to an x86_64 toolchain. The probe and installer must be
-# native arm64 binaries.
+# Pinned toolchain, so every machine and CI build the stack identically (the
+# crate dependency versions are pinned exactly for the same reason).
+#
+# The channel must be a plain version: rustup rejects a host-qualified name here
+# with "target tuple in channel name", which broke CI on both runners before it
+# compiled anything.
+#
+# On a Mac whose rustup default-host is x86_64 (a proxy installed under Rosetta),
+# a bare `cargo` resolves this pin to an x86_64 toolchain, and the probe and
+# installer must be native arm64. Fix it once per machine with
+#   rustup set default-host aarch64-apple-darwin
+# rather than naming a host here. The build scripts sidestep it by putting the
+# toolchain's own bin directory first on PATH, which skips the proxy.
 [toolchain]
-channel = "1.99.0-aarch64-apple-darwin"
+channel = "1.99.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

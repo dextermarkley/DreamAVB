@@ -20,9 +20,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # No toolchain action: rust-toolchain.toml pins the version and the
+      # clippy/rustfmt components, and the rustup proxy installs that pin on the
+      # first cargo call. Installing a separate "stable" here would download a
+      # toolchain the build then ignores, and would let a new clippy release
+      # break `-D warnings` without a commit.
+      - name: toolchain (from rust-toolchain.toml)
+        run: cargo --version && cargo clippy --version && cargo fmt --version
       - name: fmt
         run: cargo fmt --manifest-path Cargo.toml -p avb-core -p avb-gptp -p avb-srp -p avb-avtp -p avb-avdecc -p avb-mediaclock -p avb-audioring -- --check
       - name: clippy
@@ -38,9 +42,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: toolchain (from rust-toolchain.toml)
+        run: cargo --version && cargo clippy --version && cargo fmt --version
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
