@@ -1623,9 +1623,45 @@ fn streams_loop(
     // stream_id/dest/vid and declaring Listener Ready is what makes the 16R
     // transmit; the ACMP probe runs in parallel for Milan correctness.
     let bind_deadline_ns = ns_since(start).saturating_add(20_000_000_000);
+    // Apple's working controller re-asserts the full ACMP CONNECT handshake
+    // every ~1 s, and the 16R advertises its talker in lockstep. Re-send our
+    // CONNECT_TX_COMMAND for every stream on the same cadence so the Milan
+    // talker holds the connection and keeps advertising.
+    let mut connect_seq: u16 = 1000;
+    let mut last_connect = MachTicks(0);
     loop {
         if shutdown_requested() {
             return Err(Exit::Interrupted);
+        }
+        // Periodic CONNECT_TX re-assertion (~1 s), like Apple's controller.
+        if last_connect.0 == 0 || ns_since(last_connect) >= 1_000_000_000 {
+            use avb_avdecc::acmp::Acmpdu;
+            use avb_avdecc::constants::{acmp_msg, acmp_status};
+            for uid in 0..n_streams {
+                let pdu = Acmpdu {
+                    message_type: acmp_msg::CONNECT_TX_COMMAND,
+                    status: acmp_status::SUCCESS,
+                    stream_id: StreamId(0),
+                    controller_entity_id: our_id,
+                    talker_entity_id: talker,
+                    listener_entity_id: our_id,
+                    talker_unique_id: uid,
+                    listener_unique_id: uid,
+                    sequence_id: connect_seq,
+                    ..Default::default()
+                };
+                connect_seq = connect_seq.wrapping_add(1);
+                let hdr = EthHeader {
+                    dst: avb_core::AVDECC_MULTICAST,
+                    src: our_mac,
+                    vlan: None,
+                    ethertype: ETHERTYPE_AVTP,
+                };
+                if let Ok(f) = TxFrame::build(&hdr, &pdu.encode(), false, 0) {
+                    let _ = dext.send(f.bytes(), false, 0);
+                }
+            }
+            last_connect = now_mach();
         }
         let now = ns_since(start);
 
@@ -1666,6 +1702,26 @@ fn streams_loop(
             let Ok(p) = EthFrame::parse(&slot.data) else {
                 continue;
             };
+            // Diagnostic: is the 16R sending AECP (enumerating/controlling us)?
+            if p.hdr.ethertype == ETHERTYPE_AVTP
+                && p.payload.first().copied() == Some(subtype::AECP)
+            {
+                use avb_avdecc::aecp::AemPdu;
+                if let Some(cmd) = AemPdu::decode(p.payload) {
+                    if cmd.target_entity_id == our_id {
+                        log.log(
+                            Level::Info,
+                            "aecp",
+                            &format!(
+                                "INBOUND AECP to us: msg_type={} cmd=0x{:04x} from={:02x?}",
+                                cmd.message_type,
+                                cmd.command_type,
+                                p.hdr.src.octets()
+                            ),
+                        );
+                    }
+                }
+            }
             match p.hdr.ethertype {
                 ETHERTYPE_AVTP if p.payload.first().copied() == Some(subtype::ACMP) => {
                     let Some(acmp) = Acmpdu::decode(p.payload) else {
@@ -1861,6 +1917,35 @@ fn streams_loop(
                 send_our_adp(dext, our_avail_index);
                 our_avail_index = our_avail_index.wrapping_add(1);
                 last_advert = now_mach();
+            }
+            if ns_since(last_connect) >= 1_000_000_000 {
+                use avb_avdecc::acmp::Acmpdu;
+                use avb_avdecc::constants::{acmp_msg, acmp_status};
+                for uid in 0..n_streams {
+                    let pdu = Acmpdu {
+                        message_type: acmp_msg::CONNECT_TX_COMMAND,
+                        status: acmp_status::SUCCESS,
+                        stream_id: StreamId(0),
+                        controller_entity_id: our_id,
+                        talker_entity_id: talker,
+                        listener_entity_id: our_id,
+                        talker_unique_id: uid,
+                        listener_unique_id: uid,
+                        sequence_id: connect_seq,
+                        ..Default::default()
+                    };
+                    connect_seq = connect_seq.wrapping_add(1);
+                    let hdr = EthHeader {
+                        dst: avb_core::AVDECC_MULTICAST,
+                        src: our_mac,
+                        vlan: None,
+                        ethertype: ETHERTYPE_AVTP,
+                    };
+                    if let Ok(f) = TxFrame::build(&hdr, &pdu.encode(), false, 0) {
+                        let _ = dext.send(f.bytes(), false, 0);
+                    }
+                }
+                last_connect = now_mach();
             }
             srp.poll(srp_now(), &mut srp_out);
             drain_srp(dext, &mut srp_out);
