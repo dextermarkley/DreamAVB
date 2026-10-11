@@ -1,13 +1,16 @@
-//! POSIX shared-memory backing for the recovered-audio ring (Phase 1b-1).
+//! File-backed shared memory for the recovered-audio ring (Phase 1b-1).
 //!
-//! The daemon (producer) creates a named `shm_open` segment, sizes it to the
-//! ring's `total_bytes`, maps it read/write, and initialises the ring header.
-//! The CoreAudio plug-in (consumer), in `coreaudiod`'s separate process, opens
-//! the same name read/write and `AudioRing::from_raw`-attaches it. Both see the
+//! The daemon (producer) creates a memory-mapped FILE at a fixed world-
+//! accessible path, sizes it to the ring's `total_bytes`, maps it read/write,
+//! and initialises the ring header. The CoreAudio plug-in (consumer), in
+//! `coreaudiod`'s separate process, opens the same path read/write and
+//! `AudioRing::from_raw`-attaches it. A FILE (not POSIX `shm_open`) is used
+//! because macOS scopes shm names to the creator's bootstrap/sandbox namespace,
+//! making a root daemon's segment invisible to the non-root plug-in. Both see
 //! identical bytes; all header access is atomic, so no locking is needed.
 //!
-//! Only this module calls `libc::shm_open`/`ftruncate`/`mmap` for the shared
-//! case; `AudioRing` itself stays position-independent via `from_raw`.
+//! Only this module calls `libc::open`/`ftruncate`/`mmap` for the shared case;
+//! `AudioRing` itself stays position-independent via `from_raw`.
 
 use std::ffi::CString;
 use std::os::raw::c_int;
@@ -18,7 +21,13 @@ use crate::ring::{AudioRing, RingError};
 /// The stable shm name both processes agree on without the control socket
 /// (the socket, 1b-2, later carries this + geometry; until then it is fixed).
 /// macOS limits an shm name to 31 chars including the leading '/'.
-pub const SHM_NAME: &str = "/avb16r.ring";
+/// The ring is backed by a memory-mapped FILE at a fixed, world-accessible
+/// path — NOT a POSIX `shm_open` segment. macOS scopes POSIX shm names to the
+/// creator's bootstrap/sandbox namespace, so a root-launched daemon's segment
+/// is invisible (ENOENT) to the non-root `_coreaudiod` plug-in. A plain file
+/// both open by absolute path has no such namespace boundary. `/Users/Shared`
+/// is world-readable/writable and reachable by every user on the system.
+pub const SHM_NAME: &str = "/Users/Shared/avb16r.ring";
 
 /// A mapped shm segment that owns its `mmap`/fd and, optionally, unlinks the
 /// name on drop (the creator unlinks; an attacher does not).
@@ -52,12 +61,14 @@ impl ShmRing {
         }
         let name = CString::new(SHM_NAME).map_err(|_| RingError::BadConfig)?;
         let len = config.total_bytes();
-        // Drop any stale segment first (ignore ENOENT).
+        // Remove any stale file first so a crashed prior run cannot leave a
+        // wrongly-sized mapping behind (ignore ENOENT).
         // SAFETY: name is a valid C string.
-        unsafe { libc::shm_unlink(name.as_ptr()) };
-        // SAFETY: standard shm_open with O_CREAT|O_RDWR, 0600.
+        unsafe { libc::unlink(name.as_ptr()) };
+        // Create the backing FILE (not shm_open — see SHM_NAME doc).
+        // SAFETY: standard open with O_CREAT|O_RDWR|O_EXCL, 0666.
         let fd = unsafe {
-            libc::shm_open(
+            libc::open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
                 0o666,
@@ -66,16 +77,15 @@ impl ShmRing {
         if fd < 0 {
             return Err(RingError::MapFailed);
         }
-        // shm_open's mode is masked by umask, so a 0o666 request can land as
-        // 0o644. The daemon runs as root but the CoreAudio plug-in runs as
-        // _coreaudiod (a different, non-root user) and must open this segment
-        // O_RDWR — so force world read/write past umask with fchmod.
+        // open's mode is masked by umask; the daemon runs as root but the
+        // plug-in runs as the non-root _coreaudiod user and must open this
+        // file O_RDWR — force world read/write past umask with fchmod.
         unsafe { libc::fchmod(fd, 0o666) };
-        // SAFETY: fd is a valid shm fd; sizing it to the full ring length.
+        // SAFETY: fd is a valid file fd; sizing it to the full ring length.
         if unsafe { libc::ftruncate(fd, len as libc::off_t) } != 0 {
             unsafe {
                 libc::close(fd);
-                libc::shm_unlink(name.as_ptr());
+                libc::unlink(name.as_ptr());
             }
             return Err(RingError::MapFailed);
         }
@@ -101,8 +111,9 @@ impl ShmRing {
     /// unlink on drop (the creator owns the name's lifetime).
     pub fn attach() -> Result<Self, RingError> {
         let name = CString::new(SHM_NAME).map_err(|_| RingError::BadConfig)?;
+        // Open the backing FILE read/write (not shm_open — see SHM_NAME doc).
         // SAFETY: name is a valid C string.
-        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR, 0o600) };
+        let fd = unsafe { libc::open(name.as_ptr(), libc::O_RDWR) };
         if fd < 0 {
             return Err(RingError::MapFailed);
         }
@@ -161,12 +172,12 @@ impl ShmRing {
 
 impl Drop for ShmRing {
     fn drop(&mut self) {
-        // SAFETY: ptr/len/fd came from our own map()/shm_open().
+        // SAFETY: ptr/len/fd came from our own map()/open().
         unsafe {
             libc::munmap(self.ptr.cast(), self.len);
             libc::close(self.fd);
             if self.unlink_on_drop {
-                libc::shm_unlink(self.name.as_ptr());
+                libc::unlink(self.name.as_ptr());
             }
         }
     }
