@@ -5,8 +5,11 @@
 //! no unit tests.
 
 use avb_core::MachTicks;
+use avb_dext::abi::mem;
 use avb_dext::abi::{StreamFilter, StreamFilterEntry, FLAG_LINK_UP};
-use avb_dext::iokit::{io_return_of, is_device_removed, Device};
+use avb_dext::iokit::{io_return_of, is_device_removed, Device, MemMap};
+use avb_dext::shm::{Ring, RxRings};
+use avb_gptp::msg::ETHERTYPE_PTP;
 
 use crate::dextio::{DextPort, Health, RxSlot, SendResult, TxTsResult};
 
@@ -26,6 +29,13 @@ pub struct RealDext {
     /// Updated by the stack from the mapped shm header each ctl tick.
     pub producer_running: bool,
     pub last_tick_mach: MachTicks,
+    /// Mapped RX memory (ShmHeader + ctl/audio slots, read-only) and the
+    /// consumer tails (read-write). `None` until `attach_rings` succeeds. The
+    /// maps must outlive every `RxRings` view built from them.
+    rx_map: Option<MemMap>,
+    consumer_map: Option<MemMap>,
+    /// Shm mapping generation, pinned at attach for slot validation.
+    shm_generation: u64,
 }
 
 impl RealDext {
@@ -37,7 +47,35 @@ impl RealDext {
             timebase_denom,
             producer_running: false,
             last_tick_mach: MachTicks(0),
+            rx_map: None,
+            consumer_map: None,
+            shm_generation: 0,
         }
+    }
+
+    /// Map the RX memory (read-only) and the consumer tails (read-write) and
+    /// pin the mapping generation after validating the header. Call once after
+    /// `RingAttach` + `InitDatapath` (design §5.2 steps 4–6). Without this,
+    /// `rx_ctl` has nothing to drain.
+    pub fn attach_rings(&mut self, generation: u64) -> Result<(), &'static str> {
+        let rx = self.dev.map_memory(mem::RX).map_err(|_| "map RX memory")?;
+        let consumer = self
+            .dev
+            .map_memory(mem::CONSUMER)
+            .map_err(|_| "map consumer memory")?;
+        // Validate the header layout against the pinned generation.
+        // SAFETY: the maps are valid for their reported lengths for as long as
+        // they are held in `self`; the dext follows the ring protocol.
+        let rings =
+            unsafe { RxRings::from_raw(rx.as_ptr(), rx.len(), consumer.as_ptr(), consumer.len()) }
+                .map_err(|_| "ring layout mismatch")?;
+        rings
+            .validate(generation)
+            .map_err(|_| "shm header mismatch")?;
+        self.rx_map = Some(rx);
+        self.consumer_map = Some(consumer);
+        self.shm_generation = generation;
+        Ok(())
     }
 
     pub fn device(&self) -> &Device {
@@ -46,6 +84,22 @@ impl RealDext {
 
     pub fn timebase(&self) -> (u32, u32) {
         (self.timebase_numer, self.timebase_denom)
+    }
+
+    /// The dext's current clock generation from the mapped ShmHeader, or 0 if
+    /// the rings are not mapped. The gPTP port must be seeded with this so RX
+    /// slot generations match and exchanges are not discarded as step-straddles.
+    pub fn clock_gen(&self) -> u32 {
+        let (Some(rx), Some(consumer)) = (self.rx_map.as_ref(), self.consumer_map.as_ref()) else {
+            return 0;
+        };
+        // SAFETY: maps held in self for their reported lengths; dext follows
+        // the ring protocol.
+        match unsafe { RxRings::from_raw(rx.as_ptr(), rx.len(), consumer.as_ptr(), consumer.len()) }
+        {
+            Ok(r) => r.clock_gen(),
+            Err(_) => 0,
+        }
     }
 }
 
@@ -76,11 +130,18 @@ impl DextPort for RealDext {
             return TxTsResult::Idle;
         };
         match self.dev.get_tx_timestamp(seq) {
-            Ok((0, systim_ns, _)) => {
-                self.pending_ts = None;
-                TxTsResult::Ready { tag, systim_ns }
-            }
-            Ok(_) => TxTsResult::Pending,
+            Ok((status, systim_ns, _)) => match status {
+                avb_dext::abi::TX_TS_OK => {
+                    self.pending_ts = None;
+                    TxTsResult::Ready { tag, systim_ns }
+                }
+                avb_dext::abi::TX_TS_PENDING => TxTsResult::Pending,
+                // TIMEOUT / NOT_REQUESTED: the exchange is abandoned.
+                _ => {
+                    self.pending_ts = None;
+                    TxTsResult::Timeout
+                }
+            },
             Err(_) => {
                 self.pending_ts = None;
                 TxTsResult::Timeout
@@ -107,6 +168,10 @@ impl DextPort for RealDext {
         let _ = self.dev.step_clock(delta_ns);
     }
 
+    fn set_clock_abs(&mut self, ns: u64) {
+        let _ = self.dev.set_clock(ns);
+    }
+
     fn adj_freq(&mut self, ppb: i64) {
         let _ = self.dev.adj_freq(ppb);
     }
@@ -122,10 +187,55 @@ impl DextPort for RealDext {
     }
 
     fn rx_ctl(&mut self) -> Vec<RxSlot> {
-        // The real control-ring drain is done by the ctl thread over the
-        // mapped `RxRings` (the stack owns the mapping). RealDext is the
-        // command bridge, so this returns empty.
-        Vec::new()
+        // Primary path: drain the mapped control ring (design §5.2, §14.2).
+        // After RingAttach the dext delivers RX frames into the shared-memory
+        // ctl ring, NOT the PollRx batch queue, so this is where gPTP frames
+        // arrive. Fall back to PollRx only when the rings are not mapped.
+        if let (Some(rx), Some(consumer)) = (self.rx_map.as_ref(), self.consumer_map.as_ref()) {
+            // SAFETY: the maps are held in `self` for their reported lengths;
+            // the dext follows the ring protocol. A fresh view each call just
+            // re-reads the consumer tails.
+            let mut rings = match unsafe {
+                RxRings::from_raw(rx.as_ptr(), rx.len(), consumer.as_ptr(), consumer.len())
+            } {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
+            let gen = rings.generation();
+            let mut out = Vec::new();
+            rings.drain(Ring::Ctl, avb_dext::abi::RX_BATCH_MAX, |slot| {
+                if let Ok(s) = slot {
+                    out.push(RxSlot {
+                        cls: s.cls() as u8,
+                        data: s.data().to_vec(),
+                        hw_ts_ns: s.hw_ts(),
+                        clock_gen: s.clock_gen(),
+                        step_ambig: s.step_ambig(),
+                        desc_vlan_tci: s.desc_vlan_tci(),
+                    });
+                }
+            });
+            let _ = gen;
+            return out;
+        }
+
+        // Fallback: IOKit PollRx filtered to the PTP ethertype.
+        let batch = match self.dev.poll_rx(ETHERTYPE_PTP, avb_dext::abi::RX_BATCH_MAX) {
+            Ok(b) => b,
+            Err(_) => return Vec::new(),
+        };
+        batch
+            .entries()
+            .iter()
+            .map(|e| RxSlot {
+                cls: avb_dext::abi::RxClass::Gptp as u8,
+                data: e.bytes().to_vec(),
+                hw_ts_ns: (e.has_ts != 0).then_some(e.hw_ts),
+                clock_gen: 0,
+                step_ambig: false,
+                desc_vlan_tci: None,
+            })
+            .collect()
     }
 
     fn rx_audio(&mut self) -> Vec<RxSlot> {

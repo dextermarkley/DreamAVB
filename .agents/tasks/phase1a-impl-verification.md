@@ -408,3 +408,48 @@ Post-fix gate (green): `fmt --all --check` clean; `clippy --workspace
 = 319 tests pass (audioring 12, daemon 28, plus the rest); C++ tg3 97 + i210
 341; release build clean. The hardware milestones (hw-gptp … hw-audio) are the
 remaining Phase 1a work and require the real 16R/I210 and the user.
+
+---
+
+### Milestone hw-gptp — gPTP lock to the StudioLive 16R (PASSED)
+
+The `avb-daemon gptp` ctl-thread loop (`stack::gptp_loop`) was implemented to pump
+the sans-IO `avb_gptp::Port` against the `DextPort`: drain the mapped control
+ring → `handle_rx`; `poll` → send via the dext with the 8 ms Pdelay_Resp gate;
+harvest TX timestamps → `on_tx_timestamp`; execute servo actions; feed the clock
+model; exit 6 on no gPTP traffic, `DextFault` on a latched fault / lost link.
+
+Bringing it up against the real 16R exposed **five hardware-only bugs** the
+sans-IO test gate could not reach (all fixed):
+
+1. **Datapath init flags** — `bring_up` called `init_datapath(0)`; the dext's gPTP
+   RX classifier is only armed by `INIT_FLAG_RX_PTP_V2_L2` (plus `PROMISC`), so
+   no gPTP frame was ever captured (`pdelay_req_rx=0`). Fixed in `bring_up`.
+2. **Wrong RX path after RingAttach** — `rx_ctl` used the `PollRx` IOKit batch,
+   but once a ring is attached the dext delivers RX into the mapped shared-memory
+   control ring. Added `attach_rings` (map `mem::RX` + `mem::CONSUMER`, validate
+   the header against the attach generation) and made `rx_ctl` drain the ctl ring
+   via `RxRings::drain`, with `PollRx` as a fallback.
+3. **TX-timestamp status polarity inverted** — `RealDext::poll_tx_ts` treated
+   status `0` as OK, but `TX_TS_PENDING=0` / `TX_TS_OK=1`, so t1 (our Pdelay_Req
+   TX timestamp) was never delivered and every exchange was counted lost. Fixed
+   to use the named constants, and the ctl loop now harvests a `want_ts` frame's
+   timestamp immediately after sending (the dext holds only one pending TX ts).
+4. **Clock generation never seeded/re-synced** — the port started at generation
+   0 while the dext's `clock_gen` was non-zero, so `try_complete` discarded every
+   exchange as a step-straddle (`pdelay_step_discard=29`). The port is now seeded
+   with `dext.clock_gen()` and re-synced to the dext's actual generation after
+   each step.
+5. **SetClock routed through the bounded step** — a `SetClock` for `|offset| > 1 s`
+   was sent through `step_clock`, which rejects a delta larger than
+   `STEP_CLOCK_MAX_NS`; the initial ~100 546 s SYSTIM↔GM epoch gap could never be
+   closed. Split the handler: `StepClock` → bounded `step`, `SetClock` → absolute
+   `set_clock(ReadClock() + delta)` (new `DextPort::set_clock_abs`).
+
+**Result (310 s run, `--json-out`):** servo **LOCKED**, port **SLAVE**,
+**asCapable true**; offset **mean 0.05 ns, sd 5.19 ns**; path delay 138 ns;
+neighbor rate ratio 1.0000000; 2454/2456 Syncs used; **0 unlocks, 0 GM changes,
+0 lost responses, 0 step-discards**; one SetClock + one step at startup. The two
+review fixes (TX-ts owner-tag routing, the 8 ms Pdelay_Resp gate) are exercised
+by this path.
+

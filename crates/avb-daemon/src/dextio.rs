@@ -60,7 +60,11 @@ pub trait DextPort {
     fn poll_tx_ts(&mut self) -> TxTsResult;
     /// Current clock reading (mach ticks and SYSTIM ns).
     fn read_clock(&mut self) -> (MachTicks, u64);
+    /// Bounded frequency/offset step via the NIC's STEP register (small
+    /// corrections; the dext rejects a step larger than STEP_CLOCK_MAX_NS).
     fn step(&mut self, delta_ns: i64);
+    /// Absolute SYSTIM write (design §7.3 SetClock, used when |offset| > 1 s).
+    fn set_clock_abs(&mut self, ns: u64);
     fn adj_freq(&mut self, ppb: i64);
     fn set_filter(&mut self, streams: &[(u64, [u8; 6], u16)]);
     /// Drain the control ring.
@@ -102,6 +106,7 @@ pub mod fake {
         /// When true, poll_tx_ts returns Pending instead of resolving.
         pub ts_stays_pending: bool,
         pub steps: Vec<i64>,
+        pub set_clocks: Vec<u64>,
         pub freq_adjusts: Vec<i64>,
         pub filters_set: usize,
     }
@@ -125,6 +130,7 @@ pub mod fake {
                 pending_ts: None,
                 ts_stays_pending: false,
                 steps: Vec::new(),
+                set_clocks: Vec::new(),
                 freq_adjusts: Vec::new(),
                 filters_set: 0,
             }
@@ -178,6 +184,10 @@ pub mod fake {
         fn step(&mut self, delta_ns: i64) {
             self.steps.push(delta_ns);
             self.systim_ns = self.systim_ns.wrapping_add_signed(delta_ns);
+        }
+        fn set_clock_abs(&mut self, ns: u64) {
+            self.set_clocks.push(ns);
+            self.systim_ns = ns;
         }
         fn adj_freq(&mut self, ppb: i64) {
             self.freq_adjusts.push(ppb);
