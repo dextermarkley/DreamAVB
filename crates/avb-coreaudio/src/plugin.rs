@@ -708,6 +708,32 @@ static IO: Mutex<Option<IoState>> = Mutex::new(None);
 struct OutIoState {
     prod: avb_audioring::ShmProducer,
     scratch: Vec<u8>,
+    /// Inode of the ring file this mapping came from, so a ring the daemon has
+    /// since replaced can be detected. See `out_ring_is_stale`.
+    ino: u64,
+}
+
+/// The inode of the output ring path right now, or `None` if it is absent.
+fn out_ring_ino() -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(avb_audioring::SHM_NAME_OUT)
+        .ok()
+        .map(|m| m.ino())
+}
+
+/// True if the mapping we hold is no longer the ring the daemon is using.
+///
+/// The daemon UNLINKS its output ring when `play` exits and creates a fresh
+/// file — a new inode — on the next run. Our mmap of the old inode stays
+/// perfectly valid, so without this check the plug-in keeps writing into a
+/// deleted ring nobody reads while the live ring's write frontier sits at 0
+/// forever. `start_io` only attached when it held nothing, and only `stop_io`
+/// cleared it, so a device whose IO never stopped (ours is the default output)
+/// never re-attached. Observed directly: a run begun after a previous daemon
+/// exited transmitted 191,489 PDUs and 191,489 underruns while the plug-in was
+/// writing happily to the orphaned mapping.
+fn out_ring_is_stale(state: &OutIoState) -> bool {
+    out_ring_ino().is_none_or(|ino| ino != state.ino)
 }
 
 /// Frames converted per inner step of `write_mix` (bounds the scratch buffer;
@@ -720,6 +746,9 @@ static OUT_IO: Mutex<Option<OutIoState>> = Mutex::new(None);
 /// `None` if the ring is absent or its geometry does not match this device.
 fn attach_out() -> Option<OutIoState> {
     let channels = DEVICE_CHANNELS as usize;
+    // Read the inode BEFORE mapping, so a ring swapped between the two reads
+    // is caught by the next staleness check rather than remembered wrongly.
+    let ino = out_ring_ino()?;
     let prod = avb_audioring::ShmProducer::attach_at(
         avb_audioring::SHM_NAME_OUT,
         &[(0, channels, 32)],
@@ -734,6 +763,7 @@ fn attach_out() -> Option<OutIoState> {
     Some(OutIoState {
         prod,
         scratch: vec![0u8; OUT_CHUNK_FRAMES * channels * 4],
+        ino,
     })
 }
 
@@ -764,7 +794,12 @@ pub extern "C" fn start_io(
     }
     // Attach the OUTPUT ring (playback). Absence is not an error — write_mix
     // retries the attach (throttled) until the daemon's `play` loop creates it.
+    // A mapping of a ring the daemon has already replaced is dropped first:
+    // `if guard.is_none()` alone meant a stale mapping was kept forever.
     if let Ok(mut guard) = OUT_IO.lock() {
+        if guard.as_ref().is_some_and(out_ring_is_stale) {
+            *guard = None;
+        }
         if guard.is_none() {
             *guard = attach_out();
             oslog(if guard.is_some() {
@@ -958,16 +993,25 @@ fn write_mix(frames: UInt32, io_main_buffer: *mut c_void) -> OSStatus {
     // Lazy attach (review H2): coreaudiod usually starts IO before the daemon
     // creates the output ring, so retry here — throttled to once per second so
     // a missing ring costs one failed open() per second, not one per cycle.
-    if guard.is_none() {
+    // The same throttled tick drops a mapping whose ring the daemon has
+    // replaced, which is what makes a daemon RESTART recover instead of
+    // writing into an orphaned ring forever.
+    {
         static LAST_TRY: AtomicU64 = AtomicU64::new(0);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if LAST_TRY.swap(now, Ordering::Relaxed) != now {
-            *guard = attach_out();
-            if guard.is_some() {
-                oslog("[avb-coreaudio] IO: attached output ring (lazy retry in WriteMix)");
+            if guard.as_ref().is_some_and(out_ring_is_stale) {
+                oslog("[avb-coreaudio] IO: output ring replaced — reattaching");
+                *guard = None; // drop the old mapping before remapping
+            }
+            if guard.is_none() {
+                *guard = attach_out();
+                if guard.is_some() {
+                    oslog("[avb-coreaudio] IO: attached output ring (lazy retry in WriteMix)");
+                }
             }
         }
     }
