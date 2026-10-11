@@ -103,19 +103,67 @@ extern "C" fn get_zero_time_stamp(
     out_host_time: *mut u64,
     out_seed: *mut u64,
 ) -> OSStatus {
-    // Zero-timestamp anchor; derived from the ring clock model in 1b-1.
+    // Advance the zero timestamp by whole ring periods against the host clock,
+    // mirroring NullAudio. The anchor is captured on the first call. This is a
+    // stand-in until the recovered-audio ring's ClockModel drives it (1b-1).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ANCHOR_HOST: AtomicU64 = AtomicU64::new(0);
+
+    const RING_FRAMES: f64 = 8192.0;
+    const RATE_HZ: f64 = 48_000.0;
+
+    let now = unsafe { mach_absolute_time() };
+    let (numer, denom) = timebase();
+    // host ticks -> nanoseconds -> frames.
+    let anchor = match ANCHOR_HOST.compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(_) => now,              // first call: we just set it
+        Err(existing) => existing, // subsequent calls
+    };
+    let elapsed_ns = (now.wrapping_sub(anchor)) as f64 * numer as f64 / denom as f64;
+    let elapsed_frames = elapsed_ns * RATE_HZ / 1_000_000_000.0;
+    // Round DOWN to the start of the current ring period.
+    let periods = (elapsed_frames / RING_FRAMES).floor();
+    let sample_time = periods * RING_FRAMES;
+    // Host time of that period boundary.
+    let period_ns = periods * RING_FRAMES / RATE_HZ * 1_000_000_000.0;
+    let host_time = anchor + (period_ns * denom as f64 / numer as f64) as u64;
+
     unsafe {
         if !out_sample_time.is_null() {
-            *out_sample_time = 0.0;
+            *out_sample_time = sample_time;
         }
         if !out_host_time.is_null() {
-            *out_host_time = 0;
+            *out_host_time = host_time;
         }
         if !out_seed.is_null() {
             *out_seed = 1;
         }
     }
     kAudioHardwareNoError
+}
+
+extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+/// Mach timebase (numer/denom): host ticks * numer/denom = nanoseconds.
+fn timebase() -> (u32, u32) {
+    let mut tb = MachTimebaseInfo { numer: 0, denom: 0 };
+    unsafe {
+        mach_timebase_info(&mut tb);
+    }
+    if tb.numer == 0 || tb.denom == 0 {
+        (1, 1)
+    } else {
+        (tb.numer, tb.denom)
+    }
 }
 extern "C" fn will_do_io_operation(
     _d: AudioServerPlugInDriverRef,

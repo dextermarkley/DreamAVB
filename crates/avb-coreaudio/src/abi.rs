@@ -228,27 +228,99 @@ pub struct CFUUIDBytes {
 }
 
 // Common HAL property selectors we answer (four-char codes).
-pub const kAudioObjectPropertyClass: UInt32 = u32::from_be_bytes(*b"clas");
-pub const kAudioObjectPropertyManufacturer: UInt32 = u32::from_be_bytes(*b"lmak");
-pub const kAudioPlugInPropertyDeviceList: UInt32 = u32::from_be_bytes(*b"dev#");
-pub const kAudioObjectPropertyName: UInt32 = u32::from_be_bytes(*b"lnam");
-pub const kAudioDevicePropertyDeviceUID: UInt32 = u32::from_be_bytes(*b"uid ");
-pub const kAudioDevicePropertyNominalSampleRate: UInt32 = u32::from_be_bytes(*b"nsrt");
-pub const kAudioDevicePropertyStreams: UInt32 = u32::from_be_bytes(*b"stm#");
-pub const kAudioStreamPropertyVirtualFormat: UInt32 = u32::from_be_bytes(*b"sfmt");
-pub const kAudioStreamPropertyDirection: UInt32 = u32::from_be_bytes(*b"sdir");
+// --- Property selectors (exact FourCCs from the macOS CoreAudio headers) ---
 
-// Scopes.
+// Object (apply to every HAL object).
+pub const kAudioObjectPropertyBaseClass: UInt32 = u32::from_be_bytes(*b"bcls");
+pub const kAudioObjectPropertyClass: UInt32 = u32::from_be_bytes(*b"clas");
+pub const kAudioObjectPropertyOwner: UInt32 = u32::from_be_bytes(*b"stdv");
+pub const kAudioObjectPropertyName: UInt32 = u32::from_be_bytes(*b"lnam");
+pub const kAudioObjectPropertyManufacturer: UInt32 = u32::from_be_bytes(*b"lmak");
+pub const kAudioObjectPropertyOwnedObjects: UInt32 = u32::from_be_bytes(*b"ownd");
+pub const kAudioObjectPropertyModelName: UInt32 = u32::from_be_bytes(*b"lmod");
+
+// Class IDs.
+pub const kAudioObjectClassID: UInt32 = u32::from_be_bytes(*b"aobj");
+pub const kAudioPlugInClassID: UInt32 = u32::from_be_bytes(*b"aplg");
+pub const kAudioBoxClassID: UInt32 = u32::from_be_bytes(*b"abox");
+pub const kAudioDeviceClassID: UInt32 = u32::from_be_bytes(*b"adev");
+pub const kAudioStreamClassID: UInt32 = u32::from_be_bytes(*b"astr");
+
+// Plug-in.
+pub const kAudioPlugInPropertyBoxList: UInt32 = u32::from_be_bytes(*b"box#");
+pub const kAudioPlugInPropertyTranslateUIDToBox: UInt32 = u32::from_be_bytes(*b"uidb");
+pub const kAudioPlugInPropertyDeviceList: UInt32 = u32::from_be_bytes(*b"dev#");
+pub const kAudioPlugInPropertyTranslateUIDToDevice: UInt32 = u32::from_be_bytes(*b"uidd");
+
+// Box.
+pub const kAudioBoxPropertyBoxUID: UInt32 = u32::from_be_bytes(*b"buid");
+pub const kAudioBoxPropertyAcquired: UInt32 = u32::from_be_bytes(*b"bxon");
+
+// Device.
+pub const kAudioDevicePropertyDeviceUID: UInt32 = u32::from_be_bytes(*b"uid ");
+pub const kAudioDevicePropertyModelUID: UInt32 = u32::from_be_bytes(*b"muid");
+pub const kAudioDevicePropertyTransportType: UInt32 = u32::from_be_bytes(*b"tran");
+pub const kAudioDevicePropertyRelatedDevices: UInt32 = u32::from_be_bytes(*b"akin");
+pub const kAudioDevicePropertyClockDomain: UInt32 = u32::from_be_bytes(*b"clkd");
+pub const kAudioDevicePropertyDeviceIsAlive: UInt32 = u32::from_be_bytes(*b"livn");
+pub const kAudioDevicePropertyDeviceIsRunning: UInt32 = u32::from_be_bytes(*b"goin");
+pub const kAudioDevicePropertyDeviceCanBeDefaultDevice: UInt32 = u32::from_be_bytes(*b"dflt");
+pub const kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: UInt32 = u32::from_be_bytes(*b"sflt");
+pub const kAudioDevicePropertyLatency: UInt32 = u32::from_be_bytes(*b"ltnc");
+pub const kAudioDevicePropertyStreams: UInt32 = u32::from_be_bytes(*b"stm#");
+pub const kAudioObjectPropertyControlList: UInt32 = u32::from_be_bytes(*b"ctrl");
+pub const kAudioDevicePropertySafetyOffset: UInt32 = u32::from_be_bytes(*b"saft");
+pub const kAudioDevicePropertyNominalSampleRate: UInt32 = u32::from_be_bytes(*b"nsrt");
+pub const kAudioDevicePropertyAvailableNominalSampleRates: UInt32 = u32::from_be_bytes(*b"nsr#");
+pub const kAudioDevicePropertyIsHidden: UInt32 = u32::from_be_bytes(*b"hidn");
+pub const kAudioDevicePropertyZeroTimeStampPeriod: UInt32 = u32::from_be_bytes(*b"ring");
+pub const kAudioDevicePropertyPreferredChannelsForStereo: UInt32 = u32::from_be_bytes(*b"dch2");
+pub const kAudioDevicePropertyPreferredChannelLayout: UInt32 = u32::from_be_bytes(*b"srnd");
+
+// Stream.
+pub const kAudioStreamPropertyDirection: UInt32 = u32::from_be_bytes(*b"sdir");
+pub const kAudioStreamPropertyTerminalType: UInt32 = u32::from_be_bytes(*b"term");
+pub const kAudioStreamPropertyStartingChannel: UInt32 = u32::from_be_bytes(*b"schn");
+pub const kAudioStreamPropertyIsActive: UInt32 = u32::from_be_bytes(*b"sact");
+pub const kAudioStreamPropertyVirtualFormat: UInt32 = u32::from_be_bytes(*b"sfmt");
+pub const kAudioStreamPropertyPhysicalFormat: UInt32 = u32::from_be_bytes(*b"pft ");
+pub const kAudioStreamPropertyAvailableVirtualFormats: UInt32 = u32::from_be_bytes(*b"sfma");
+pub const kAudioStreamPropertyAvailablePhysicalFormats: UInt32 = u32::from_be_bytes(*b"pfta");
+
+// Scopes + element.
 pub const kAudioObjectPropertyScopeGlobal: UInt32 = u32::from_be_bytes(*b"glob");
 pub const kAudioObjectPropertyScopeInput: UInt32 = u32::from_be_bytes(*b"inpt");
+pub const kAudioObjectPropertyScopeOutput: UInt32 = u32::from_be_bytes(*b"outp");
+pub const kAudioObjectPropertyElementMain: UInt32 = 0;
+
+// Values.
+pub const kAudioDeviceTransportTypeVirtual: UInt32 = u32::from_be_bytes(*b"virt");
+pub const kAudioStreamTerminalTypeMicrophone: UInt32 = u32::from_be_bytes(*b"micr");
 
 pub const kAudioHardwareNoError: OSStatus = 0;
 pub const kAudioHardwareBadObjectError: OSStatus = u32::from_be_bytes(*b"!obj") as OSStatus;
 pub const kAudioHardwareUnknownPropertyError: OSStatus = u32::from_be_bytes(*b"who?") as OSStatus;
 pub const kAudioHardwareIllegalOperationError: OSStatus = u32::from_be_bytes(*b"nope") as OSStatus;
+pub const kAudioHardwareBadPropertySizeError: OSStatus = u32::from_be_bytes(*b"!siz") as OSStatus;
 
 /// IO operation ids we care about (read-input).
 pub const kAudioServerPlugInIOOperationReadInput: UInt32 = u32::from_be_bytes(*b"read");
+
+/// `AudioValueRange` (<CoreAudio/CoreAudioTypes.h>).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AudioValueRange {
+    pub mMinimum: Float64,
+    pub mMaximum: Float64,
+}
+
+/// `AudioStreamRangedDescription` = a format plus its sample-rate range.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AudioStreamRangedDescription {
+    pub mFormat: AudioStreamBasicDescription,
+    pub mSampleRateRange: AudioValueRange,
+}
 
 // --- CoreFoundation: minimal CFString creation --------------------------
 //
