@@ -2680,6 +2680,68 @@ fn talker_loop(
     let now_mach = || MachTicks(unsafe { mach2::mach_time::mach_absolute_time() });
     let ns_since = |t: MachTicks| tb.ticks_to_ns(now_mach().ticks_since(t));
 
+    // ---- MSRP: advertise our stream so the 16R will accept it ---------------
+    //
+    // A listener does not accept a stream it has not been told about. SRP is
+    // how it learns: the talker declares a Talker Advertise ("I have a stream,
+    // here is its id, destination, VLAN and bandwidth"), the listener answers
+    // with Listener Ready, and only then is the path established. Our own
+    // listener path applies exactly this rule in reverse -- it refuses to
+    // declare Listener Ready until the 16R registers a Talker Advertise -- and
+    // the 16R holds us to the same contract.
+    //
+    // Without this the stream was transmitted into a void: the hardware
+    // session showed the 16R listing no input device at all, because nothing
+    // had ever announced one.
+    use avb_core::eth::EthFrame;
+    use avb_core::{Now, Outbox, RxMeta};
+    use avb_srp::attr::{Attribute, Talker, DEFAULT_DOMAIN, ETHERTYPE_MSRP, ETHERTYPE_MVRP};
+    use avb_srp::participant::{Participant, ParticipantConfig, SrpEvent};
+
+    let srp_cfg = ParticipantConfig {
+        mac: our_mac,
+        timebase: tb,
+        seed: u64::from_be_bytes(our_id.0),
+    };
+    // SRP timers add tick durations to `now.mach`, so SRP time MUST be raw
+    // mach ticks, not the ns the ACMP state machines use. Keep them distinct.
+    let srp_now = || Now::mach_only(now_mach());
+    let mut srp = Participant::new(srp_cfg, now_mach());
+    srp.declare(
+        now_mach(),
+        Attribute::Vid {
+            vid: DEFAULT_DOMAIN.vid,
+        },
+    );
+    srp.declare(now_mach(), Attribute::Domain(DEFAULT_DOMAIN));
+
+    // TSpec. `max_frame_size` is computed from the frame we actually transmit
+    // below (Ethernet header + VLAN tag + the AAF PDU) rather than guessed, so
+    // it cannot drift from the real stream. The rest follow 802.1Q-2018
+    // §35.2.2.8 for an SR class A talker: one frame per 125 us observation
+    // interval, priority from the SR class A domain, rank 1 (non-emergency).
+    // `accumulated_latency_ns` starts at 0 -- it is the latency accumulated
+    // ALONG THE PATH, which bridges add to as the advertise propagates, and we
+    // are cabled directly to the 16R with no bridge in between.
+    let stream_dst = stream_dest_mac(our_stream_id);
+    let advertise = talker_tspec(our_stream_id, talker.pdu_len());
+    let max_frame_size = advertise.max_frame_size;
+    srp.declare(now_mach(), Attribute::Talker(Talker::Advertise(advertise)));
+    log.log(
+        Level::Info,
+        "msrp",
+        &format!(
+            "Talker Advertise declared: stream 0x{:016x} dest {} vid {} max_frame {}B 1 frame/interval prio {}",
+            our_stream_id.0, stream_dst, DEFAULT_DOMAIN.vid, max_frame_size, DEFAULT_DOMAIN.priority
+        ),
+    );
+
+    let mut srp_out: Outbox<32> = Outbox::new();
+    // Whether the 16R has answered with Listener Ready for OUR stream. This is
+    // the acceptance signal: until it is true the 16R is not listening, and
+    // audio cannot arrive however many PDUs we send.
+    let mut listener_ready = false;
+
     // One PDU every `spf / rate` seconds (125 µs for 48 kHz / 6 spf).
     let pdu_interval_ns = (spf as u64)
         .saturating_mul(1_000_000_000)
@@ -2714,6 +2776,57 @@ fn talker_loop(
         if h.fault != 0 {
             log.log(Level::Error, "play", &format!("dext fault {}", h.fault));
             return Err(Exit::DextFault);
+        }
+
+        // ---- MSRP service ---------------------------------------------------
+        // MRP is a two-way protocol: the participant must see the peer's
+        // declarations to keep its own registered, and our Listener Ready
+        // arrives here. This loop was pure TX before, which is why MSRP could
+        // not simply be declared and forgotten.
+        for slot in dext.rx_ctl() {
+            let Ok(p) = EthFrame::parse(&slot.data) else {
+                continue;
+            };
+            if p.hdr.ethertype == ETHERTYPE_MSRP || p.hdr.ethertype == ETHERTYPE_MVRP {
+                let meta = RxMeta {
+                    desc_vlan_tci: slot.desc_vlan_tci,
+                    ..Default::default()
+                };
+                let _ = srp.handle_rx(srp_now(), &slot.data, meta);
+            }
+        }
+        while let Some(ev) = srp.pop_event() {
+            log.log(Level::Debug, "srp", &format!("event: {ev:?}"));
+            match ev {
+                // The 16R accepting our stream. Report it once: it is the
+                // difference between "transmitting" and "connected".
+                SrpEvent::ListenerRegistered { stream_id, .. }
+                    if stream_id.0 == our_stream_id.0 =>
+                {
+                    if !listener_ready {
+                        listener_ready = true;
+                        log.log(
+                            Level::Info,
+                            "msrp",
+                            "16R declared Listener Ready for our stream — accepted",
+                        );
+                    }
+                }
+                SrpEvent::ListenerWithdrawn { stream_id, .. } if stream_id.0 == our_stream_id.0 => {
+                    listener_ready = false;
+                    log.log(
+                        Level::Warn,
+                        "msrp",
+                        "16R withdrew Listener Ready for our stream",
+                    );
+                }
+                _ => {}
+            }
+        }
+        // Run the MRP timers and put whatever they produced on the wire.
+        srp.poll(srp_now(), &mut srp_out);
+        while let Some(f) = srp_out.pop() {
+            let _ = dext.send(f.bytes(), false, 0);
         }
 
         // Keep our ADP advertisement alive (valid_time is short) so the 16R
@@ -2801,10 +2914,19 @@ fn talker_loop(
         Level::Info,
         "play",
         &format!(
-            "talker done: {tx_pdus} PDUs sent, {underruns} underruns over {}s",
+            "talker done: {tx_pdus} PDUs sent, {underruns} underruns over {}s; 16R listener_ready={listener_ready}",
             run_ns / 1_000_000_000
         ),
     );
+    if !listener_ready {
+        // Say so rather than letting a clean exit imply success: every PDU
+        // went out, but nothing was listening.
+        log.log(
+            Level::Warn,
+            "msrp",
+            "16R never declared Listener Ready — it did not accept the stream, so no audio reached it",
+        );
+    }
     Ok(())
 }
 
@@ -2820,6 +2942,36 @@ fn talker_loop(
 fn stream_dest_mac(stream_id: avb_core::StreamId) -> avb_core::MacAddr {
     let uid = ((stream_id.0 & 0xFFFF) as u16).saturating_add(1);
     avb_core::MacAddr([0x91, 0xE0, 0xF0, 0x01, (uid >> 8) as u8, uid as u8])
+}
+
+/// The MSRP Talker Advertise TSpec for our stream (802.1Q-2018 §35.2.2.8).
+///
+/// Pure, so the values the 16R is asked to reserve against are testable rather
+/// than buried in the TX loop.
+///
+/// `max_frame_size` is DERIVED from the frame we actually transmit — Ethernet
+/// header + VLAN tag + the AAF PDU — so it cannot drift from the real stream if
+/// the format changes. An SR class A talker emits one frame per 125 µs
+/// observation interval, hence `max_interval_frames: 1`. Priority comes from the
+/// SR class A domain (the same PCP the frames are tagged with, so the
+/// reservation matches the traffic). `rank: true` is non-emergency.
+///
+/// `accumulated_latency_ns` is 0 at the talker: it accumulates ALONG THE PATH as
+/// bridges add their transit time while the advertise propagates, and we are
+/// cabled directly to the 16R with no bridge in between.
+fn talker_tspec(stream_id: avb_core::StreamId, pdu_len: usize) -> avb_srp::attr::TalkerAdvertise {
+    use avb_core::eth::{ETH_HDR_LEN, VLAN_TAG_LEN};
+    use avb_srp::attr::DEFAULT_DOMAIN;
+    avb_srp::attr::TalkerAdvertise {
+        stream_id,
+        dest_mac: stream_dest_mac(stream_id),
+        vlan_id: DEFAULT_DOMAIN.vid,
+        max_frame_size: (ETH_HDR_LEN + VLAN_TAG_LEN + pdu_len) as u16,
+        max_interval_frames: 1,
+        priority: DEFAULT_DOMAIN.priority,
+        rank: true,
+        accumulated_latency_ns: 0,
+    }
 }
 
 /// Advertise OUR entity as a talker (ADP ENTITY_AVAILABLE) so the 16R has us
@@ -3074,6 +3226,37 @@ fn connect_rx_pdu(
 mod talker_tests {
     use super::*;
     use avb_core::{Eui64, MacAddr, StreamId};
+
+    /// The TSpec the 16R reserves against must describe the stream we actually
+    /// send, and must match the frames' own VLAN priority — otherwise the
+    /// reservation and the traffic disagree and the listener can refuse.
+    #[test]
+    fn talker_tspec_describes_the_real_stream() {
+        let mac = MacAddr([0x64, 0x4b, 0xf0, 0x12, 0x73, 0xb8]);
+        let sid = StreamId::from_parts(mac, 0);
+        // The Milan 48 kHz / 6 spf / 8 ch / 32-bit PDU: 24 B AAF header + 192 B.
+        let pdu_len = 24 + 192;
+        let t = talker_tspec(sid, pdu_len);
+
+        // Ethernet header (14) + VLAN tag (4) + PDU — derived, not guessed.
+        assert_eq!(t.max_frame_size, (14 + 4 + pdu_len) as u16);
+        assert_eq!(t.max_frame_size, 234);
+        // One frame per class-A observation interval.
+        assert_eq!(t.max_interval_frames, 1);
+        // Same PCP the frames are tagged with, and the SR class A VID.
+        assert_eq!(t.priority, avb_srp::attr::DEFAULT_DOMAIN.priority);
+        assert_eq!(t.vlan_id, avb_srp::attr::DEFAULT_DOMAIN.vid);
+        assert!(t.rank, "non-emergency");
+        // Path latency accumulates in bridges; a directly-cabled talker starts
+        // at zero.
+        assert_eq!(t.accumulated_latency_ns, 0);
+        // The advertise must name the same destination the frames are sent to,
+        // or the 16R reserves a path for an address we never use.
+        assert_eq!(t.dest_mac, stream_dest_mac(sid));
+        assert_eq!(t.stream_id.0, sid.0);
+        // And that destination must stay out of the AVDECC control block.
+        assert_ne!(t.dest_mac.octets()[3], 0x00);
+    }
 
     #[test]
     fn connect_rx_names_the_16r_as_listener_and_us_by_eui64() {
