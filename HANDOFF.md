@@ -18,7 +18,7 @@ Read this file first, then `AGENTS.md` (rules) and the docs it points to.
 | 002 | `avb-core`, `avb-dext` (ABI mirror, shm consumer), probe `counters` | done | `b002a39` |
 | 003 | `avb-gptp` (slave-only 802.1AS, servo), `avb-srp` (MRP/MSRP/MVRP) | done | `ffb83e3` |
 | 004 | `avb-avtp` (AAF, stream format) + `avb-avdecc` (ADP/AECP/ACMP, controller, listener entity, ListenerSm) | done | `802891b` |
-| 005 | `avb-mediaclock`, `avb-audioring`, `avb-daemon` (`record` CLI), packaging | pending | |
+| 005 | `avb-mediaclock`, `avb-audioring`, `avb-daemon` (`record` CLI), packaging | done | `a631a82` |
 
 After FEAT-005 the plan is:
 - An implement-and-review loop over the whole diff. The reviewer always runs last and gates the loop.
@@ -31,29 +31,54 @@ After FEAT-005 the plan is:
 
 Phase 1b (next) covers three things. The first is a Rust Core Audio AudioServerPlugIn, an input-only device fed from the audio ring. The second is a small macOS app showing status and a sample-rate selector driven by the 16R's AEM. Rate changes go through the daemon, then AVDECC, then `RequestDeviceConfigurationChange`. The third is validation in Reaper, then Pro Tools. The feasibility report covers the model under "Sample rates".
 
-### FEAT-005 resume point
+### Resume point: all code FEATs done; review loop + hardware next
 
-FEAT-004 is done (commit `802891b`). `avb-avtp` and `avb-avdecc` are in the workspace `members`, tested and clippy-clean. The AS-7 ACQUIRE_ENTITY / ENTITY GET_COUNTERS decisions (both NOT_IMPLEMENTED, Milan v1.2) are recorded in `.agents/tasks/phase1a-impl-verification.md`.
+FEAT-001…FEAT-005 are all **done** on `phase1a-listener` (latest `a631a82`). The
+whole Rust workspace (11 crates) and the C++ dext tests build and pass; the
+packaged `avb-daemon` is signed with `packaging/daemon.entitlements` (I210
+only) and `--help` lists all six subcommands. AS-7 decisions and every FEAT's
+deviations are recorded in `.agents/tasks/phase1a-impl-verification.md`.
 
-Next is `FEAT-005` from `.agents/tasks/task-phase1a-listener/features/FEAT-005.json`:
-- `avb-mediaclock` (2nd-order DLL, reference stream, lock SM, placement, stats).
-- `avb-audioring` (repr(C) header, Producer/Consumer SPSC, ClockModel seqlock).
-- `avb-daemon` (clap CLI, stack wiring, `DextPort` trait + `FakeDext`, `record` CLI, WAV/RF64, exit codes).
-- Packaging updates and the full-stack pipeline test (§14.1 avb-daemon row).
+What is left in Phase 1a (needs no more green-field coding):
 
-After FEAT-005: the implement-and-review loop over the whole diff (reviewer gates), then the four hardware milestones (§4): hw-gptp, hw-avdecc, hw-streams, hw-audio.
+1. **Implement-and-review loop over the whole diff.** The reviewer runs last
+   and gates the loop (plan). This is the next step a fresh session should take:
+   review the full `phase1a-listener` diff against the design and fix findings
+   until the reviewer approves.
+2. **Four hardware milestones, in order (§4).** These REQUIRE the user: they
+   run against the real 16R/I210 and may need a replug or boot-security steps
+   (AGENTS.md — ask before any physical action or NVRAM/SIP/dext-approval
+   change). The ABI v3 dext from FEAT-001 has **not** been activated on
+   hardware yet; `avb-installer activate` + an `ioreg`/kernelmanagerd check come
+   first.
+   - hw-gptp: lock to the 16R as GM ≥ 5 min, asCapable true.
+   - hw-avdecc: `avb-daemon aem-dump` → the full AEM JSON.
+   - hw-streams: bind all STREAM_OUTPUTs, confirm 8000 pkt/s per stream.
+   - hw-audio: a 600 s multichannel WAV, no sequence gaps, media-clock drift in
+     ppm. Pause and ask the user to feed signal into specific 16R inputs for the
+     channel-map check.
+3. `docs/phase1a-results.md` from the milestone runs.
 
-## Verified at handoff
+The ctl/audio/rec threads (§5.1) and the full `run`/`record` loops are wired
+during the hardware milestones; the daemon binary carries a documented
+crate-level `#![allow(dead_code)]` until then (see the FEAT-005 deviations).
 
-This was run on the `phase1a-listener` HEAD at the FEAT-004 commit (`802891b`):
+## Verified at the FEAT-005 commit (`a631a82`)
+
 - `cargo fmt --all --check`: clean.
-- `cargo test --workspace --locked`: all pass. That covers core 22, dext 28, gptp 59, probe 16, srp 30, **avtp 11 and avdecc 87**.
+- `cargo test --workspace --locked`: all pass — core 22, dext 28, gptp 59,
+  srp 30, avtp 11, avdecc 87, mediaclock 26, audioring 10, daemon 27 (incl. the
+  48 kHz/96 kHz pipeline tests with the 0-allocation assertion), probe 16.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
 - C++ host tests: 341 i210 checks and 97 tg3 checks pass.
 - `xcodebuild … AVBI210Driver`: BUILD SUCCEEDED, 0 compiler warnings.
-- `scripts/package.sh --adhoc`: both dexts + Rust release built, package assembled and ad-hoc signed (CFBundleVersion 283.0.1).
+- `scripts/package.sh --adhoc`: both dexts + Rust release built, package
+  assembled and ad-hoc signed; `avb-daemon` signed with `daemon.entitlements`.
 
-Note: `package.sh` needs `cargo` on `PATH` for its Rust step. In this environment `~/.cargo/bin` is not on the default subprocess `PATH`, so prefix the command with `PATH="$HOME/.cargo/bin:$PATH"` (and `cargo` itself with `/Users/dexter/.cargo/bin/cargo`).
+Note: `package.sh` needs `cargo` on `PATH` for its Rust step. In this
+environment `~/.cargo/bin` is not on the default subprocess `PATH`, so prefix
+the command with `PATH="$HOME/.cargo/bin:$PATH"` (and invoke `cargo` as
+`/Users/dexter/.cargo/bin/cargo`).
 
 ## Gate commands
 
