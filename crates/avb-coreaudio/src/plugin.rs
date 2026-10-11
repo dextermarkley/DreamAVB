@@ -657,20 +657,6 @@ pub extern "C" fn do_io_operation(
     io_main_buffer: *mut c_void,
     _secondary: *mut c_void,
 ) -> OSStatus {
-    // Only the input-read operation fills our buffer; ignore the rest.
-    {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        if n < 20 {
-            oslog(&format!(
-                "[avb-coreaudio] DoIO op={} frames={} main_null={}",
-                fourcc(operation_id),
-                io_buffer_frame_size,
-                io_main_buffer.is_null()
-            ));
-        }
-    }
     if operation_id != kAudioServerPlugInIOOperationReadInput || io_main_buffer.is_null() {
         return kAudioHardwareNoError;
     }
@@ -682,19 +668,46 @@ pub extern "C" fn do_io_operation(
     let out = unsafe { std::slice::from_raw_parts_mut(io_main_buffer as *mut u8, total_bytes) };
 
     let mut filled = 0usize;
+    // 1-Hz throttle so the log reflects the LIVE cycle, not just the first N
+    // cycles (a capped counter hides current state behind ancient history).
+    let log_now = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let prev = LAST.load(Ordering::Relaxed);
+        if now != prev {
+            LAST.store(now, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    };
     if let Ok(mut guard) = IO.lock() {
         // Lazy attach-retry: StartIO may have run before the daemon created
         // the ring file, and attach is otherwise one-shot. Retry here so we
         // pick it up whenever the daemon appears — regardless of start order.
         if guard.is_none() {
-            if let Ok(shm) = ShmRing::attach() {
-                // Start a small margin BEHIND the write frontier so the first
-                // reads have committed data (avoids immediate underrun) while
-                // keeping latency low. ~2048 frames ≈ 43 ms at 48 kHz.
-                let w = Consumer::new(shm.ring()).write_frame();
-                let read_frame = w.saturating_sub(2048);
-                *guard = Some(IoState { shm, read_frame });
-                oslog("[avb-coreaudio] IO: attached ring (lazy retry in DoIO)");
+            match ShmRing::attach() {
+                Ok(shm) => {
+                    // Start a small margin BEHIND the write frontier so the
+                    // first reads have committed data (avoids immediate
+                    // underrun) while keeping latency low. ~2048 fr ≈ 43 ms.
+                    let w = Consumer::new(shm.ring()).write_frame();
+                    let read_frame = w.saturating_sub(2048);
+                    *guard = Some(IoState { shm, read_frame });
+                    oslog("[avb-coreaudio] IO: attached ring (lazy retry in DoIO)");
+                }
+                Err(e) => {
+                    if log_now {
+                        let errno = std::io::Error::last_os_error();
+                        oslog(&format!(
+                            "[avb-coreaudio] DoIO attach FAILED: {e:?} errno={errno}"
+                        ));
+                    }
+                }
             }
         }
         if let Some(state) = guard.as_mut() {
@@ -709,16 +722,12 @@ pub extern "C" fn do_io_operation(
             let got = consumer.read_into(out, want);
             filled = got * frame_bytes;
             state.read_frame = consumer.read_frame();
-            {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static M: AtomicU32 = AtomicU32::new(0);
-                let m = M.fetch_add(1, Ordering::Relaxed);
-                if m < 20 {
-                    oslog(&format!(
-                        "[avb-coreaudio] read got={got} want={want} avail={avail} cursor={}",
-                        state.read_frame
-                    ));
-                }
+            if log_now {
+                oslog(&format!(
+                    "[avb-coreaudio] read got={got} want={want} avail={avail} write={} cursor={}",
+                    consumer.write_frame(),
+                    state.read_frame
+                ));
             }
         }
     }
