@@ -59,6 +59,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "avb-audioring"
+version = "0.1.0"
+dependencies = [
+ "avb-core",
+ "libc",
+]
+
+[[package]]
 name = "avb-avdecc"
 version = "0.1.0"
 dependencies = [
@@ -78,6 +86,26 @@ dependencies = [
 [[package]]
 name = "avb-core"
 version = "0.1.0"
+
+[[package]]
+name = "avb-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "avb-audioring",
+ "avb-avdecc",
+ "avb-avtp",
+ "avb-core",
+ "avb-dext",
+ "avb-gptp",
+ "avb-mediaclock",
+ "avb-srp",
+ "clap",
+ "libc",
+ "mach2 0.7.0",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "avb-dext"
@@ -107,6 +135,14 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-system-extensions",
+]
+
+[[package]]
+name = "avb-mediaclock"
+version = "0.1.0"
+dependencies = [
+ "avb-core",
+ "serde",
 ]
 
 [[package]]

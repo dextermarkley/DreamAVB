@@ -1,0 +1,15 @@
+[package]
+name = "avb-audioring"
+description = "Recovered-audio ring ABI v1: position-independent 16 KiB header, SPSC Producer/Consumer, clock-block seqlock (phase1a §10.6)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "avb_audioring"
+path = "src/lib.rs"
+
+[dependencies]
+avb-core = { path = "../avb-core" }
+libc = "=0.2.190"

@@ -86,6 +86,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Library/SystemExtensions"
 cp "$ROOT/packaging/Installer-Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/target/release/avb-installer" "$APP/Contents/MacOS/avb-installer"
 cp "$ROOT/target/release/avb-probe" "$APP/Contents/MacOS/avb-probe"
+cp "$ROOT/target/release/avb-daemon" "$APP/Contents/MacOS/avb-daemon"
 DEXT="$APP/Contents/Library/SystemExtensions/$DEXT_ID.dext"
 cp -R "$DEXT_BUILT" "$DEXT"
 
@@ -106,6 +107,7 @@ echo "dext executable archs: $ARCHS"
 
 for p in "$APP/Contents/Info.plist" "$DEXT/Info.plist" \
          "$ROOT/packaging/installer.entitlements" "$ROOT/packaging/probe.entitlements" \
+         "$ROOT/packaging/daemon.entitlements" \
          "$DEXT_ENT"; do
     /usr/bin/plutil -lint "$p"
 done
@@ -116,11 +118,13 @@ echo "== sign (inside-out)"
 /usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none -o runtime \
     --entitlements "$ROOT/packaging/probe.entitlements" "$APP/Contents/MacOS/avb-probe"
 /usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none -o runtime \
+    --entitlements "$ROOT/packaging/daemon.entitlements" "$APP/Contents/MacOS/avb-daemon"
+/usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none -o runtime \
     --entitlements "$ROOT/packaging/installer.entitlements" "$APP"
 
 echo "== verify"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
-for item in "$DEXT" "$APP/Contents/MacOS/avb-probe" "$APP"; do
+for item in "$DEXT" "$APP/Contents/MacOS/avb-probe" "$APP/Contents/MacOS/avb-daemon" "$APP"; do
     echo "-- entitlements: $item"
     /usr/bin/codesign -d --entitlements - "$item"
 done

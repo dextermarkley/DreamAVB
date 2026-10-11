@@ -271,3 +271,107 @@ the responder's shape.
    UTF-8 with lossy fallback; `write_name` truncates to 64 bytes on a char
    boundary (the derived STREAM_INPUT "→Mac …" names are truncated the same way
    in `derive`).
+
+## FEAT-005: avb-mediaclock, avb-audioring, avb-daemon and packaging
+
+Three crates (two sans-IO libraries plus the daemon binary) and the daemon
+packaging (design §5, §10.3–§10.6, §11, §13, §6.5).
+
+Gate (all green):
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo test --workspace --locked`: avb-mediaclock 26, avb-audioring 10,
+  avb-daemon 27 (incl. the 48 kHz and 96 kHz pipeline tests), plus the
+  unchanged core 22 / dext 28 / gptp 59 / srp 30 / avtp 11 / avdecc 87 / probe
+  16.
+- C++ host tests: tg3 97, i210 341.
+- `scripts/package.sh --adhoc`: both dexts + the Rust release built, the
+  package assembled and ad-hoc signed (CFBundleVersion 283.0.31), and
+  `AVBInstaller.app/Contents/MacOS/avb-daemon` signed with
+  `packaging/daemon.entitlements` (printed in the verify loop).
+- `avb-daemon --help` lists `run`, `aem-dump`, `gptp`, `streams`, `record`,
+  `capture`. The packaged binary's entitlements contain exactly
+  `com.avbaudio.installer.i210` (no BCM).
+
+### avb-mediaclock (§10.3–§10.5)
+
+- `constants`: rate-derived `RateConsts`. The 48 kHz/6 spf and 96 kHz/12 spf
+  values match §10.5 exactly (8000 lock packets, 192/384 lag frames, 65 536/
+  131 072 capacity, 8 publish packets, 125 µs period).
+- `dll`: the 2nd-order DLL (B = 1 Hz, b = √2·ω, c = ω²), k-packet advance,
+  60 s epoch rebase. Tests: nominal tracking, +100 ppm convergence, ns
+  quantization, gap handling, reset, rebase.
+- `recovery`: the lock SM (|e| < 1 µs for `lock_packets` → LOCKED; 8× |e| >
+  10 µs, mr toggle or > 10 ms gap → UNLOCKED), reference-switch counting.
+- `placement`: `n = n0 + round((pt − t0)/T)`, `early_bound = max(ta, 2 ms) +
+  125 µs`, late/early classification, 32→64 pt extension.
+- `stats`: 10 s windows, ppm vs nominal, sd across windows, RMS jitter, the
+  MCR-5 verdict (pass / finding / not-applicable).
+- `lib`: the `MediaClock` orchestrator and the published `ClockModel`.
+
+### avb-audioring (§10.6)
+
+- `layout`: the position-independent 16 384-byte header; every field offset in
+  the §10.6 table is pinned (channel_map ends 10 240, streams end 2 048, gap
+  log ends 14 344 ≤ 16 384); magic `AVAR` / version 1.
+- `ring`: `new_anonymous` (the one `libc::mmap` call) and `from_raw`
+  (magic/version/size validation), atomic header accessors, and the clock-block
+  seqlock (the avb-core protocol over the shared fields). Concurrent-reader
+  test asserts no torn reads.
+- `producer`: placement writes (INT_32BIT verbatim big-endian, INT_24BIT
+  `i32 << 8`, both MSB-aligned), zero-fill up to the frontier, the frontier
+  commit with the lagging-stream and all-silent rules, the gap log, overrun
+  counting; never blocks.
+- `consumer`: committed-frame reads with overrun skip and underrun counting.
+- An SPSC stress test runs a 50 000-packet producer against a consumer and
+  verifies in-order, non-torn frames.
+
+### avb-daemon (§5, §11, §13)
+
+- `exit`: the §11.4 codes, pinned.
+- `log`: the `avb-daemon[<subsys>]:` prefix and the per-key 10 s rate limit.
+- `dextio`: the `DextPort` trait (the IOKit boundary) and `FakeDext` (heap
+  rings, scripted peer, simulated clock) used by every daemon test.
+- `txsched`: the three outboxes (gPTP 8 / MRP 16 / AVDECC 40), strict priority,
+  the held-`want_ts` rule (does not block a lower non-timestamped frame), the
+  pending-step block, Busy/NoResources keep-at-head retry, and the per-class
+  full-drop counters. Tests cover each (including the 41st AVDECC push → TxFull
+  and the Pdelay_Resp-next-with-AVDECC-full case).
+- `wav`: the 104-byte WAVE_FORMAT_EXTENSIBLE header and the RF64 `ds64` switch
+  at the 4 GiB boundary, both byte-exact (golden tests; the RF64 case is
+  computed, not written).
+- `pcap`: the nanosecond pcap global + record headers (magic `0xA1B23C4D`).
+- `audio`: the per-packet pipeline (AAF parse → §10.2 checks → sequence/mr/tv
+  handling → media clock on the reference → placement) with per-stream atomic
+  counters; nothing on this path allocates or logs.
+- `validate`: §13.2 input validation (talker id, timeouts, seconds, out-path
+  writability, `statvfs` disk check) mapped to the exit codes.
+- `realdext` / `stack`: the production `DextPort` over `avb-dext` and the §5.2
+  bring-up (open → GetInfo/ABI → RingAttach → InitDatapath → link wait) with
+  the documented exit-code contract, plus SIGINT/SIGTERM via `libc::sigaction`.
+- `main`: the clap CLI for all six subcommands.
+- The **48 kHz/6 spf 3×4-ch** and **96 kHz/12 spf 2×6-ch** pipeline tests feed
+  generated AAF frames (with a gap, a late and a reordered packet) through
+  `audio → ring → consumer → WAV bytes` under a counting global allocator and
+  assert **0 allocations in the per-packet function** (acceptance criterion 2).
+
+### Deviations
+
+1. The ctl/audio/rec threads (§5.1) and the full `run`/`record` loops are
+   wired at the hardware milestones (hw-gptp … hw-audio, §14.3). The daemon's
+   data-path building blocks (`audio`, `txsched`, `wav`, `pcap`, `report`, the
+   `DextPort` consumers and the extra exit codes) are therefore reached only
+   from the hardware loop and the tests today, so the binary carries a
+   documented crate-level `#![allow(dead_code)]`. Every item is exercised now
+   by the unit tests and the two pipeline tests; the lint would otherwise fire
+   on the test-only call sites because `clippy --all-targets` type-checks the
+   binary without `cfg(test)`.
+2. `RealDext::read_clock` returns the midpoint of the dext's `mach_before`/
+   `mach_after` bracket as the mach instant of `eav_ns`; the bracket width is
+   the SYSTIM-read latency and the midpoint is its best single estimate.
+3. The ring producer treats a `&self` → `&mut [u8]` on the data region as sound
+   (an `#[allow(clippy::mut_from_ref)]` with a safety note) because exactly one
+   `Producer` ever writes it (SPSC, §10.6).
+4. `AudioRing` is `unsafe impl Send + Sync`: all header access is atomic and the
+   data region is single-producer / single-consumer, so sharing the `&AudioRing`
+   across the audio and rec threads is sound.

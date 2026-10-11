@@ -1,0 +1,15 @@
+[package]
+name = "avb-mediaclock"
+description = "Sans-IO media-clock recovery: 2nd-order DLL, reference stream, lock SM, placement, 10 s window stats (phase1a §10.3-§10.5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "avb_mediaclock"
+path = "src/lib.rs"
+
+[dependencies]
+avb-core = { path = "../avb-core" }
+serde = { version = "=1.0.229", features = ["derive"] }

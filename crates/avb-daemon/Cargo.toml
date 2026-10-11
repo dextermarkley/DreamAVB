@@ -1,0 +1,27 @@
+[package]
+name = "avb-daemon"
+description = "The AVB listener daemon: dext I/O, TX scheduler, media path, record (WAV/RF64), reports (phase1a §5, §11, §13)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "avb-daemon"
+path = "src/main.rs"
+
+[dependencies]
+avb-core = { path = "../avb-core" }
+avb-dext = { path = "../avb-dext" }
+avb-gptp = { path = "../avb-gptp" }
+avb-srp = { path = "../avb-srp" }
+avb-avtp = { path = "../avb-avtp" }
+avb-avdecc = { path = "../avb-avdecc" }
+avb-mediaclock = { path = "../avb-mediaclock" }
+avb-audioring = { path = "../avb-audioring" }
+anyhow = "=1.0.104"
+clap = { version = "=4.6.7", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+mach2 = "=0.7.0"
+libc = "=0.2.190"
