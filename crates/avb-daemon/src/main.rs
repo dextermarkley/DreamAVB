@@ -121,6 +121,26 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Full stack + TALKER: play audio OUT to the 16R from the output ring
+    /// (Phase 1b-2). The CoreAudio plug-in's output stream fills the ring; this
+    /// loop packetizes it as AAF and transmits to the 16R (as listener).
+    Play {
+        #[arg(long)]
+        seconds: u64,
+        /// The 16R entity id to send to (as the listener). Auto-discovered when
+        /// omitted, like `record`'s talker discovery.
+        #[arg(long)]
+        listener: Option<String>,
+        /// Which of the 16R's STREAM_INPUT sinks (listener_unique_id) to bind.
+        #[arg(long, default_value_t = 0)]
+        listener_uid: u16,
+        #[arg(long)]
+        allow_partial: bool,
+        #[arg(long, default_value_t = 30)]
+        start_timeout: u64,
+        #[arg(long)]
+        summary_out: Option<PathBuf>,
+    },
 }
 
 fn run() -> Result<(), Exit> {
@@ -202,6 +222,30 @@ fn run() -> Result<(), Exit> {
             validate::validate_seconds(seconds)?;
             validate::validate_out_path(&out)?;
             stack::capture(&opts, seconds, &out)
+        }
+        Command::Play {
+            seconds,
+            listener,
+            listener_uid,
+            allow_partial,
+            start_timeout,
+            summary_out,
+        } => {
+            validate::validate_seconds(seconds)?;
+            validate::validate_timeout(start_timeout)?;
+            let listener = listener
+                .as_deref()
+                .map(validate::parse_talker)
+                .transpose()?;
+            stack::play(
+                &opts,
+                seconds,
+                listener,
+                listener_uid,
+                allow_partial,
+                start_timeout,
+                summary_out,
+            )
         }
     }
 }

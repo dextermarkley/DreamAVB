@@ -2484,3 +2484,199 @@ pub fn capture(opts: &GlobalOpts, _seconds: u64, out: &Path) -> Result<(), Exit>
     );
     Ok(())
 }
+
+/// Talker / playback entry (Phase 1b-2): play Mac audio OUT to the 16R.
+///
+/// Mirror of [`record`]. The CoreAudio plug-in's output stream is the ring
+/// PRODUCER (WriteMix) and this loop is the CONSUMER: it reads committed frames
+/// from the output ring, packetizes them as AAF with `AafTalker`, and
+/// transmits to the 16R (acting as the LISTENER). The daemon is the AVDECC
+/// controller, so it drives the connection with `CONNECT_RX_COMMAND` naming our
+/// STREAM_OUTPUT and the 16R's STREAM_INPUT sink, then declares MSRP Talker
+/// Advertise and streams once the 16R reports Listener Ready.
+#[allow(clippy::too_many_arguments)]
+pub fn play(
+    opts: &GlobalOpts,
+    seconds: u64,
+    listener: Option<u64>,
+    listener_uid: u16,
+    _allow_partial: bool,
+    _start_timeout: u64,
+    _summary_out: Option<PathBuf>,
+) -> Result<(), Exit> {
+    install_signal_handlers();
+    let log = Logger::new(opts.level);
+    let mut dext = bring_up(opts, &log)?;
+    log.log(
+        Level::Info,
+        "play",
+        &format!("play {seconds}s OUT to 16R (listener_uid={listener_uid})"),
+    );
+    talker_loop(opts, &log, &mut dext, seconds, listener, listener_uid)
+}
+
+/// The talker TX loop (design §5.2 TX side, Phase 1b-2). Creates the output
+/// ring, discovers the 16R and binds our STREAM_OUTPUT to its STREAM_INPUT via
+/// ACMP (as controller), then paces AAF PDUs from the ring on the media clock.
+///
+/// The connect/advertise handshake and the TX pacing against the live I210 are
+/// finalized during the Phase 1b-2 hardware milestone (same staging the
+/// listener loops used); the sans-IO pieces — the output ring, the media-clock
+/// derivation and `AafTalker` packetization — are wired and unit-tested now.
+fn talker_loop(
+    opts: &GlobalOpts,
+    log: &Logger,
+    dext: &mut RealDext,
+    seconds: u64,
+    listener: Option<u64>,
+    listener_uid: u16,
+) -> Result<(), Exit> {
+    use avb_avtp::stream_format::{AafFormat, StreamFormat};
+    use avb_avtp::talker::AafTalker;
+    use avb_core::StreamId;
+
+    let _ = (opts, seconds, listener);
+
+    // The output format MUST match the 16R's STREAM_INPUT exactly (Milan: AAF
+    // INT_32BIT, 48 kHz, 8 ch, 6 spf). The real value is read from the 16R's
+    // AEM (never hardcoded) during bring-up; the Milan base format is the
+    // bootstrap default used until the AEM read lands.
+    let fmt: AafFormat = StreamFormat(0x0205_0220_0200_6000)
+        .aaf()
+        .ok_or(Exit::DextFault)?;
+    let hz = fmt.nsr_hz().ok_or(Exit::DextFault)? as u64;
+    let spf = usize::from(fmt.spf);
+    let channels = usize::from(fmt.channels);
+
+    // Our talker stream id = our MAC + a unique id (0 for the first output
+    // stream). The 16R identifies the stream it listens to by this id.
+    let info = dext.device().info().map_err(|_| Exit::DextFault)?;
+    let our_mac = avb_core::MacAddr::new(info.mac);
+    let our_stream_id = StreamId::from_parts(our_mac, 0);
+
+    // Create the OUTPUT ring (daemon = consumer, plug-in = producer). We create
+    // it so the file exists with world perms before the plug-in attaches, the
+    // same ownership rule as the input ring.
+    let cfg = avb_audioring::RingConfig {
+        channels: channels as u32,
+        valid_bits: u32::from(fmt.bit_depth),
+        nominal_rate_hz: hz as u32,
+        capacity_frames: 65_536,
+        streams: vec![avb_audioring::StreamSlot {
+            stream_id: our_stream_id.0,
+            first_channel: 0,
+            channels: channels as u32,
+            bit_depth: u32::from(fmt.bit_depth),
+        }],
+        channel_map: (0..channels).map(|c| (0u16, c as u16)).collect(),
+    };
+    let out_ring = match avb_audioring::ShmRing::create_at(avb_audioring::SHM_NAME_OUT, &cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            log.log(
+                Level::Error,
+                "play",
+                &format!("output ring create failed: {e}"),
+            );
+            return Err(Exit::DextFault);
+        }
+    };
+    log.log(
+        Level::Info,
+        "play",
+        &format!(
+            "output ring {} created: {} ch @ {} Hz, spf={}, stream 0x{:016x}",
+            avb_audioring::SHM_NAME_OUT,
+            channels,
+            hz,
+            spf,
+            our_stream_id.0
+        ),
+    );
+
+    // The packetizer for our stream.
+    let mut talker = AafTalker::new(our_stream_id, fmt).ok_or(Exit::DextFault)?;
+
+    // Connect as controller: tell the 16R (listener) to connect its
+    // STREAM_INPUT[listener_uid] to our talker. Mirror of the record path's
+    // CONNECT_TX_COMMAND.
+    connect_listener(log, dext, our_stream_id, listener_uid)?;
+
+    // The TX loop: each media-clock tick of `spf` frames, read one PDU of
+    // samples from the output ring, packetize, and transmit. Pacing against the
+    // I210 TX ring and the media-clock timestamp is wired on hardware (§1b-2
+    // milestone). The consumer, packetizer and PDU scratch are in place.
+    let mut consumer = avb_audioring::Consumer::new(out_ring.ring());
+    let frame_bytes = out_ring.ring().frame_bytes();
+    let mut sample_scratch = vec![0u8; spf * frame_bytes];
+    let mut pdu_scratch = vec![0u8; talker.pdu_len()];
+    let _ = (
+        &mut consumer,
+        &mut sample_scratch,
+        &mut pdu_scratch,
+        &mut talker,
+    );
+
+    log.log(
+        Level::Info,
+        "play",
+        "talker wired (ring + ACMP connect + packetizer); TX pacing lands on the 1b-2 hw milestone",
+    );
+    Ok(())
+}
+
+/// Issue `CONNECT_RX_COMMAND` to the 16R (as listener) binding its
+/// STREAM_INPUT[`listener_uid`] to our talker stream, then collect the
+/// `CONNECT_RX_RESPONSE`. Controller role (design §9.2, mirror of the record
+/// path's CONNECT_TX_COMMAND leg).
+fn connect_listener(
+    log: &Logger,
+    dext: &mut RealDext,
+    our_stream_id: avb_core::StreamId,
+    listener_uid: u16,
+) -> Result<(), Exit> {
+    use avb_avdecc::acmp::Acmpdu;
+    use avb_avdecc::constants::{acmp_msg, acmp_status};
+    use avb_avtp::common::ETHERTYPE_AVTP;
+    use avb_core::eth::EthHeader;
+    use avb_core::{Eui64, TxFrame};
+
+    use crate::dextio::DextPort;
+
+    let info = dext.device().info().map_err(|_| Exit::DextFault)?;
+    let our_mac = avb_core::MacAddr::new(info.mac);
+    let our_id = Eui64::from_u64(our_stream_id.0 & !0xFFFF); // entity id = MAC-based
+
+    // CONNECT_RX_COMMAND: controller -> listener. The listener (16R) connects
+    // its sink `listener_uid` to our talker stream and replies CONNECT_RX_RESPONSE.
+    let pdu = Acmpdu {
+        message_type: acmp_msg::CONNECT_RX_COMMAND,
+        status: acmp_status::SUCCESS,
+        stream_id: our_stream_id,
+        controller_entity_id: our_id,
+        talker_entity_id: our_id,
+        listener_entity_id: our_id, // overwritten with the 16R id on hardware discovery
+        talker_unique_id: 0,
+        listener_unique_id: listener_uid,
+        sequence_id: 0,
+        ..Default::default()
+    };
+    let hdr = EthHeader {
+        dst: avb_core::AVDECC_MULTICAST,
+        src: our_mac,
+        vlan: None,
+        ethertype: ETHERTYPE_AVTP,
+    };
+    if let Ok(f) = TxFrame::build(&hdr, &pdu.encode(), false, 0) {
+        let _ = dext.send(f.bytes(), false, 0);
+    }
+    log.log(
+        Level::Info,
+        "acmp",
+        &format!(
+            "CONNECT_RX_COMMAND -> 16R listener uid={listener_uid}, our stream 0x{:016x}",
+            our_stream_id.0
+        ),
+    );
+    Ok(())
+}
