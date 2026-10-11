@@ -11,8 +11,9 @@
 //!     └─ owns device (id 3)
 //!           └─ owns input stream (id 4)
 //!
-//! The device is an 8-ch 48 kHz 32-bit signed-integer input. The IO path
-//! returns silence until the recovered-audio ring is wired (Phase 1b-1).
+//! The device is an 8-ch 48 kHz Float32 input (CoreAudio's native sample
+//! format). The IO path converts the recovered-audio ring's S32 samples to
+//! f32 on delivery (Phase 1b-1).
 
 #![allow(non_snake_case)]
 
@@ -57,12 +58,22 @@ unsafe fn put<T: Copy>(
     kAudioHardwareNoError
 }
 
-/// Build the device's ASBD for a given rate (interleaved signed 32-bit PCM).
+/// Build the device's ASBD for a given rate (interleaved 32-bit float PCM).
+///
+/// The modern CoreAudio AudioServerPlugIn model expects **Float32** samples
+/// (±1.0 full scale), not integer — this is what BlackHole and every stock
+/// HAL input device advertise. We advertise float here and convert the ring's
+/// S32 samples to f32 in the ReadInput delivery path (`do_io_operation`).
+/// Advertising integer while handing CoreAudio integer bytes made CoreAudio
+/// reinterpret them as float, collapsing every sample to 0 or full-scale
+/// (the 0x800000 garble seen in Reaper).
 fn device_asbd(rate: f64) -> AudioStreamBasicDescription {
     AudioStreamBasicDescription {
         mSampleRate: rate,
         mFormatID: kAudioFormatLinearPCM,
-        mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+        mFormatFlags: kAudioFormatFlagIsFloat
+            | kAudioFormatFlagsNativeEndian
+            | kAudioFormatFlagIsPacked,
         mBytesPerPacket: DEVICE_CHANNELS * 4,
         mFramesPerPacket: 1,
         mBytesPerFrame: DEVICE_CHANNELS * 4,
@@ -688,7 +699,10 @@ pub extern "C" fn do_io_operation(
     }
     let frame_bytes = (DEVICE_CHANNELS * 4) as usize;
     let total_bytes = io_buffer_frame_size as usize * frame_bytes;
-    // The HAL buffer is interleaved S32LE, exactly our ring frame layout.
+    // The HAL buffer is interleaved Float32 (device ASBD = float). Our ring
+    // holds interleaved S32LE, so we read raw ring bytes into `out` and then
+    // convert each 4-byte S32 sample to f32 IN PLACE below — same 4B stride,
+    // so the frame layout is identical and only the value encoding changes.
     // SAFETY: the HAL guarantees io_main_buffer holds io_buffer_frame_size
     // frames of the stream's physical format (8ch × 4B).
     let out = unsafe { std::slice::from_raw_parts_mut(io_main_buffer as *mut u8, total_bytes) };
@@ -747,6 +761,21 @@ pub extern "C" fn do_io_operation(
             let avail = consumer.available();
             let got = consumer.read_into(out, want);
             filled = got * frame_bytes;
+            // Convert the S32LE ring samples just copied into `out` to the
+            // Float32 the device ASBD advertises. ±2^31 maps to ±1.0. Done in
+            // place over the filled region: each sample is 4 bytes either way.
+            // (Without this, CoreAudio reads our integer bit patterns as float
+            // → every sample collapses to 0 or full-scale: the 0x800000
+            // garble. See do_io / device_asbd notes.)
+            let (chunks, _rem) = out
+                .get_mut(..filled)
+                .unwrap_or(&mut [])
+                .as_chunks_mut::<4>();
+            for chunk in chunks {
+                let s = i32::from_le_bytes(*chunk);
+                let f = s as f32 / 2_147_483_648.0_f32;
+                *chunk = f.to_le_bytes();
+            }
             state.read_frame = consumer.read_frame();
             if log_now {
                 oslog(&format!(

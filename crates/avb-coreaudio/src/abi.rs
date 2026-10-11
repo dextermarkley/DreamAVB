@@ -67,10 +67,22 @@ pub struct AudioStreamBasicDescription {
     pub mReserved: UInt32,
 }
 
-/// LPCM, as used for our 32-bit signed interleaved stream.
+/// LPCM format flags (<CoreAudio/CoreAudioBaseTypes.h>). The device advertises
+/// Float | NativeEndian | Packed (see `device_asbd`); the integer/big-endian
+/// flags are kept as documented ABI constants.
 pub const kAudioFormatLinearPCM: UInt32 = u32::from_be_bytes(*b"lpcm");
+pub const kAudioFormatFlagIsFloat: UInt32 = 1 << 0;
+#[allow(dead_code)]
+pub const kAudioFormatFlagIsBigEndian: UInt32 = 1 << 1;
+#[allow(dead_code)]
 pub const kAudioFormatFlagIsSignedInteger: UInt32 = 1 << 2;
 pub const kAudioFormatFlagIsPacked: UInt32 = 1 << 3;
+/// Native-endian flag: the big-endian bit set only on big-endian hosts. On
+/// Apple Silicon / Intel (little-endian) this is 0.
+#[cfg(target_endian = "big")]
+pub const kAudioFormatFlagsNativeEndian: UInt32 = kAudioFormatFlagIsBigEndian;
+#[cfg(target_endian = "little")]
+pub const kAudioFormatFlagsNativeEndian: UInt32 = 0;
 
 /// `SMPTETime` (<CoreAudio/CoreAudioBaseTypes.h>). We never read its fields;
 /// it exists only so `AudioTimeStamp` has the correct size/alignment and
