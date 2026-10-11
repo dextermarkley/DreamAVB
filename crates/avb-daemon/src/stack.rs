@@ -1051,6 +1051,51 @@ fn streams_loop(
         ),
     );
 
+    // --- Advertise OUR listener entity via ADP ---
+    // A Milan talker will not honour a Listener Ready / connection from an
+    // entity it has not discovered. We send ADP discover but never advertised
+    // ourselves, so the 16R did not know we exist. Advertise ENTITY_AVAILABLE
+    // periodically (valid_time 10 -> 20 s) with an incrementing
+    // available_index, declaring ourselves an AEM/gPTP/Class-A listener with
+    // n_streams sinks.
+    let mut our_avail_index: u32 = 0;
+    let send_our_adp = |dext: &mut RealDext, avail: u32| {
+        use avb_avdecc::constants::{entity_caps, listener_caps};
+        let adp = Adpdu {
+            message_type: avb_avdecc::constants::adp_msg::ENTITY_AVAILABLE,
+            valid_time: 10,
+            entity_id: our_id,
+            entity_model_id: 0,
+            entity_capabilities: entity_caps::AEM_SUPPORTED
+                | entity_caps::CLASS_A_SUPPORTED
+                | entity_caps::GPTP_SUPPORTED,
+            talker_stream_sources: 0,
+            talker_capabilities: 0,
+            listener_stream_sinks: n_streams,
+            listener_capabilities: listener_caps::IMPLEMENTED | listener_caps::AUDIO_SINK,
+            controller_capabilities: 0,
+            available_index: avail,
+            gptp_grandmaster_id: 0,
+            gptp_domain_number: 0,
+            identify_control_index: 0,
+            interface_index: 0,
+            association_id: 0,
+        };
+        let hdr = EthHeader {
+            dst: avb_core::AVDECC_MULTICAST,
+            src: our_mac,
+            vlan: None,
+            ethertype: ETHERTYPE_AVTP,
+        };
+        if let Ok(f) = TxFrame::build(&hdr, &adp.encode(), false, 0) {
+            let _ = dext.send(f.bytes(), false, 0);
+        }
+    };
+    // Announce ourselves immediately so the 16R learns of us before we probe.
+    send_our_adp(dext, our_avail_index);
+    our_avail_index = our_avail_index.wrapping_add(1);
+    let mut last_advert = now_mach();
+
     // --- Phase 1b: GET_STREAM_INFO on each STREAM_OUTPUT ---
     // Learn the 16R's authoritative per-output stream_id, dest_mac, vlan and
     // its streaming/connected flags. A Milan talker's stream_id is NOT the
@@ -1230,9 +1275,11 @@ fn streams_loop(
                             Level::Info,
                             "acmp",
                             &format!(
-                                "CONNECT_TX_RESPONSE uid={} status={} id=0x{:016x} dest={:02x?} vid={}",
+                                "CONNECT_TX_RESPONSE uid={} status={} flags=0x{:04x} conn_count={} id=0x{:016x} dest={:02x?} vid={}",
                                 a.talker_unique_id,
                                 a.status,
+                                a.flags,
+                                a.connection_count,
                                 a.stream_id.0,
                                 a.stream_dest_mac.octets(),
                                 a.stream_vlan_id
@@ -1533,7 +1580,29 @@ fn streams_loop(
         }
     }
     srp.poll(srp_now(), &mut srp_out);
-    drain_srp(dext, &mut srp_out);
+    // One-shot trace of what we actually transmit for the reservation.
+    while let Some(f) = srp_out.pop() {
+        let b = f.bytes();
+        // eth(14) + MRPDU: ProtocolVersion(1) then AttributeType(1)...
+        let et = b
+            .get(12..14)
+            .map(|x| (u16::from(x[0]) << 8) | u16::from(x[1]));
+        let atype = b.get(15).copied();
+        let alen = b.get(16).copied();
+        log.log(
+            Level::Debug,
+            "srp",
+            &format!(
+                "TX et={:?} first_attr_type={:?} attr_len={:?} len={} head={:02x?}",
+                et.map(|e| format!("0x{e:04x}")),
+                atype,
+                alen,
+                b.len(),
+                b.iter().take(28).copied().collect::<Vec<_>>()
+            ),
+        );
+        let _ = dext.send(b, false, 0);
+    }
     log.log(
         Level::Info,
         "srp",
@@ -1551,6 +1620,14 @@ fn streams_loop(
             return Err(Exit::Interrupted);
         }
         let now = ns_since(start);
+
+        // Keep our ADP advertisement fresh (every ~2 s) so the 16R holds us
+        // in its entity table while we probe and reserve.
+        if ns_since(last_advert) >= 2_000_000_000 {
+            send_our_adp(dext, our_avail_index);
+            our_avail_index = our_avail_index.wrapping_add(1);
+            last_advert = now_mach();
+        }
 
         // Fire any due ACMP SM timers (delay -> probe, probe timeout -> resend).
         for sm in &mut sms {
@@ -1769,6 +1846,11 @@ fn streams_loop(
         // and absorb peer control frames; without this the declaration ages
         // out and the 16R stops transmitting mid-run.
         {
+            if ns_since(last_advert) >= 2_000_000_000 {
+                send_our_adp(dext, our_avail_index);
+                our_avail_index = our_avail_index.wrapping_add(1);
+                last_advert = now_mach();
+            }
             srp.poll(srp_now(), &mut srp_out);
             drain_srp(dext, &mut srp_out);
             for slot in dext.rx_ctl() {
