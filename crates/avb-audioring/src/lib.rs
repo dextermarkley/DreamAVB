@@ -22,7 +22,7 @@ pub use consumer::Consumer;
 pub use layout::{RingConfig, StreamSlot};
 pub use producer::{Producer, SampleFormat};
 pub use ring::{AudioRing, RingError};
-pub use shm::{ShmProducer, ShmRing, SHM_NAME};
+pub use shm::{ShmProducer, ShmRing, SHM_NAME, SHM_NAME_OUT};
 
 /// The media-clock model carried in the ring's clock block (§10.6). Mirrors
 /// `avb_mediaclock::ClockModel`; kept here so the ring crate does not depend

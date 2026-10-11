@@ -15,6 +15,7 @@
 pub mod aaf;
 pub mod common;
 pub mod stream_format;
+pub mod talker;
 
 pub use aaf::{AafHeader, AafPdu};
 pub use common::{StreamHeader, ETHERTYPE_AVTP};

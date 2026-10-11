@@ -29,6 +29,13 @@ use crate::ring::{AudioRing, RingError};
 /// is world-readable/writable and reachable by every user on the system.
 pub const SHM_NAME: &str = "/Users/Shared/avb16r.ring";
 
+/// The output (playback) ring: Mac audio OUT to the 16R (talker direction,
+/// Phase 1b-2). Same ABI and backing-file rationale as [`SHM_NAME`], a
+/// distinct path so the input and output rings never collide. The CoreAudio
+/// plug-in's output stream is the PRODUCER (WriteMix) and the daemon's talker
+/// TX loop is the CONSUMER — the mirror of the input ring's roles.
+pub const SHM_NAME_OUT: &str = "/Users/Shared/avb16r-out.ring";
+
 /// A mapped shm segment that owns its `mmap`/fd and, optionally, unlinks the
 /// name on drop (the creator unlinks; an attacher does not).
 pub struct ShmRing {
@@ -56,10 +63,16 @@ impl ShmRing {
     /// stale segment of the same name first so a crashed prior run cannot leave
     /// a wrongly-sized mapping behind. The returned handle unlinks on drop.
     pub fn create(config: &RingConfig) -> Result<Self, RingError> {
+        Self::create_at(SHM_NAME, config)
+    }
+
+    /// As [`create`](Self::create) but at an explicit path (e.g.
+    /// [`SHM_NAME_OUT`](crate::SHM_NAME_OUT) for the output ring).
+    pub fn create_at(path: &str, config: &RingConfig) -> Result<Self, RingError> {
         if !config.is_valid() {
             return Err(RingError::BadConfig);
         }
-        let name = CString::new(SHM_NAME).map_err(|_| RingError::BadConfig)?;
+        let name = CString::new(path).map_err(|_| RingError::BadConfig)?;
         let len = config.total_bytes();
         // Remove any stale file first so a crashed prior run cannot leave a
         // wrongly-sized mapping behind (ignore ENOENT).
@@ -110,7 +123,13 @@ impl ShmRing {
     /// Plug-in/consumer side. Validates the header via `from_raw`. Does NOT
     /// unlink on drop (the creator owns the name's lifetime).
     pub fn attach() -> Result<Self, RingError> {
-        let name = CString::new(SHM_NAME).map_err(|_| RingError::BadConfig)?;
+        Self::attach_at(SHM_NAME)
+    }
+
+    /// As [`attach`](Self::attach) but at an explicit path (e.g.
+    /// [`SHM_NAME_OUT`](crate::SHM_NAME_OUT) for the output ring).
+    pub fn attach_at(path: &str) -> Result<Self, RingError> {
+        let name = CString::new(path).map_err(|_| RingError::BadConfig)?;
         // Open the backing FILE read/write (not shm_open — see SHM_NAME doc).
         // SAFETY: name is a valid C string.
         let fd = unsafe { libc::open(name.as_ptr(), libc::O_RDWR) };
@@ -204,7 +223,19 @@ impl ShmProducer {
         lag_frames: u64,
         silent_lag: u64,
     ) -> Result<Self, RingError> {
-        let shm = Box::new(ShmRing::create(config)?);
+        Self::create_at(SHM_NAME, config, streams, lag_frames, silent_lag)
+    }
+
+    /// As [`create`](Self::create) but at an explicit path (output ring uses
+    /// [`SHM_NAME_OUT`](crate::SHM_NAME_OUT)).
+    pub fn create_at(
+        path: &str,
+        config: &RingConfig,
+        streams: &[(usize, usize, u32)],
+        lag_frames: u64,
+        silent_lag: u64,
+    ) -> Result<Self, RingError> {
+        let shm = Box::new(ShmRing::create_at(path, config)?);
         // SAFETY: the Producer borrows the ring inside `shm`, which is boxed
         // (stable address) and dropped AFTER `producer` (field order), so the
         // borrow never dangles. We never expose the 'static borrow.
