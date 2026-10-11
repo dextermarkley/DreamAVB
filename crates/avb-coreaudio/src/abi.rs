@@ -42,6 +42,9 @@ pub const K_PLUGIN_OBJECT: AudioObjectID = 1;
 pub const K_BOX_OBJECT: AudioObjectID = 2;
 pub const K_DEVICE_OBJECT: AudioObjectID = 3;
 pub const K_STREAM_OBJECT: AudioObjectID = 4;
+/// Output stream object (Phase 1b-2 playback direction). The device owns both
+/// the input stream (`K_STREAM_OBJECT`) and this output stream.
+pub const K_STREAM_OUT_OBJECT: AudioObjectID = 5;
 
 /// `AudioObjectPropertyAddress` (selector/scope/element), 4-byte-packed.
 #[repr(C)]
@@ -309,6 +312,8 @@ pub const kAudioObjectPropertyElementMain: UInt32 = 0;
 // Values.
 pub const kAudioDeviceTransportTypeVirtual: UInt32 = u32::from_be_bytes(*b"virt");
 pub const kAudioStreamTerminalTypeMicrophone: UInt32 = u32::from_be_bytes(*b"micr");
+/// Output speaker terminal type (CoreAudioTypes.h: OUTPUT_SPEAKER = 0x0301).
+pub const kAudioStreamTerminalTypeSpeaker: UInt32 = 0x0301;
 
 pub const kAudioHardwareNoError: OSStatus = 0;
 pub const kAudioHardwareBadObjectError: OSStatus = u32::from_be_bytes(*b"!obj") as OSStatus;
@@ -318,6 +323,9 @@ pub const kAudioHardwareBadPropertySizeError: OSStatus = u32::from_be_bytes(*b"!
 
 /// IO operation ids we care about (read-input).
 pub const kAudioServerPlugInIOOperationReadInput: UInt32 = u32::from_be_bytes(*b"read");
+/// WriteMix: the HAL hands the plug-in mixed output samples to transmit
+/// (Phase 1b-2 playback). FourCC 'wmix'.
+pub const kAudioServerPlugInIOOperationWriteMix: UInt32 = u32::from_be_bytes(*b"wmix");
 
 /// `AudioValueRange` (<CoreAudio/CoreAudioTypes.h>).
 #[repr(C)]

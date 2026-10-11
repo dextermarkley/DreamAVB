@@ -58,6 +58,30 @@ unsafe fn put<T: Copy>(
     kAudioHardwareNoError
 }
 
+/// Write a list of `AudioObjectID`s into `out_data`, truncated to the room
+/// `in_data_size` allows (the HAL may ask for a partial count). Sets the
+/// written size to the number of ids actually written × their size.
+unsafe fn put_oids(
+    ids: &[AudioObjectID],
+    in_data_size: UInt32,
+    out_data_size: *mut UInt32,
+    out_data: *mut c_void,
+) -> OSStatus {
+    if out_data.is_null() {
+        return kAudioHardwareBadPropertySizeError;
+    }
+    let one = std::mem::size_of::<AudioObjectID>();
+    let room = (in_data_size as usize) / one;
+    let n = room.min(ids.len());
+    for (i, id) in ids.iter().take(n).enumerate() {
+        ptr::write_unaligned((out_data as *mut AudioObjectID).add(i), *id);
+    }
+    if !out_data_size.is_null() {
+        *out_data_size = (n * one) as UInt32;
+    }
+    kAudioHardwareNoError
+}
+
 /// Build the device's ASBD for a given rate (interleaved 32-bit float PCM).
 ///
 /// The modern CoreAudio AudioServerPlugIn model expects **Float32** samples
@@ -171,7 +195,7 @@ fn property_known(object_id: AudioObjectID, selector: UInt32) -> bool {
                 || x == kAudioDevicePropertyPreferredChannelsForStereo
                 || x == kAudioDevicePropertyPreferredChannelLayout
         ),
-        K_STREAM_OBJECT => matches!(
+        K_STREAM_OBJECT | K_STREAM_OUT_OBJECT => matches!(
             selector,
             x if x == kAudioStreamPropertyDirection
                 || x == kAudioStreamPropertyTerminalType
@@ -253,7 +277,7 @@ pub extern "C" fn get_property_data_size(
         }
         // Owned objects.
         (K_PLUGIN_OBJECT, s) if s == kAudioObjectPropertyOwnedObjects => 2 * oidsz,
-        (K_DEVICE_OBJECT, s) if s == kAudioObjectPropertyOwnedObjects => oidsz,
+        (K_DEVICE_OBJECT, s) if s == kAudioObjectPropertyOwnedObjects => 2 * oidsz,
         (_, s) if s == kAudioObjectPropertyOwnedObjects => 0,
         // Plug-in.
         (K_PLUGIN_OBJECT, s) if s == kAudioPlugInPropertyBoxList => oidsz,
@@ -289,7 +313,7 @@ pub extern "C" fn get_property_data_size(
         }
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyRelatedDevices => oidsz,
         (K_DEVICE_OBJECT, s) if s == kAudioObjectPropertyControlList => 0,
-        (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyStreams => oidsz,
+        (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyStreams => 2 * oidsz,
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyNominalSampleRate => f64sz,
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyAvailableNominalSampleRates => rangesz,
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyPreferredChannelsForStereo => 2 * u32sz,
@@ -298,7 +322,7 @@ pub extern "C" fn get_property_data_size(
             12 + DEVICE_CHANNELS * 20
         }
         // Stream.
-        (K_STREAM_OBJECT, s)
+        (K_STREAM_OBJECT | K_STREAM_OUT_OBJECT, s)
             if s == kAudioStreamPropertyDirection
                 || s == kAudioStreamPropertyTerminalType
                 || s == kAudioStreamPropertyStartingChannel
@@ -306,13 +330,13 @@ pub extern "C" fn get_property_data_size(
         {
             u32sz
         }
-        (K_STREAM_OBJECT, s)
+        (K_STREAM_OBJECT | K_STREAM_OUT_OBJECT, s)
             if s == kAudioStreamPropertyVirtualFormat
                 || s == kAudioStreamPropertyPhysicalFormat =>
         {
             asbdsz
         }
-        (K_STREAM_OBJECT, s)
+        (K_STREAM_OBJECT | K_STREAM_OUT_OBJECT, s)
             if s == kAudioStreamPropertyAvailableVirtualFormats
                 || s == kAudioStreamPropertyAvailablePhysicalFormats =>
         {
@@ -351,7 +375,7 @@ pub extern "C" fn get_property_data(
                     K_PLUGIN_OBJECT => kAudioObjectClassID,
                     K_BOX_OBJECT => kAudioObjectClassID,
                     K_DEVICE_OBJECT => kAudioObjectClassID,
-                    K_STREAM_OBJECT => kAudioObjectClassID,
+                    K_STREAM_OBJECT | K_STREAM_OUT_OBJECT => kAudioObjectClassID,
                     _ => return kAudioHardwareBadObjectError,
                 };
                 return put(base, in_data_size, out_data_size, out_data);
@@ -361,7 +385,7 @@ pub extern "C" fn get_property_data(
                     K_PLUGIN_OBJECT => kAudioPlugInClassID,
                     K_BOX_OBJECT => kAudioBoxClassID,
                     K_DEVICE_OBJECT => kAudioDeviceClassID,
-                    K_STREAM_OBJECT => kAudioStreamClassID,
+                    K_STREAM_OBJECT | K_STREAM_OUT_OBJECT => kAudioStreamClassID,
                     _ => return kAudioHardwareBadObjectError,
                 };
                 return put(class, in_data_size, out_data_size, out_data);
@@ -371,7 +395,7 @@ pub extern "C" fn get_property_data(
                     K_PLUGIN_OBJECT => kAudioObjectUnknown, // the plug-in has no owner
                     K_BOX_OBJECT => K_PLUGIN_OBJECT,
                     K_DEVICE_OBJECT => K_PLUGIN_OBJECT,
-                    K_STREAM_OBJECT => K_DEVICE_OBJECT,
+                    K_STREAM_OBJECT | K_STREAM_OUT_OBJECT => K_DEVICE_OBJECT,
                     _ => return kAudioHardwareBadObjectError,
                 };
                 return put(owner, in_data_size, out_data_size, out_data);
@@ -381,6 +405,7 @@ pub extern "C" fn get_property_data(
                     K_BOX_OBJECT => BOX_NAME,
                     K_DEVICE_OBJECT => DEVICE_NAME,
                     K_STREAM_OBJECT => "AVB 16R Input Stream",
+                    K_STREAM_OUT_OBJECT => "AVB 16R Output Stream",
                     _ => "AVB-Audio",
                 };
                 return put(cfstring(name), in_data_size, out_data_size, out_data);
@@ -443,9 +468,12 @@ pub extern "C" fn get_property_data(
             }
 
             // Device.
-            (K_DEVICE_OBJECT, s) if s == kAudioObjectPropertyOwnedObjects => {
-                put(K_STREAM_OBJECT, in_data_size, out_data_size, out_data)
-            }
+            (K_DEVICE_OBJECT, s) if s == kAudioObjectPropertyOwnedObjects => put_oids(
+                &[K_STREAM_OBJECT, K_STREAM_OUT_OBJECT],
+                in_data_size,
+                out_data_size,
+                out_data,
+            ),
             (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyDeviceUID => {
                 put(cfstring(DEVICE_UID), in_data_size, out_data_size, out_data)
             }
@@ -498,8 +526,22 @@ pub extern "C" fn get_property_data(
                 kAudioHardwareNoError
             }
             (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyStreams => {
-                // Only input streams exist, so any scope returns the one stream.
-                put(K_STREAM_OBJECT, in_data_size, out_data_size, out_data)
+                // Scope selects which streams: input scope -> the input stream,
+                // output scope -> the output stream, global/wildcard -> both.
+                match a.mScope {
+                    x if x == kAudioObjectPropertyScopeInput => {
+                        put(K_STREAM_OBJECT, in_data_size, out_data_size, out_data)
+                    }
+                    x if x == kAudioObjectPropertyScopeOutput => {
+                        put(K_STREAM_OUT_OBJECT, in_data_size, out_data_size, out_data)
+                    }
+                    _ => put_oids(
+                        &[K_STREAM_OBJECT, K_STREAM_OUT_OBJECT],
+                        in_data_size,
+                        out_data_size,
+                        out_data,
+                    ),
+                }
             }
             (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyNominalSampleRate => {
                 put(DEVICE_RATE, in_data_size, out_data_size, out_data)
@@ -526,8 +568,8 @@ pub extern "C" fn get_property_data(
                 kAudioHardwareNoError
             }
 
-            // Stream.
-            (K_STREAM_OBJECT, s) if s == kAudioObjectPropertyOwnedObjects => {
+            // Stream (both input and output).
+            (K_STREAM_OBJECT | K_STREAM_OUT_OBJECT, s) if s == kAudioObjectPropertyOwnedObjects => {
                 if !out_data_size.is_null() {
                     *out_data_size = 0;
                 }
@@ -537,19 +579,30 @@ pub extern "C" fn get_property_data(
                 // 0 = output, 1 = input.
                 put(1u32, in_data_size, out_data_size, out_data)
             }
+            (K_STREAM_OUT_OBJECT, s) if s == kAudioStreamPropertyDirection => {
+                put(0u32, in_data_size, out_data_size, out_data)
+            }
             (K_STREAM_OBJECT, s) if s == kAudioStreamPropertyTerminalType => put(
                 kAudioStreamTerminalTypeMicrophone,
                 in_data_size,
                 out_data_size,
                 out_data,
             ),
-            (K_STREAM_OBJECT, s) if s == kAudioStreamPropertyStartingChannel => {
+            (K_STREAM_OUT_OBJECT, s) if s == kAudioStreamPropertyTerminalType => put(
+                kAudioStreamTerminalTypeSpeaker,
+                in_data_size,
+                out_data_size,
+                out_data,
+            ),
+            (K_STREAM_OBJECT | K_STREAM_OUT_OBJECT, s)
+                if s == kAudioStreamPropertyStartingChannel =>
+            {
                 put(1u32, in_data_size, out_data_size, out_data)
             }
-            (K_STREAM_OBJECT, s) if s == kAudioStreamPropertyIsActive => {
+            (K_STREAM_OBJECT | K_STREAM_OUT_OBJECT, s) if s == kAudioStreamPropertyIsActive => {
                 put(1u32, in_data_size, out_data_size, out_data)
             }
-            (K_STREAM_OBJECT, s)
+            (K_STREAM_OBJECT | K_STREAM_OUT_OBJECT, s)
                 if s == kAudioStreamPropertyVirtualFormat
                     || s == kAudioStreamPropertyPhysicalFormat =>
             {
@@ -560,7 +613,7 @@ pub extern "C" fn get_property_data(
                     out_data,
                 )
             }
-            (K_STREAM_OBJECT, s)
+            (K_STREAM_OBJECT | K_STREAM_OUT_OBJECT, s)
                 if s == kAudioStreamPropertyAvailableVirtualFormats
                     || s == kAudioStreamPropertyAvailablePhysicalFormats =>
             {
@@ -618,6 +671,17 @@ struct IoState {
 
 static IO: Mutex<Option<IoState>> = Mutex::new(None);
 
+/// Output (playback) IO state (Phase 1b-2). The plug-in is the PRODUCER on the
+/// output ring: WriteMix hands us mixed f32 samples, we convert to S32LE and
+/// place them into the ring the daemon's talker loop consumes. The daemon
+/// creates `SHM_NAME_OUT`; we attach it. `write_frame` is our place cursor.
+struct OutIoState {
+    shm: ShmRing,
+    write_frame: u64,
+}
+
+static OUT_IO: Mutex<Option<OutIoState>> = Mutex::new(None);
+
 pub extern "C" fn start_io(
     _d: AudioServerPlugInDriverRef,
     _dev: AudioObjectID,
@@ -643,6 +707,22 @@ pub extern "C" fn start_io(
             }
         }
     }
+    // Attach the OUTPUT ring (playback). Absence is not an error — WriteMix is
+    // dropped until the daemon's `play` loop has created the ring.
+    if let Ok(mut guard) = OUT_IO.lock() {
+        if guard.is_none() {
+            match ShmRing::attach_at(avb_audioring::SHM_NAME_OUT) {
+                Ok(shm) => {
+                    let write_frame = Consumer::new(shm.ring()).write_frame();
+                    *guard = Some(OutIoState { shm, write_frame });
+                    oslog("[avb-coreaudio] IO: attached output ring");
+                }
+                Err(_) => {
+                    oslog("[avb-coreaudio] IO: output ring not present — playback muted");
+                }
+            }
+        }
+    }
     kAudioHardwareNoError
 }
 
@@ -653,6 +733,9 @@ pub extern "C" fn stop_io(
 ) -> OSStatus {
     if let Ok(mut guard) = IO.lock() {
         *guard = None; // drops ShmRing -> munmap/close
+    }
+    if let Ok(mut guard) = OUT_IO.lock() {
+        *guard = None;
     }
     kAudioHardwareNoError
 }
@@ -694,7 +777,14 @@ pub extern "C" fn do_io_operation(
     io_main_buffer: *mut c_void,
     _secondary: *mut c_void,
 ) -> OSStatus {
-    if operation_id != kAudioServerPlugInIOOperationReadInput || io_main_buffer.is_null() {
+    if io_main_buffer.is_null() {
+        return kAudioHardwareNoError;
+    }
+    // WriteMix (playback): the HAL hands us mixed output samples to transmit.
+    if operation_id == kAudioServerPlugInIOOperationWriteMix {
+        return write_mix(io_buffer_frame_size, io_main_buffer);
+    }
+    if operation_id != kAudioServerPlugInIOOperationReadInput {
         return kAudioHardwareNoError;
     }
     let frame_bytes = (DEVICE_CHANNELS * 4) as usize;
@@ -789,6 +879,57 @@ pub extern "C" fn do_io_operation(
     // Zero-fill any remainder (underrun, or no daemon): silence, never garbage.
     if let Some(tail) = out.get_mut(filled..) {
         tail.fill(0);
+    }
+    kAudioHardwareNoError
+}
+
+/// WriteMix (Phase 1b-2 playback): the HAL hands us `frames` of interleaved
+/// Float32 output samples; convert to S32 big-endian and `place` them into the
+/// output ring the daemon's talker loop consumes. The HAL buffer's format is
+/// the device ASBD (Float32, ±1.0 full scale); the ring container is S32.
+/// `place` takes big-endian wire bytes and stores little-endian, so the daemon
+/// reads LE S32 — the same container the input ring uses.
+fn write_mix(frames: UInt32, io_main_buffer: *mut c_void) -> OSStatus {
+    use avb_audioring::{Producer, SampleFormat};
+
+    let channels = DEVICE_CHANNELS as usize;
+    let frame_bytes = channels * 4;
+    let n_frames = frames as usize;
+    let total_bytes = n_frames * frame_bytes;
+    // SAFETY: the HAL guarantees the buffer holds `frames` frames of the
+    // stream's physical format (8ch × 4B f32).
+    let inp = unsafe { std::slice::from_raw_parts(io_main_buffer as *const u8, total_bytes) };
+
+    let Ok(mut guard) = OUT_IO.lock() else {
+        return kAudioHardwareNoError;
+    };
+    let Some(state) = guard.as_mut() else {
+        return kAudioHardwareNoError; // ring not attached yet — drop (muted)
+    };
+    let ring = state.shm.ring();
+
+    // Convert f32 → S32 big-endian into a scratch, then place one frame-group.
+    // Max buffer: a HAL IO buffer is small (hundreds of frames); cap the
+    // scratch at a generous bound and process in that unit.
+    const MAX_FR: usize = 4096;
+    let mut be = [0u8; MAX_FR * 8 * 4]; // 8ch × 4B, up to MAX_FR frames
+    let fr_this = n_frames.min(MAX_FR);
+    let want_bytes = fr_this * frame_bytes;
+    let (src_chunks, _r) = inp.get(..want_bytes).unwrap_or(&[]).as_chunks::<4>();
+    let be_slice = be.get_mut(..want_bytes).unwrap_or(&mut []);
+    let (be_chunks, _r2) = be_slice.as_chunks_mut::<4>();
+    for (dst, src) in be_chunks.iter_mut().zip(src_chunks.iter()) {
+        let f = f32::from_le_bytes(*src);
+        // ±1.0 full scale → S32. Clamp to avoid overflow on >1.0 peaks.
+        let scaled = (f as f64 * 2_147_483_648.0).clamp(-2_147_483_648.0, 2_147_483_647.0);
+        *dst = (scaled as i32).to_be_bytes();
+    }
+
+    let mut producer = Producer::new(ring, &[(0, channels, 32)], 0, 0);
+    let f = state.write_frame;
+    if producer.place(0, f as i128, fr_this, SampleFormat::Int32, be_slice) {
+        producer.commit(false, None);
+        state.write_frame = f + fr_this as u64;
     }
     kAudioHardwareNoError
 }
