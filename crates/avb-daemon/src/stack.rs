@@ -2540,8 +2540,6 @@ fn talker_loop(
 
     use crate::dextio::DextPort;
 
-    let _ = (opts, seconds, listener);
-
     // The output format MUST match the 16R's STREAM_INPUT exactly (Milan: AAF
     // INT_32BIT, 48 kHz, 8 ch, 6 spf). The real value is read from the 16R's
     // AEM (never hardcoded) during bring-up; the Milan base format is the
@@ -2602,10 +2600,31 @@ fn talker_loop(
     // The packetizer for our stream.
     let mut talker = AafTalker::new(our_stream_id, fmt).ok_or(Exit::DextFault)?;
 
-    // Connect as controller: tell the 16R (listener) to connect its
-    // STREAM_INPUT[listener_uid] to our talker. Mirror of the record path's
-    // CONNECT_TX_COMMAND.
-    connect_listener(log, dext, our_stream_id, listener_uid)?;
+    // Our entity id is the EUI-64 of our MAC (FF:FE inserted), exactly as every
+    // other path derives it — the 16R keys ACMP on it (review H4).
+    let our_id = avb_core::Eui64::from_mac(our_mac);
+
+    // Find the 16R (the LISTENER for this direction) — from --listener, or by
+    // ADP discovery — and announce ourselves as a talker so it knows us before
+    // we ask it to connect (review H3; a Milan entity ignores ACMP from an
+    // entity it has not discovered).
+    let listener_id = discover_listener(opts, log, dext, our_id, our_mac, listener)?;
+
+    // Connect as controller: tell the 16R to connect its STREAM_INPUT
+    // [listener_uid] to our talker stream. Mirror of the record path's
+    // CONNECT_TX_COMMAND, with the 16R as listener_entity_id.
+    let mut connect_seq: u16 = 0;
+    connect_listener(
+        log,
+        dext,
+        our_mac,
+        our_id,
+        listener_id,
+        our_stream_id,
+        listener_uid,
+        connect_seq,
+    );
+    connect_seq = connect_seq.wrapping_add(1);
 
     // ---- TX pacing loop ------------------------------------------------------
     //
@@ -2651,7 +2670,8 @@ fn talker_loop(
     let mut tx_pdus: u64 = 0;
     let mut underruns: u64 = 0;
     let mut last_connect = now_mach();
-    let mut connect_seq: u16 = 1;
+    let mut last_advert = now_mach();
+    let mut advert_index: u32 = 1;
 
     loop {
         if shutdown_requested() {
@@ -2667,11 +2687,28 @@ fn talker_loop(
             return Err(Exit::DextFault);
         }
 
+        // Keep our ADP advertisement alive (valid_time is short) so the 16R
+        // keeps us in its entity table.
+        if ns_since(last_advert) >= 2_000_000_000 {
+            send_talker_adp(dext, our_mac, our_id, advert_index);
+            advert_index = advert_index.wrapping_add(1);
+            last_advert = now_mach();
+        }
+
         // Refresh the listener connection every second so the 16R keeps its
-        // sink bound (mirror of the record loop's periodic CONNECT_TX).
+        // sink bound (mirror of the record loop's periodic CONNECT_TX). This
+        // used to only bump a counter and never re-send (review L1).
         if ns_since(last_connect) >= 1_000_000_000 {
-            // sequence advances; the real 16R entity-id is filled on hw.
-            let _ = connect_seq;
+            connect_listener(
+                log,
+                dext,
+                our_mac,
+                our_id,
+                listener_id,
+                our_stream_id,
+                listener_uid,
+                connect_seq,
+            );
             connect_seq = connect_seq.wrapping_add(1);
             last_connect = now_mach();
         }
@@ -2742,51 +2779,222 @@ fn talker_loop(
     Ok(())
 }
 
-/// The AVB stream destination MAC for a stream id (Milan derives a
-/// locally-administered multicast from the stream id's low bytes; the 16R
-/// learns it from the SRP Talker Advertise on hardware). Stand-in: the AVB
-/// destination group base with the stream's unique id in the low byte.
+/// The AVB stream destination MAC for our talker stream.
+///
+/// A real talker obtains this via MAAP; until that is wired the 16R learns the
+/// destination from our SRP Talker Advertise. The stand-in must NOT fall inside
+/// `91:E0:F0:00:xx:xx`: the dext classifier (`avb_core::is_avdecc_dest`) treats
+/// that whole block as AVDECC control traffic, so a stream addressed there
+/// would be misrouted on any loopback/RX (review L2). We use the 1722 MAAP
+/// locally-administered range one octet up, `91:E0:F0:01:xx:xx`, excluding the
+/// AVDECC multicast itself (`91:E0:F0:01:00:00`): uid 0 maps to `..:01:00:01`.
 fn stream_dest_mac(stream_id: avb_core::StreamId) -> avb_core::MacAddr {
-    let uid = (stream_id.0 & 0xFFFF) as u16;
-    avb_core::MacAddr([0x91, 0xE0, 0xF0, 0x00, (uid >> 8) as u8, uid as u8])
+    let uid = ((stream_id.0 & 0xFFFF) as u16).saturating_add(1);
+    avb_core::MacAddr([0x91, 0xE0, 0xF0, 0x01, (uid >> 8) as u8, uid as u8])
 }
 
-/// Issue `CONNECT_RX_COMMAND` to the 16R (as listener) binding its
-/// STREAM_INPUT[`listener_uid`] to our talker stream, then collect the
-/// `CONNECT_RX_RESPONSE`. Controller role (design §9.2, mirror of the record
-/// path's CONNECT_TX_COMMAND leg).
-fn connect_listener(
-    log: &Logger,
+/// Advertise OUR entity as a talker (ADP ENTITY_AVAILABLE) so the 16R has us
+/// in its entity table before we ask it to connect. Mirror of the listener
+/// path's `send_our_adp`, with talker capabilities instead of listener ones.
+fn send_talker_adp(
     dext: &mut RealDext,
-    our_stream_id: avb_core::StreamId,
-    listener_uid: u16,
-) -> Result<(), Exit> {
-    use avb_avdecc::acmp::Acmpdu;
-    use avb_avdecc::constants::{acmp_msg, acmp_status};
+    our_mac: avb_core::MacAddr,
+    our_id: avb_core::Eui64,
+    avail: u32,
+) {
+    use avb_avdecc::adp::Adpdu;
+    use avb_avdecc::constants::{entity_caps, talker_caps};
     use avb_avtp::common::ETHERTYPE_AVTP;
     use avb_core::eth::EthHeader;
+    use avb_core::TxFrame;
+
+    use crate::dextio::DextPort;
+
+    let adp = Adpdu {
+        message_type: avb_avdecc::constants::adp_msg::ENTITY_AVAILABLE,
+        valid_time: 10,
+        entity_id: our_id,
+        entity_model_id: 0,
+        entity_capabilities: entity_caps::AEM_SUPPORTED
+            | entity_caps::CLASS_A_SUPPORTED
+            | entity_caps::GPTP_SUPPORTED,
+        talker_stream_sources: 1,
+        talker_capabilities: talker_caps::IMPLEMENTED | talker_caps::AUDIO_SOURCE,
+        listener_stream_sinks: 0,
+        listener_capabilities: 0,
+        controller_capabilities: 0,
+        available_index: avail,
+        gptp_grandmaster_id: 0,
+        gptp_domain_number: 0,
+        identify_control_index: 0,
+        interface_index: 0,
+        association_id: 0,
+    };
+    let hdr = EthHeader {
+        dst: avb_core::AVDECC_MULTICAST,
+        src: our_mac,
+        vlan: None,
+        ethertype: ETHERTYPE_AVTP,
+    };
+    if let Ok(f) = TxFrame::build(&hdr, &adp.encode(), false, 0) {
+        let _ = dext.send(f.bytes(), false, 0);
+    }
+}
+
+/// Resolve the 16R's entity id — the LISTENER for the playback direction.
+/// `--listener <id>` wins; otherwise discover via ADP exactly like the record
+/// path (the 16R is the sole AVDECC talker on the link). Advertises our own
+/// talker entity while waiting. Exits `TalkerNotFound` (6) on timeout or when
+/// several candidates make the choice ambiguous.
+fn discover_listener(
+    opts: &GlobalOpts,
+    log: &Logger,
+    dext: &mut RealDext,
+    our_id: avb_core::Eui64,
+    our_mac: avb_core::MacAddr,
+    want: Option<u64>,
+) -> Result<avb_core::Eui64, Exit> {
+    use avb_avdecc::adp::Adpdu;
+    use avb_avdecc::constants::subtype;
+    use avb_avdecc::EntityTable;
+    use avb_avtp::common::ETHERTYPE_AVTP;
+    use avb_core::eth::{EthFrame, EthHeader};
+    use avb_core::time::{MachTicks, Timebase};
     use avb_core::{Eui64, TxFrame};
 
     use crate::dextio::DextPort;
 
-    let info = dext.device().info().map_err(|_| Exit::DextFault)?;
-    let our_mac = avb_core::MacAddr::new(info.mac);
-    let our_id = Eui64::from_u64(our_stream_id.0 & !0xFFFF); // entity id = MAC-based
+    send_talker_adp(dext, our_mac, our_id, 0);
+    if let Some(id) = want {
+        let id = Eui64::from_u64(id);
+        log.log(
+            Level::Info,
+            "adp",
+            &format!("listener given: 0x{:016x}", u64::from_be_bytes(id.0)),
+        );
+        return Ok(id);
+    }
 
-    // CONNECT_RX_COMMAND: controller -> listener. The listener (16R) connects
-    // its sink `listener_uid` to our talker stream and replies CONNECT_RX_RESPONSE.
-    let pdu = Acmpdu {
-        message_type: acmp_msg::CONNECT_RX_COMMAND,
-        status: acmp_status::SUCCESS,
-        stream_id: our_stream_id,
-        controller_entity_id: our_id,
-        talker_entity_id: our_id,
-        listener_entity_id: our_id, // overwritten with the 16R id on hardware discovery
-        talker_unique_id: 0,
-        listener_unique_id: listener_uid,
-        sequence_id: 0,
-        ..Default::default()
+    let info = dext.device().info().map_err(|_| Exit::DextFault)?;
+    let tb = Timebase {
+        numer: info.tb_numer,
+        denom: info.tb_denom,
     };
+    let now_mach = || MachTicks(unsafe { mach2::mach_time::mach_absolute_time() });
+    let start = now_mach();
+    let ns_since = |t: MachTicks| tb.ticks_to_ns(now_mach().ticks_since(t));
+    let deadline_ns = opts.discover_timeout.saturating_mul(1_000_000_000);
+
+    let discover = Adpdu {
+        message_type: avb_avdecc::constants::adp_msg::ENTITY_DISCOVER,
+        valid_time: 0,
+        entity_id: Eui64([0; 8]),
+        entity_model_id: 0,
+        entity_capabilities: 0,
+        talker_stream_sources: 0,
+        talker_capabilities: 0,
+        listener_stream_sinks: 0,
+        listener_capabilities: 0,
+        controller_capabilities: 0,
+        available_index: 0,
+        gptp_grandmaster_id: 0,
+        gptp_domain_number: 0,
+        identify_control_index: 0,
+        interface_index: 0,
+        association_id: 0,
+    };
+    let mut table = EntityTable::new(our_id);
+    let mut last_discover = MachTicks(0);
+    loop {
+        if shutdown_requested() {
+            return Err(Exit::Interrupted);
+        }
+        if last_discover.0 == 0 || ns_since(last_discover) >= 2_000_000_000 {
+            let hdr = EthHeader {
+                dst: avb_core::AVDECC_MULTICAST,
+                src: our_mac,
+                vlan: None,
+                ethertype: ETHERTYPE_AVTP,
+            };
+            if let Ok(f) = TxFrame::build(&hdr, &discover.encode(), false, 0) {
+                let _ = dext.send(f.bytes(), false, 0);
+            }
+            last_discover = now_mach();
+        }
+        for slot in dext.rx_ctl() {
+            if let Ok(p) = EthFrame::parse(&slot.data) {
+                if p.hdr.ethertype == ETHERTYPE_AVTP
+                    && p.payload.first().copied() == Some(subtype::ADP)
+                {
+                    if let Some(adp) = Adpdu::decode(p.payload) {
+                        let _ = table.observe(&adp, p.hdr.src, ns_since(start), false);
+                    }
+                }
+            }
+        }
+        match table.sole_talker() {
+            Ok(Some(id)) => {
+                log.log(
+                    Level::Info,
+                    "adp",
+                    &format!(
+                        "listener (16R) discovered: 0x{:016x}",
+                        u64::from_be_bytes(id.0)
+                    ),
+                );
+                return Ok(id);
+            }
+            Err(ids) => {
+                log.log(
+                    Level::Error,
+                    "adp",
+                    &format!("{} entities discovered; pass --listener <id>", ids.len()),
+                );
+                return Err(Exit::TalkerNotFound);
+            }
+            Ok(None) => {}
+        }
+        if ns_since(start) >= deadline_ns {
+            log.log(
+                Level::Error,
+                "adp",
+                "no AVDECC entity discovered to play to",
+            );
+            return Err(Exit::TalkerNotFound);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Issue `CONNECT_RX_COMMAND` to the 16R (as listener), binding its
+/// STREAM_INPUT[`listener_uid`] to our talker stream. Controller role (design
+/// §9.2, mirror of the record path's CONNECT_TX_COMMAND leg). The 16R is the
+/// listener here, so `listener_entity_id` is ITS id (review H3) and every id
+/// that names us is our EUI-64 entity id (review H4).
+#[allow(clippy::too_many_arguments)]
+fn connect_listener(
+    log: &Logger,
+    dext: &mut RealDext,
+    our_mac: avb_core::MacAddr,
+    our_id: avb_core::Eui64,
+    listener_id: avb_core::Eui64,
+    our_stream_id: avb_core::StreamId,
+    listener_uid: u16,
+    sequence_id: u16,
+) {
+    use avb_avtp::common::ETHERTYPE_AVTP;
+    use avb_core::eth::EthHeader;
+    use avb_core::TxFrame;
+
+    use crate::dextio::DextPort;
+
+    let pdu = connect_rx_pdu(
+        our_id,
+        listener_id,
+        our_stream_id,
+        listener_uid,
+        sequence_id,
+    );
     let hdr = EthHeader {
         dst: avb_core::AVDECC_MULTICAST,
         src: our_mac,
@@ -2796,13 +3004,75 @@ fn connect_listener(
     if let Ok(f) = TxFrame::build(&hdr, &pdu.encode(), false, 0) {
         let _ = dext.send(f.bytes(), false, 0);
     }
-    log.log(
-        Level::Info,
-        "acmp",
-        &format!(
-            "CONNECT_RX_COMMAND -> 16R listener uid={listener_uid}, our stream 0x{:016x}",
-            our_stream_id.0
-        ),
-    );
-    Ok(())
+    if sequence_id == 0 {
+        log.log(
+            Level::Info,
+            "acmp",
+            &format!(
+                "CONNECT_RX_COMMAND -> 0x{:016x} uid={listener_uid}, our stream 0x{:016x}",
+                u64::from_be_bytes(listener_id.0),
+                our_stream_id.0
+            ),
+        );
+    }
+}
+
+/// Build the CONNECT_RX_COMMAND PDU (pure; unit-tested).
+fn connect_rx_pdu(
+    our_id: avb_core::Eui64,
+    listener_id: avb_core::Eui64,
+    our_stream_id: avb_core::StreamId,
+    listener_uid: u16,
+    sequence_id: u16,
+) -> avb_avdecc::acmp::Acmpdu {
+    use avb_avdecc::acmp::Acmpdu;
+    use avb_avdecc::constants::{acmp_msg, acmp_status};
+    Acmpdu {
+        message_type: acmp_msg::CONNECT_RX_COMMAND,
+        status: acmp_status::SUCCESS,
+        stream_id: our_stream_id,
+        controller_entity_id: our_id,
+        talker_entity_id: our_id,
+        listener_entity_id: listener_id,
+        talker_unique_id: (our_stream_id.0 & 0xFFFF) as u16,
+        listener_unique_id: listener_uid,
+        sequence_id,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod talker_tests {
+    use super::*;
+    use avb_core::{Eui64, MacAddr, StreamId};
+
+    #[test]
+    fn connect_rx_names_the_16r_as_listener_and_us_by_eui64() {
+        let mac = MacAddr([0x64, 0x4b, 0xf0, 0x12, 0x73, 0xb8]);
+        let our_id = Eui64::from_mac(mac);
+        let the_16r = Eui64::from_u64(0x000a_92ff_fe03_3ba9);
+        let sid = StreamId::from_parts(mac, 0);
+        let pdu = connect_rx_pdu(our_id, the_16r, sid, 3, 7);
+        assert_eq!(pdu.listener_entity_id, the_16r, "listener must be the 16R");
+        assert_eq!(pdu.talker_entity_id, our_id);
+        assert_eq!(pdu.controller_entity_id, our_id);
+        // Our entity id carries the FF:FE EUI-64 insertion, like every other path.
+        assert_eq!(&our_id.0[3..5], &[0xff, 0xfe]);
+        assert_eq!(pdu.listener_unique_id, 3);
+        assert_eq!(pdu.sequence_id, 7);
+    }
+
+    #[test]
+    fn stream_dest_mac_is_outside_the_avdecc_classifier_block() {
+        let mac = MacAddr([0x64, 0x4b, 0xf0, 0x12, 0x73, 0xb8]);
+        for uid in [0u16, 1, 0x00ff, 0xfffe] {
+            let d = stream_dest_mac(StreamId::from_parts(mac, uid));
+            assert!(
+                !avb_core::is_avdecc_dest(d, mac),
+                "uid {uid} -> {:02x?} lands in the AVDECC block",
+                d.0
+            );
+            assert_ne!(d, avb_core::AVDECC_MULTICAST);
+        }
+    }
 }

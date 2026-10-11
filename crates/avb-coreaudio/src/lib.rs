@@ -191,20 +191,31 @@ extern "C" fn will_do_io_operation(
     _d: AudioServerPlugInDriverRef,
     _dev: AudioObjectID,
     _c: UInt32,
-    _op: UInt32,
+    op: UInt32,
     out_will_do: *mut Boolean,
     out_in_place: *mut Boolean,
 ) -> OSStatus {
+    // Claim ONLY the operations DoIOOperation implements (review C2). Saying
+    // yes to everything made the HAL hand us ops like ProcessOutput/ConvertMix
+    // that we silently ignored, leaving any non-in-place buffer unfilled.
+    let will = op_is_handled(op);
     unsafe {
         if !out_will_do.is_null() {
-            *out_will_do = 1;
+            *out_will_do = Boolean::from(will);
         }
         if !out_in_place.is_null() {
-            *out_in_place = 1;
+            *out_in_place = Boolean::from(will);
         }
     }
     kAudioHardwareNoError
 }
+
+/// The IO operations this plug-in performs: ReadInput (input stream) and
+/// WriteMix (output stream). Both run in place on the HAL's buffer.
+fn op_is_handled(op: UInt32) -> bool {
+    op == kAudioServerPlugInIOOperationReadInput || op == kAudioServerPlugInIOOperationWriteMix
+}
+
 extern "C" fn begin_io_operation(
     _d: AudioServerPlugInDriverRef,
     _dev: AudioObjectID,
@@ -275,4 +286,18 @@ pub extern "C" fn avb_coreaudio_factory(
     // Return &(&DRIVER_INTERFACE): the HAL dereferences once to reach the
     // vtable, matching the COM `IUnknown**` convention.
     &DRIVER_INTERFACE_PTR as *const _ as *mut c_void
+}
+
+#[cfg(test)]
+mod io_op_tests {
+    use super::*;
+
+    #[test]
+    fn only_read_input_and_write_mix_are_claimed() {
+        assert!(op_is_handled(kAudioServerPlugInIOOperationReadInput));
+        assert!(op_is_handled(kAudioServerPlugInIOOperationWriteMix));
+        for other in [b"thrd", b"cycl", b"proc", b"mixo", b"cvtm", b"cvti"] {
+            assert!(!op_is_handled(u32::from_be_bytes(*other)));
+        }
+    }
 }
