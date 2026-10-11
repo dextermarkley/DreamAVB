@@ -239,7 +239,33 @@ impl DextPort for RealDext {
     }
 
     fn rx_audio(&mut self) -> Vec<RxSlot> {
-        Vec::new()
+        // Drain the mapped audio ring (design §5.2, §10.6). Stream AAF frames
+        // land here after the stream filter is set and ACMP binds the stream.
+        let (Some(rx), Some(consumer)) = (self.rx_map.as_ref(), self.consumer_map.as_ref()) else {
+            return Vec::new();
+        };
+        // SAFETY: maps held in self for their reported lengths; dext follows
+        // the ring protocol.
+        let mut rings = match unsafe {
+            RxRings::from_raw(rx.as_ptr(), rx.len(), consumer.as_ptr(), consumer.len())
+        } {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        rings.drain(Ring::Audio, avb_dext::abi::RX_BATCH_MAX, |slot| {
+            if let Ok(s) = slot {
+                out.push(RxSlot {
+                    cls: s.cls() as u8,
+                    data: s.data().to_vec(),
+                    hw_ts_ns: s.hw_ts(),
+                    clock_gen: s.clock_gen(),
+                    step_ambig: s.step_ambig(),
+                    desc_vlan_tci: s.desc_vlan_tci(),
+                });
+            }
+        });
+        out
     }
 
     fn health(&self) -> Health {

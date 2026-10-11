@@ -918,13 +918,333 @@ fn gptp_loop(
 
 pub fn streams(
     opts: &GlobalOpts,
-    _seconds: u64,
-    _interval: u64,
-    _json_out: Option<PathBuf>,
+    seconds: u64,
+    interval: u64,
+    json_out: Option<PathBuf>,
 ) -> Result<(), Exit> {
     install_signal_handlers();
     let log = Logger::new(opts.level);
-    let _dext = bring_up(opts, &log)?;
+    let mut dext = bring_up(opts, &log)?;
+    streams_loop(
+        opts,
+        &log,
+        &mut dext,
+        seconds,
+        interval,
+        json_out.as_deref(),
+    )
+}
+
+/// Bind all of the 16R's talker streams via ACMP and count received AAF
+/// packets per stream over `seconds`, reporting per-stream pkt/s each
+/// `interval` (design §4 hw-streams; Class A is 8000 pkt/s). Reuses the
+/// ADP/AECP control path and the mapped audio ring.
+fn streams_loop(
+    opts: &GlobalOpts,
+    log: &Logger,
+    dext: &mut RealDext,
+    seconds: u64,
+    interval: u64,
+    json_out: Option<&Path>,
+) -> Result<(), Exit> {
+    use avb_avdecc::acmp::Acmpdu;
+    use avb_avdecc::adp::Adpdu;
+    use avb_avdecc::constants::{acmp_msg, subtype};
+    use avb_avdecc::controller::{BindOutcome, BindTarget, Binder};
+    use avb_avdecc::EntityTable;
+    use avb_avtp::common::ETHERTYPE_AVTP;
+    use avb_core::eth::{EthFrame, EthHeader};
+    use avb_core::time::{MachTicks, Timebase};
+    use avb_core::{Eui64, MacAddr, StreamId, TxFrame};
+
+    use crate::dextio::DextPort;
+
+    let info = dext.device().info().map_err(|_| Exit::DextFault)?;
+    let our_mac = MacAddr::new(info.mac);
+    let tb = Timebase {
+        numer: info.tb_numer,
+        denom: info.tb_denom,
+    };
+    let our_id = Eui64::from_mac(our_mac);
+    let now_mach = || MachTicks(unsafe { mach2::mach_time::mach_absolute_time() });
+    let start = now_mach();
+    let ns_since = |t: MachTicks| tb.ticks_to_ns(now_mach().ticks_since(t));
+
+    // --- Phase 1: discover the 16R (ADP) ---
+    let mut table = EntityTable::new(our_id);
+    let discover_adp = Adpdu {
+        message_type: avb_avdecc::constants::adp_msg::ENTITY_DISCOVER,
+        valid_time: 0,
+        entity_id: Eui64([0; 8]),
+        entity_model_id: 0,
+        entity_capabilities: 0,
+        talker_stream_sources: 0,
+        talker_capabilities: 0,
+        listener_stream_sinks: 0,
+        listener_capabilities: 0,
+        controller_capabilities: 0,
+        available_index: 0,
+        gptp_grandmaster_id: 0,
+        gptp_domain_number: 0,
+        identify_control_index: 0,
+        interface_index: 0,
+        association_id: 0,
+    };
+    let discover_deadline_ns = opts.discover_timeout.saturating_mul(1_000_000_000);
+    let mut last_discover = MachTicks(0);
+    let (talker, talker_mac, n_streams) = loop {
+        if shutdown_requested() {
+            return Err(Exit::Interrupted);
+        }
+        if last_discover.0 == 0 || ns_since(last_discover) >= 2_000_000_000 {
+            let hdr = EthHeader {
+                dst: avb_core::AVDECC_MULTICAST,
+                src: our_mac,
+                vlan: None,
+                ethertype: ETHERTYPE_AVTP,
+            };
+            if let Ok(f) = TxFrame::build(&hdr, &discover_adp.encode(), false, 0) {
+                let _ = dext.send(f.bytes(), false, 0);
+            }
+            last_discover = now_mach();
+        }
+        for slot in dext.rx_ctl() {
+            if let Ok(p) = EthFrame::parse(&slot.data) {
+                if p.hdr.ethertype == ETHERTYPE_AVTP
+                    && p.payload.first().copied() == Some(subtype::ADP)
+                {
+                    if let Some(adp) = Adpdu::decode(p.payload) {
+                        let _ = table.observe(&adp, p.hdr.src, ns_since(start), false);
+                    }
+                }
+            }
+        }
+        if let Ok(Some(id)) = table.sole_talker() {
+            if let Some(e) = table.get(id) {
+                break (id, e.mac, e.adp.talker_stream_sources);
+            }
+        }
+        if ns_since(start) >= discover_deadline_ns {
+            log.log(Level::Error, "adp", "no AVDECC talker discovered");
+            return Err(Exit::TalkerNotFound);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let n_streams = n_streams.min(avb_avdecc::derive::S_MAX as u16);
+    log.log(
+        Level::Info,
+        "acmp",
+        &format!(
+            "talker {} has {n_streams} stream source(s); binding all",
+            u64::from_be_bytes(talker.0)
+        ),
+    );
+
+    // --- Phase 2: bind every talker stream via ACMP (sequential binder) ---
+    let targets: Vec<BindTarget> = (0..n_streams)
+        .map(|i| BindTarget {
+            listener_unique_id: i,
+            talker_unique_id: i,
+        })
+        .collect();
+    let mut binder = Binder::new(our_id, talker, our_id, talker_mac, targets);
+    // Per-stream filter params learned from each successful CONNECT_RX response.
+    let mut filter: Vec<(u64, [u8; 6], u16)> = Vec::new();
+    let mut bound_ids: std::collections::BTreeMap<u16, StreamId> = Default::default();
+
+    while !binder.is_done() {
+        if shutdown_requested() {
+            return Err(Exit::Interrupted);
+        }
+        let now = ns_since(start);
+        if let Some(send) = binder.poll(now) {
+            let hdr = EthHeader {
+                dst: avb_core::AVDECC_MULTICAST,
+                src: our_mac,
+                vlan: None,
+                ethertype: ETHERTYPE_AVTP,
+            };
+            if let Ok(f) = TxFrame::build(&hdr, &send.frame, false, 0) {
+                let _ = dext.send(f.bytes(), false, 0);
+            }
+        }
+        for slot in dext.rx_ctl() {
+            let Ok(p) = EthFrame::parse(&slot.data) else {
+                continue;
+            };
+            if p.hdr.ethertype != ETHERTYPE_AVTP
+                || p.payload.first().copied() != Some(subtype::ACMP)
+            {
+                continue;
+            }
+            let Some(acmp) = Acmpdu::decode(p.payload) else {
+                continue;
+            };
+            // Only RX_RESPONSEs matter to the binder.
+            if acmp.message_type != acmp_msg::CONNECT_RX_RESPONSE {
+                continue;
+            }
+            if let Some((luid, outcome)) = binder.on_rx(&acmp) {
+                match outcome {
+                    BindOutcome::Success => {
+                        filter.push((
+                            acmp.stream_id.0,
+                            acmp.stream_dest_mac.octets(),
+                            acmp.stream_vlan_id,
+                        ));
+                        bound_ids.insert(luid, acmp.stream_id);
+                        log.log(
+                            Level::Info,
+                            "acmp",
+                            &format!(
+                                "stream {luid} bound: id=0x{:016x} dest={:02x?} vid={}",
+                                acmp.stream_id.0,
+                                acmp.stream_dest_mac.octets(),
+                                acmp.stream_vlan_id
+                            ),
+                        );
+                    }
+                    BindOutcome::Failed { status, a5 } => log.log(
+                        Level::Warn,
+                        "acmp",
+                        &format!("stream {luid} bind failed: status={status} a5={a5}"),
+                    ),
+                    BindOutcome::TimedOut => log.log(
+                        Level::Warn,
+                        "acmp",
+                        &format!("stream {luid} bind timed out"),
+                    ),
+                }
+            }
+        }
+        let (resend, timeout_outcome) = binder.on_tick(now);
+        if let Some(send) = resend {
+            let hdr = EthHeader {
+                dst: avb_core::AVDECC_MULTICAST,
+                src: our_mac,
+                vlan: None,
+                ethertype: ETHERTYPE_AVTP,
+            };
+            if let Ok(f) = TxFrame::build(&hdr, &send.frame, false, 0) {
+                let _ = dext.send(f.bytes(), false, 0);
+            }
+        }
+        if let Some((luid, _)) = timeout_outcome {
+            log.log(
+                Level::Warn,
+                "acmp",
+                &format!("stream {luid} bind timed out"),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    if filter.is_empty() {
+        log.log(
+            Level::Error,
+            "acmp",
+            "no streams bound; cannot count packets",
+        );
+        return Err(Exit::StreamRefused);
+    }
+    // Program the dext stream filter so the audio ring receives these streams.
+    dext.set_filter(&filter);
+    log.log(
+        Level::Info,
+        "acmp",
+        &format!(
+            "{} stream(s) bound; counting AAF packets for {seconds}s",
+            filter.len()
+        ),
+    );
+
+    // --- Phase 3: count AAF packets per stream over the run ---
+    let mut counts: std::collections::BTreeMap<u64, u64> = Default::default();
+    let mut gaps: std::collections::BTreeMap<u64, u64> = Default::default();
+    let mut last_seq: std::collections::BTreeMap<u64, u8> = Default::default();
+    let run_ns = seconds.saturating_mul(1_000_000_000);
+    let interval_ns = interval.max(1).saturating_mul(1_000_000_000);
+    let count_start = now_mach();
+    let mut last_report = count_start;
+    loop {
+        if shutdown_requested() {
+            break;
+        }
+        if ns_since(count_start) >= run_ns {
+            break;
+        }
+        let h = dext.health();
+        if h.fault != 0 {
+            log.log(Level::Error, "streams", &format!("dext fault {}", h.fault));
+            return Err(Exit::DextFault);
+        }
+        for slot in dext.rx_audio() {
+            if let Ok(pdu) = avb_avtp::aaf::decode(&slot.data) {
+                let sid = pdu.hdr.stream.stream_id.0;
+                *counts.entry(sid).or_insert(0) += 1;
+                let seq = pdu.hdr.stream.seq;
+                if let Some(&prev) = last_seq.get(&sid) {
+                    let expected = prev.wrapping_add(1);
+                    if seq != expected {
+                        *gaps.entry(sid).or_insert(0) += 1;
+                    }
+                }
+                last_seq.insert(sid, seq);
+            }
+        }
+        if ns_since(last_report) >= interval_ns {
+            let secs = (ns_since(count_start) as f64) / 1e9;
+            for (sid, n) in &counts {
+                log.log(
+                    Level::Info,
+                    "streams",
+                    &format!(
+                        "stream 0x{sid:016x}: {n} pkts ({:.0}/s), seq_gaps={}",
+                        (*n as f64) / secs.max(1e-9),
+                        gaps.get(sid).copied().unwrap_or(0)
+                    ),
+                );
+            }
+            last_report = now_mach();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    // --- Report ---
+    let elapsed_s = (ns_since(count_start) as f64) / 1e9;
+    let streams_json: Vec<serde_json::Value> = bound_ids
+        .values()
+        .map(|sid| {
+            let n = counts.get(&sid.0).copied().unwrap_or(0);
+            serde_json::json!({
+                "stream_id": format!("0x{:016x}", sid.0),
+                "packets": n,
+                "packets_per_s": (n as f64) / elapsed_s.max(1e-9),
+                "seq_gaps": gaps.get(&sid.0).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    let report = serde_json::json!({
+        "schema": "avb-streams/1",
+        "talker": format!("0x{:016x}", u64::from_be_bytes(talker.0)),
+        "bound_streams": filter.len(),
+        "elapsed_s": elapsed_s,
+        "streams": streams_json,
+    });
+    if let Some(path) = json_out {
+        if let Ok(j) = serde_json::to_string_pretty(&report) {
+            let _ = std::fs::write(path, j);
+        }
+    }
+    log.log(
+        Level::Info,
+        "streams",
+        &format!(
+            "done: {} streams, {:.1}s; see per-stream pkt/s above",
+            filter.len(),
+            elapsed_s
+        ),
+    );
     Ok(())
 }
 
