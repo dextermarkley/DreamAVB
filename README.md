@@ -1,4 +1,4 @@
-# AVB-Audio
+# DreamAVB
 
 A native macOS AVB (Audio Video Bridging) audio bridge. A custom Intel I210
 DriverKit driver plus a Rust stack (gPTP / 802.1AS, MSRP/MVRP, IEEE 1722 AAF,
