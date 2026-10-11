@@ -1950,6 +1950,14 @@ fn streams_loop(
     let mut mclk: Option<avb_mediaclock::MediaClock> = None;
     let mut ring_stream_id: u64 = 0;
     let mut ring_spf: usize = 0;
+    // Geometry the ring was built from (first packet of the primary stream).
+    // Later packets must match it exactly, or the placement would be blind.
+    let mut ring_channels: u16 = 0;
+    let mut ring_bit_depth: u8 = 0;
+    let mut ring_format: u8 = 0;
+    let mut ring_nsr: u8 = 0;
+    let mut ring_data_len: u16 = 0;
+    let mut ring_format_mismatch: u64 = 0;
     // Sequential write cursor for the ring FIFO (frames). Advanced by spf per
     // placed packet; the plug-in's Consumer drains it in order.
     let mut ring_write_pos: u64 = 0;
@@ -2118,6 +2126,11 @@ fn streams_loop(
                                 ring = Some(rp);
                                 ring_stream_id = sid;
                                 ring_spf = spf;
+                                ring_channels = pdu.hdr.channels_per_frame;
+                                ring_bit_depth = pdu.hdr.bit_depth;
+                                ring_format = pdu.hdr.format;
+                                ring_nsr = pdu.hdr.nsr;
+                                ring_data_len = pdu.hdr.stream_data_length;
                                 log.log(
                                     Level::Info,
                                     "ring",
@@ -2167,6 +2180,22 @@ fn streams_loop(
                         // consumer can't track, lapping it by millions of frames
                         // (= overrun garble). The media clock still timestamps
                         // the clock block below for the plug-in's timebase.
+                        // Re-validate the packet against the geometry the ring
+                        // was built from (review M1). Only the first packet set
+                        // that geometry; a later packet with a different
+                        // format/channel count/length would be placed blind,
+                        // zero-filling the missing samples while the frame
+                        // counter kept advancing — silent corruption. The
+                        // audio.rs path already does this check.
+                        if pdu.hdr.channels_per_frame != ring_channels
+                            || pdu.hdr.bit_depth != ring_bit_depth
+                            || pdu.hdr.format != ring_format
+                            || pdu.hdr.nsr != ring_nsr
+                            || pdu.hdr.stream_data_length != ring_data_len
+                        {
+                            ring_format_mismatch += 1;
+                            continue;
+                        }
                         let fmt = if pdu.hdr.format == avb_avtp::aaf::format::INT_24BIT {
                             avb_audioring::SampleFormat::Int24
                         } else {
@@ -2320,7 +2349,7 @@ fn streams_loop(
     log.log(
         Level::Info,
         "streams",
-        &format!("audio ring: raw_slots={raw_audio_slots} non_aaf_or_undecoded={aaf_decode_fail}"),
+        &format!("audio ring: raw_slots={raw_audio_slots} non_aaf_or_undecoded={aaf_decode_fail} format_mismatch={ring_format_mismatch}"),
     );
     let _ = first_slot_dump;
     // Channel-map: report channels whose peak |sample| is well above the noise

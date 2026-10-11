@@ -195,7 +195,6 @@ fn property_known(object_id: AudioObjectID, selector: UInt32) -> bool {
                 || x == kAudioDevicePropertyIsHidden
                 || x == kAudioDevicePropertyZeroTimeStampPeriod
                 || x == kAudioDevicePropertyPreferredChannelsForStereo
-                || x == kAudioDevicePropertyPreferredChannelLayout
         ),
         K_STREAM_OBJECT | K_STREAM_OUT_OBJECT => matches!(
             selector,
@@ -315,14 +314,27 @@ pub extern "C" fn get_property_data_size(
         }
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyRelatedDevices => oidsz,
         (K_DEVICE_OBJECT, s) if s == kAudioObjectPropertyControlList => 0,
-        (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyStreams => 2 * oidsz,
+        // Scope-aware, matching the DATA handler exactly (review M1): input or
+        // output scope has ONE stream, global/wildcard has both. Returning
+        // 2 ids here regardless of scope told a client to expect two and then
+        // handed it one, so it read a stale id.
+        (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyStreams => {
+            if a.mScope == kAudioObjectPropertyScopeInput
+                || a.mScope == kAudioObjectPropertyScopeOutput
+            {
+                oidsz
+            } else {
+                2 * oidsz
+            }
+        }
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyNominalSampleRate => f64sz,
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyAvailableNominalSampleRates => rangesz,
         (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyPreferredChannelsForStereo => 2 * u32sz,
-        (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyPreferredChannelLayout => {
-            // AudioChannelLayout header (12 bytes) + N descriptions (20 bytes).
-            12 + DEVICE_CHANNELS * 20
-        }
+        // NOTE: kAudioDevicePropertyPreferredChannelLayout is deliberately NOT
+        // advertised. It was listed as known and sized here but had no case in
+        // GetPropertyData, so HasProperty said yes and the get returned
+        // UnknownProperty (review M2). The HAL derives a sensible default
+        // layout from the channel count when the property is absent.
         // Stream.
         (K_STREAM_OBJECT | K_STREAM_OUT_OBJECT, s)
             if s == kAudioStreamPropertyDirection
