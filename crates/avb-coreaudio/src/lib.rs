@@ -433,6 +433,19 @@ mod io_op_tests {
         );
     }
 
+    /// Stream terminal types, also pinned to the SDK. Speaker was 0x0301 — the
+    /// USB Audio Class terminal type, a different namespace that CoreAudio
+    /// never matches — while its sibling Microphone was a correct FourCC.
+    #[test]
+    fn terminal_type_fourccs_match_the_sdk() {
+        assert_eq!(kAudioStreamTerminalTypeMicrophone, 0x6d69_6372); // 'micr'
+        assert_eq!(kAudioStreamTerminalTypeSpeaker, 0x7370_6b72); // 'spkr'
+        assert_ne!(
+            kAudioStreamTerminalTypeSpeaker, 0x0301,
+            "Speaker must not regress to the USB Audio Class value"
+        );
+    }
+
     #[test]
     fn only_read_input_and_write_mix_are_claimed() {
         assert!(op_is_handled(kAudioServerPlugInIOOperationReadInput));

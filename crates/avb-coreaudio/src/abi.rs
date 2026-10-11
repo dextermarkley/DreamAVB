@@ -314,8 +314,15 @@ pub const kAudioObjectPropertyElementMain: UInt32 = 0;
 // Values.
 pub const kAudioDeviceTransportTypeVirtual: UInt32 = u32::from_be_bytes(*b"virt");
 pub const kAudioStreamTerminalTypeMicrophone: UInt32 = u32::from_be_bytes(*b"micr");
-/// Output speaker terminal type (CoreAudioTypes.h: OUTPUT_SPEAKER = 0x0301).
-pub const kAudioStreamTerminalTypeSpeaker: UInt32 = 0x0301;
+/// Output speaker terminal type. FourCC 'spkr', per the
+/// `kAudioStreamTerminalType*` enum in <CoreAudioTypes/CoreAudioBaseTypes.h>,
+/// alongside 'micr' above.
+///
+/// This was 0x0301, which is the USB Audio Class output terminal type for a
+/// speaker — a different namespace entirely, and not a value CoreAudio ever
+/// matches. Found by auditing all 66 constants against the SDK headers after
+/// the WriteMix FourCC turned out to be guessed.
+pub const kAudioStreamTerminalTypeSpeaker: UInt32 = u32::from_be_bytes(*b"spkr");
 
 pub const kAudioHardwareNoError: OSStatus = 0;
 pub const kAudioHardwareBadObjectError: OSStatus = u32::from_be_bytes(*b"!obj") as OSStatus;
