@@ -148,16 +148,17 @@ impl AafTalker {
     /// order, taking the top `wire_bps` bytes of each sample (left-justified,
     /// the inverse of the listener's `read_be_iNN_*`).
     fn swap_le_to_be(&self, src_le: &[u8], dst_be: &mut [u8]) {
-        let bps = self.wire_bps;
-        for (i, le) in src_le.chunks_exact(4).enumerate() {
+        let bps = self.wire_bps.min(4);
+        let (chunks, _rem) = src_le.as_chunks::<4>();
+        for (i, le) in chunks.iter().enumerate() {
             // le = [b0, b1, b2, b3] little-endian S32; big-endian is reversed.
             // Wire takes the HIGH `bps` bytes of the BE sample, i.e. the top
             // `bps` of [b3, b2, b1, b0].
             let be = [le[3], le[2], le[1], le[0]];
             let dst_off = i * bps;
-            if let Some(slot) = dst_be.get_mut(dst_off..dst_off + bps) {
-                // top `bps` bytes of the 4-byte BE sample
-                slot.copy_from_slice(&be[..bps]);
+            if let (Some(slot), Some(src)) = (dst_be.get_mut(dst_off..dst_off + bps), be.get(..bps))
+            {
+                slot.copy_from_slice(src);
             }
         }
     }
@@ -167,6 +168,7 @@ impl AafTalker {
 const MAX_PDU_PAYLOAD: usize = 64 * 64 * 4;
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::aaf;
