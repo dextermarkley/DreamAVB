@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! MRP state machines (IEEE 802.1Q-2018 §10.7), hand-written from the
 //! standard's tables:
 //! - applicant: Table 10-3 (§10.7.7), 12 states VO..LO;

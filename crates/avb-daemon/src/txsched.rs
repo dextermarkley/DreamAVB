@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The TX scheduler (design §5.2). Three fixed-capacity sub-queues (gPTP 8,
 //! MRP 16, AVDECC 40), strict priority gPTP > MRP > AVDECC, FIFO within a
 //! class. A `want_ts` frame is held while a timestamp is outstanding but does

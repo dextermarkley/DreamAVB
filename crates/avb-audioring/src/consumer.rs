@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The ring consumer (design §10.6): reads committed frames into a caller
 //! buffer, skipping past an overrun and counting underruns. Single consumer
 //! (the `rec` thread in Phase 1a, the AudioServerPlugIn in Phase 1b).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! MSRP (802.1Q-2018 §35.2.2) and MVRP (§11.2.3.1) attribute values and their
 //! FirstValue encodings.
 

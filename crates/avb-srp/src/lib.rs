@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-srp: sans-IO IEEE 802.1Q-2018 MRP end-station participant for MSRP
 //! and MVRP (design §8).
 //!

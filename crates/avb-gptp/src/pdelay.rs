@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Peer delay (design §7.2): NRR window, link delay, the initiator and
 //! responder exchange state, and the asCapable conditions.
 //!

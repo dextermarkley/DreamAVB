@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Participant tests: declarations, registrations, timers, LeaveAll, Domain
 //! adoption, TalkerChanged, TA_WAIT-style Listener declarations.
 #![allow(clippy::indexing_slicing)]

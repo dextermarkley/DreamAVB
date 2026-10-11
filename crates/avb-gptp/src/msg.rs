@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! IEEE 802.1AS-2020 message codec (layer-2 transport, design §7.1, §13.2).
 //!
 //! Decoded: Sync (two-step), Follow_Up with the Follow_Up information TLV,

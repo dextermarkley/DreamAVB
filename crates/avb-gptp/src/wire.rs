@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Bounds-checked big-endian cursors. The protocol crates deny
 //! `clippy::indexing_slicing`, so every field access goes through these.
 

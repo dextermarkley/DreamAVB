@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Single-writer sequence lock over atomic words (design §5.1).
 //!
 //! The storage is `seq: AtomicU32` plus `[AtomicU64; N]`, so there are no

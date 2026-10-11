@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Injected time: mach ticks, the mach timebase, gPTP nanoseconds and 32-bit
 //! timestamp extension. No clock is read here (design §6.1).
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! AAF talker packetizer (Phase 1b-2, the output/playback direction).
 //!
 //! The mirror of the listener decode path: given a negotiated [`AafFormat`] and

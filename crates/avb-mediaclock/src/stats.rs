@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Media-clock statistics: 10 s windows, ppm vs nominal, sd across windows,
 //! RMS of the loop error as residual jitter, and the MCR-5 verdict
 //! (design §10.5).

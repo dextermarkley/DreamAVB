@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ACMP: AVDECC Connection Management Protocol (IEEE 1722.1-2021 §8; design
 //! §9.2 binding, §9.4 listener SM).
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The 64-bit AEM stream format (IEEE 1722.1-2021 §7.3.2 *(verify)*;
 //! design §10.1).
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Bounds-checked big-endian cursors (`clippy::indexing_slicing` is denied).
 
 pub(crate) struct Rd<'a> {

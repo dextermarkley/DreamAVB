@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The gPTP port (design §7.2–§7.4): port state machine, Sync/Follow_Up
 //! offset, servo driving, peer delay scheduling, Signaling, step bookkeeping
 //! and the gPTP ↔ mach model.

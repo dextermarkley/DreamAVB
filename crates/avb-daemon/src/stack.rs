@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Stack wiring and subcommand runners (design §5.2 bring-up, §5.3 shutdown,
 //! §11). The ctl/audio/rec threads and the full record loop run on hardware
 //! at the milestones; the bring-up sequence, exit-code mapping and the

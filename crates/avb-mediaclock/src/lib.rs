@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-mediaclock: sans-IO media-clock recovery for the listener (design
 //! §10.3–§10.5).
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! WAV / RF64 header construction (design §11.3). Pure byte-builders: the
 //! daemon's `rec` thread writes the 104-byte header, then streams data, then
 //! patches sizes (or rewrites to RF64) on finalize. Golden bytes are pinned

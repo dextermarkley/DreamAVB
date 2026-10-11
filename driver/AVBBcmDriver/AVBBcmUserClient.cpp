@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // AVBBcmUserClient.cpp - validates argument counts with an
 // IOUserClientMethodDispatch table, then forwards every call to
 // AVBBcmDriver::HandleUserMethod on the driver's default queue. That keeps all

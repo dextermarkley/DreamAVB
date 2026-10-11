@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // I210Logic.hpp - pure, header-only helpers for the Intel I210 dext.
 //
 // No DriverKit includes: this file is compiled both into the dext and into the

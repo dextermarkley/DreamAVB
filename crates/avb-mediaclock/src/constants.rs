@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Rate-derived media-clock constants (design §10.5). Every threshold is a
 //! duration converted with the bound model's `rate` (AUDIO_UNIT current rate,
 //! Hz) and `spf` (samples per frame of the reference stream), never a packet

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! JSON report builders (design §11.3 summary.json, §11.1 subcommand
 //! summaries). Pure serde_json; the stack fills them from run-time state.
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-audioring: the recovered-audio ring ABI v1 (design §10.6).
 //!
 //! A position-independent 16 KiB header plus an interleaved S32LE data region.

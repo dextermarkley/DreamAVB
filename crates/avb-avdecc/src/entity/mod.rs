@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Our listener entity (design §9.3, §9.4): the ADP advertiser, the AECP AEM
 //! responder, and the per-STREAM_INPUT ACMP listener state machines.
 //!

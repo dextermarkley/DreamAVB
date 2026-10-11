@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! File-backed shared memory for the recovered-audio ring (Phase 1b-1).
 //!
 //! The daemon (producer) creates a memory-mapped FILE at a fixed world-

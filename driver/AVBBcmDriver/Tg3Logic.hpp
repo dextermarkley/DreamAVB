@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Tg3Logic.hpp - pure, header-only helpers for the BCM57762 dext.
 //
 // No DriverKit includes: this file is compiled both into the dext and into the

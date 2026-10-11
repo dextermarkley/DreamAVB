@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! pcap writer (design §11.1 capture / §4): nanosecond-resolution classic
 //! pcap (magic `0xA1B23C4D`). Pure byte-builders; the daemon writes the global
 //! header once, then a 16-byte record header + bytes per captured slot.

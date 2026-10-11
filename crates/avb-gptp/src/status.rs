@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! gPTP status for logs and JSON (design §7.6, PTP-10).
 
 use std::collections::VecDeque;

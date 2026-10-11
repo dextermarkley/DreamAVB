@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The AEM model, descriptor codecs and dump (design §9.2, §9.3).
 
 pub mod desc;

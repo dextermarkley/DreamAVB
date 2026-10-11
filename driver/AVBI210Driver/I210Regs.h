@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // I210Regs.h - Intel I210 register offsets and bit values used by the
 // AVBI210Driver dext.
 //

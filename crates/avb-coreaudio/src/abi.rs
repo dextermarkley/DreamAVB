@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The CoreAudio / AudioServerPlugIn C ABI, hand-declared.
 //!
 //! A HAL plug-in is a CFPlugIn: `coreaudiod` calls our factory (named in

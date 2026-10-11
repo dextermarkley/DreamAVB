@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Port-level tests over the simulated 16R (design §14.1 avb-gptp row).
 #![allow(clippy::indexing_slicing)]
 

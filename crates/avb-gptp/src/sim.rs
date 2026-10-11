@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Test-only simulation of the 16R (GM + peer-delay responder/initiator), the
 //! dext's timestamping, step generations and the §3.6 settle-window rule,
 //! and the daemon's TX scheduler. Time is mach ns (identity timebase).

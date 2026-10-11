@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Minimal IEEE 802.1AS / 1588v2 (layer 2) message building and parsing for
 //! the Phase 0 peer-delay test. Only what G3/G4 need: build Pdelay_Req, parse
 //! Pdelay_Req/Pdelay_Resp/Pdelay_Resp_Follow_Up, identify the other types.

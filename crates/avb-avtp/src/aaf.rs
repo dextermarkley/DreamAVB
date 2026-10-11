@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! AVTP Audio Format, PCM encapsulation (IEEE 1722-2016 §7.2-§7.3
 //! *(verify)*).
 //!

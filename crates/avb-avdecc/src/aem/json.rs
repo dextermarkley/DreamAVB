@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The AEM dump JSON (design §9.2 ADC-6), schema `avb-aem-dump/1`.
 //!
 //! Builds a `serde_json::Value` with exactly the §9.2 top-level keys from a

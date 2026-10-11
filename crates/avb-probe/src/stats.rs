@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Clock statistics: mach timebase conversion, least-squares fit of EAV ns
 //! against host time, monotonicity and bracket helpers.
 

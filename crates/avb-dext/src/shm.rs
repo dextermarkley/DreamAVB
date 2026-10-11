@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Consumer side of the dext's shared-memory RX rings (design §3.4, §5.2).
 //!
 //! The dext (producer) writes slots with plain stores and publishes them with

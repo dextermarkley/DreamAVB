@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // AVBI210Driver.cpp - Phase 0b PCIDriverKit driver for the Intel I210 in the
 // Thunderbolt AVB adapter (PCI 8086:1533, subsystem 1ab6:0214).
 //

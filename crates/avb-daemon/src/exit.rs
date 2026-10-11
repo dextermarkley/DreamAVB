@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Process exit codes (design §11.4). A single enum so every exit path names
 //! its reason and the codes are pinned by a test.
 

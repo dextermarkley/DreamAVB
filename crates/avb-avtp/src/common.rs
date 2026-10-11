@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! AVTP EtherType, subtype codes and the common stream header
 //! (IEEE 1722-2016 §4.4).
 

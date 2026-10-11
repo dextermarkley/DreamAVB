@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-probe: Phase 0 / 0b hardware gates for the AVB dexts (AVBI210Driver,
 //! AVBBcmDriver). `--nic auto|i210|bcm` picks the service (auto: I210 first).
 //!

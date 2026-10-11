@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Rust mirror of `driver/AVBShared.h` (user-client ABI version 3).
 //!
 //! Keep in lock-step with the C header: the tests at the bottom assert the

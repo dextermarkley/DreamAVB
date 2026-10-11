@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Fixed-capacity transmit queue (design §5.2): each protocol crate's `poll`
 //! writes into its own class's `Outbox<N>`; a push into a full outbox drops
 //! the **new** frame and returns [`TxFull`]. No allocation after construction.

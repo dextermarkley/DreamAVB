@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Ethernet II frames with at most one IEEE 802.1Q C-tag: parse and build.
 //!
 //! Frames arrive without FCS. A VLAN tag is either in the frame bytes

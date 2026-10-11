@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-core: std-only primitives shared by the Phase 1a protocol crates
 //! (design §6.1, §5.1).
 //!

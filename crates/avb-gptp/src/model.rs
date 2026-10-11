@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! gPTP ↔ mach model (design §7.5, PTP-6).
 //!
 //! Every 125 ms `ctl` calls `ReadClock(8)` and hands the samples to

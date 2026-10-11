@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Link the plug-in as a Mach-O **bundle** (`MH_BUNDLE`), not a dylib.
 //!
 //! CoreAudio's `coreaudiod` loads a HAL plug-in with `CFBundle`, which only

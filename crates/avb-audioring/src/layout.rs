@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The recovered-audio ring ABI v1 layout (design §10.6).
 //!
 //! The header is a position-independent 16 384-byte region: fields live at

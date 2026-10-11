@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The AudioServerPlugIn driver-interface method implementations — a faithful
 //! port of Apple's `NullAudio.c` property model, trimmed to one input-only
 //! device.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `derive`: build our listener model from the 16R's AEM (design §9.1, §9.3).
 //!
 //! [`listener_model`] is the ONLY constructor of [`ListenerModel`]; nothing

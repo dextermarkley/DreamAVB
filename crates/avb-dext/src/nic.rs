@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-NIC data for the probe: which service to open, register names, the
 //! read-only dump, frequency math and timestamp-point latencies. The NIC
 //! specific parts are data plus two pure functions, so a static table is

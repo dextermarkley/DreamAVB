@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `RealDext`: the production [`DextPort`] over `avb_dext::Device` (design
 //! §5.2, §5.3). The start/shutdown sequencing and the mapped-ring consumer
 //! live in the stack wiring; this type is the per-call command bridge. It is

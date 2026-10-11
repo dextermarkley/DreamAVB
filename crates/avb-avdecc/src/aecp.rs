@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! AECP: AVDECC Enumeration and Control Protocol (IEEE 1722.1-2021 §9;
 //! design §9.2 AECP engine, §9.3 responder).
 //!

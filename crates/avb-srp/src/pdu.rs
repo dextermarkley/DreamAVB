@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! MRPDU vector codec (802.1Q-2018 §10.8, MSRP specifics §35.2.2).
 //!
 //! ```text

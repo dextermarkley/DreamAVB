@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The AVDECC controller's connection management (design §9.2 Binding,
 //! ADC-14, ADC-15). Discovery and the enumeration walk are driven by the
 //! daemon through the [`crate::aecp::AecpEngine`]; this module owns the ACMP

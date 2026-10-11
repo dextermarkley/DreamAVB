@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-avdecc: sans-IO IEEE 1722.1-2021 / Milan v1.2 AVDECC for the Phase 1a
 //! listener (design §9).
 //!

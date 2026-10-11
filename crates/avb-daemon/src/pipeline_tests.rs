@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Full-stack pipeline tests (design §14.1 avb-daemon row): synthetic AEM +
 //! generated AAF frames fed through the audio engine → ring → consumer → WAV
 //! bytes, checking alignment, zero-fill, counters, channel map and bit

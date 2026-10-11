@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! MAC addresses, EUI-64 identifiers, stream IDs and the AVDECC destination
 //! predicate.
 

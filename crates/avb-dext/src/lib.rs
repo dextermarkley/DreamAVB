@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-dext: the user-space side of the AVB dext user-client ABI (v3).
 //!
 //! - `abi`: hand mirror of driver/AVBShared.h (sizes/offsets asserted in tests);

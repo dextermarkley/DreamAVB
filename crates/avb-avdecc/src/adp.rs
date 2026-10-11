@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ADP: AVDECC Discovery Protocol (IEEE 1722.1-2021 §6; design §9.2, §9.3).
 //!
 //! The ADPDU is a 68-byte AVTP control PDU: the AVTP control header

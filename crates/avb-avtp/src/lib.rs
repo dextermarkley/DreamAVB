@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-avtp: sans-IO IEEE 1722-2016 AVTP pieces the listener needs (design
 //! §10.1, §10.2).
 //!

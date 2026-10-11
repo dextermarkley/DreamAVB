@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // AVBShared.h - user-client ABI shared by the AVB dexts (AVBBcmDriver,
 // AVBI210Driver) and the Rust user-space tools (mirrored by hand in
 // crates/avb-dext/src/abi.rs; both sides assert the struct sizes and offsets

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! PI servo with ACQUIRE / TRACKING / LOCKED / HOLDOVER (design §7.3 table).
 //!
 //! One update per accepted Sync. The caller (the port) only feeds Syncs that

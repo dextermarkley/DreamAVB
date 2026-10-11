@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-coreaudio: a CoreAudio AudioServerPlugIn (HAL plug-in) that will expose
 //! the 16R's AVB streams as a macOS input device (Phase 1b).
 //!

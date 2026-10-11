@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! JSON report accumulation for `--json <path>`.
 //!
 //! The file holds one top-level object. Each test appends a record under its

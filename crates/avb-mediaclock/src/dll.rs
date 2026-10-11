@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The 2nd-order media-clock DLL (design §10.5).
 //!
 //! Times are f64 ns relative to an epoch `E` (u64 ns) rebased every 60 s to

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Thin IOKit wrapper around the AVB dext user client (AVBI210Driver or
 //! AVBBcmDriver; same ABI).
 //!

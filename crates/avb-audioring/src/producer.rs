@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The ring producer (design §10.6): placement writes, zero-fill, frontier
 //! commit with the lagging-stream and all-silent rules, gap logging, overrun
 //! counting. Never blocks (RING-1). Single producer (the `audio` thread).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-installer: host app for the AVB driver system extensions.
 //!
 //! This binary lives at `AVBInstaller.app/Contents/MacOS/avb-installer` and is

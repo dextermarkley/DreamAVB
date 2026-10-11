@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Counter helpers. Counters are monotonic `u64`s; the atomic form is for
 //! values one thread writes and others read (relaxed, tear-free on arm64).
 

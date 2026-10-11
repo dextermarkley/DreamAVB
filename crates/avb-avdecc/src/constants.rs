@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Every AVDECC command / status / descriptor / message-type code the design
 //! relies on, as a named `const` with an IEEE 1722.1-2021 or Milan v1.2
 //! citation. Pinned by [`tests`] so a typo cannot drift silently (design §9,

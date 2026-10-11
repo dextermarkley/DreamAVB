@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The decoded AEM model (design §9.2 enumeration, §9.3 derived model).
 //!
 //! These are plain data structs the controller fills from READ_DESCRIPTOR

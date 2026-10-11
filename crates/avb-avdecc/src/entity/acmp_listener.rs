@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The Milan ACMP listener state machine (design §9.4, Milan v1.2 §5.5.3).
 //!
 //! One [`ListenerSm`] per STREAM_INPUT. Sans-IO: events in, actions out, one

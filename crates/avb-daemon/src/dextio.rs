@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The `DextPort` trait (design §14.2) abstracts the dext so the daemon logic
 //! is testable without IOKit. `RealDext` (in `realdext.rs`) implements it over
 //! `avb-dext`; `FakeDext` (here, test-only) uses heap rings, a scripted 16R

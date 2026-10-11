@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The ring mapping and header accessors (design §10.6). `AudioRing` owns the
 //! region (anonymous mmap in Phase 1a, or a borrowed mapping via `from_raw`
 //! in Phase 1b). All header access is atomic, by byte offset, so a C reader

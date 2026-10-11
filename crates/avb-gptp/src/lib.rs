@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-gptp: sans-IO, slave-only IEEE 802.1AS time-aware end station
 //! (design §7).
 //!

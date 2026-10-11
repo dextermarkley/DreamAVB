@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Host-side unit tests for Tg3Logic.hpp and the AVBShared.h ABI.
 // Plain assert-style runner: prints one line per check group, exits non-zero
 // on the first failure.

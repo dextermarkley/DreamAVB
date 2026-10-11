@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The media-clock lock state machine and reference-stream management
 //! (design §10.5). Sans-IO: packet events in, lock transitions and the
 //! published model out.

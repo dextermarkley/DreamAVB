@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Logging (design §11.1, NFR-4): stderr, prefixed `avb-daemon[<subsys>]:`,
 //! rate-limited to one line per key per 10 s for repetitive conditions.
 //! Nothing is logged on the audio per-packet path.

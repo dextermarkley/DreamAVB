@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! External input validation (design §13.2). clap handles syntactic ranges
 //! (exit 2); these are the semantic checks that map to specific exit codes
 //! (talker id format, output path writability, disk space).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Milan v1.2 specifics: the Vendor-Unique MVU protocol id, GET_MILAN_INFO,
 //! and the probing-status enum used in GET_STREAM_INFO (Milan v1.2 §5.4.2.10,
 //! §5.4.4). Named constants with citations, pinned by tests.

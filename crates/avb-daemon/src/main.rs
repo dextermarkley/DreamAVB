@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! avb-daemon: the Phase 1a AVB listener daemon (design §5, §11, §13).
 //!
 //! Subcommands (§11.1): `run`, `aem-dump`, `gptp`, `streams`, `record`,

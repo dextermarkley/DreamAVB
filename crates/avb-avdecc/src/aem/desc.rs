@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! AEM descriptor codecs (IEEE 1722.1-2021 §7.2). Decode is used by the
 //! controller to enumerate the 16R; encode is used by our listener entity's
 //! READ_DESCRIPTOR responder (design §9.2, §9.3).

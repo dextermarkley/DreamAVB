@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The audio per-packet pipeline (design §10.2–§10.6). The `audio` thread
 //! calls [`AudioEngine::on_packet`] for each AAF slot; it parses, classifies
 //! timing, drives the media clock on the reference stream, and places samples

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Sample placement and arrival/late/early classification (design §10.3,
 //! §10.6 placement). Pure arithmetic over DLL state; no I/O.
 

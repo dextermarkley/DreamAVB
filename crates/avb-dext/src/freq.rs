@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Frequency-adjust register math, one module per NIC. Each mirrors the
 //! C++ helper its dext uses, and both sides test the same golden table.
 

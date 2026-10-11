@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The end-station MRP participant for MSRP and MVRP (design §8): one
 //! attribute table per application, each attribute with an applicant and a
 //! registrar (802.1Q-2018 §10.7), one LeaveAll machine per application,

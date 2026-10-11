@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Bcm57762Regs.h - register map for the Broadcom BCM57762 (57766-class) as
 // used by the AVB-Audio Phase 0 dext.
 //

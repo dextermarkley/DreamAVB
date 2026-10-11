@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // AVBBcmDriver.cpp - Phase 0 PCIDriverKit driver for the BCM57762 (57766-class)
 // in the Apple Thunderbolt Gigabit Ethernet adapter.
 //

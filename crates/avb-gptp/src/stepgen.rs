@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Step bookkeeping (design §7.3 "Step bookkeeping", rev 5).
 //!
 //! - RX event timestamps get their generation from the dext's slot alone
