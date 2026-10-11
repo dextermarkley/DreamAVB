@@ -38,6 +38,10 @@ cp "$DYLIB" "$BUNDLE/Contents/MacOS/AVBAudio"
 # CODESIGN_IDENTITY; defaults to the Apple Development cert on this machine.
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-Apple Development: armitage787@gmail.com (32P75VK9W8)}"
 echo "signing as: $CODESIGN_IDENTITY"
+# Plain hardened-runtime signing, NO entitlements. An Apple Development cert
+# cannot grant com.apple.security.cs.disable-library-validation without a
+# provisioning profile — codesign silently drops it and the resulting state is
+# SIGKILLed "Code Signature Invalid" at dlopen. This plain form loads cleanly.
 codesign --force --options runtime --timestamp=none \
   --sign "$CODESIGN_IDENTITY" "$BUNDLE"
 

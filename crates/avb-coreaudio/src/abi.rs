@@ -349,4 +349,18 @@ pub fn cfstring(s: &str) -> CFStringRef {
     }
 }
 
+// --- Diagnostic file log (robust; coreaudiod stderr/os_log are unreliable
+// to capture from a third-party plug-in). Appends to a world-writable path so
+// coreaudiod (_coreaudiod user) can write it. Dev-only. ---
+pub fn oslog(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/avb-coreaudio.log")
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 const _: () = assert!(std::mem::size_of::<c_int>() == 4);
