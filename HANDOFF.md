@@ -33,30 +33,38 @@ Phase 1b (next) covers three things. The first is a Rust Core Audio AudioServerP
 
 ### Resume point: all code FEATs done; review loop + hardware next
 
-FEAT-001…FEAT-005 are all **done** on `phase1a-listener` (latest `a631a82`). The
-whole Rust workspace (11 crates) and the C++ dext tests build and pass; the
-packaged `avb-daemon` is signed with `packaging/daemon.entitlements` (I210
-only) and `--help` lists all six subcommands. AS-7 decisions and every FEAT's
-deviations are recorded in `.agents/tasks/phase1a-impl-verification.md`.
+FEAT-001…FEAT-005 are all **done** on `phase1a-listener`. The review loop is
+done (`104df2b`). **hw-gptp** (`353f662`) and **hw-avdecc** (`bcfe889`) are
+done on the real hardware. The whole Rust workspace (11 crates, 320 tests) and
+the C++ dext tests build and pass; the packaged `avb-daemon` is signed with
+`packaging/daemon.entitlements` (I210 only). Decisions and every FEAT's
+deviations, plus the hw-gptp/hw-avdecc results and the seven hardware bugs
+found, are recorded in `.agents/tasks/phase1a-impl-verification.md`.
 
-What is left in Phase 1a (needs no more green-field coding):
+Hardware state (as of the milestone runs): the **ABI v3 dext (283.0.31) is
+activated and matched** to the I210 (`AVBI210Driver`, `avb-probe info` reads
+it). It was activated via `avb-installer activate`; a reboot + Thunderbolt
+replug were needed once to clear a tangled sysextd and let the dext win the
+match over Apple's generic E1000 driver. The 16R is cabled to the I210.
 
-1. **Implement-and-review loop over the whole diff.** The reviewer runs last
-   and gates the loop (plan). This is the next step a fresh session should take:
-   review the full `phase1a-listener` diff against the design and fix findings
-   until the reviewer approves.
-2. **Four hardware milestones, in order (§4).** These REQUIRE the user: they
-   run against the real 16R/I210 and may need a replug or boot-security steps
-   (AGENTS.md — ask before any physical action or NVRAM/SIP/dext-approval
-   change). The ABI v3 dext from FEAT-001 has **not** been activated on
-   hardware yet; `avb-installer activate` + an `ioreg`/kernelmanagerd check come
-   first.
-   - hw-gptp: lock to the 16R as GM ≥ 5 min, asCapable true.
-   - hw-avdecc: `avb-daemon aem-dump` → the full AEM JSON.
-   - hw-streams: bind all STREAM_OUTPUTs, confirm 8000 pkt/s per stream.
-   - hw-audio: a 600 s multichannel WAV, no sequence gaps, media-clock drift in
-     ppm. Pause and ask the user to feed signal into specific 16R inputs for the
-     channel-map check.
+What is left in Phase 1a:
+
+1. **hw-streams** — bind all STREAM_OUTPUTs, confirm 8000 pkt/s per stream.
+   Reuses the hw-gptp bring-up + ADP/AECP path and the fixed avdecc codecs; the
+   `streams` runner's loop body still needs implementing like `gptp`/`aem-dump`.
+2. **hw-audio** — a 600 s multichannel WAV, no sequence gaps, media-clock drift
+   in ppm. The `record` runner's loop still needs implementing. **This one needs
+   the user**: pause and ask them to feed signal into specific 16R inputs so the
+   channel map can be checked.
+3. `docs/phase1a-results.md` from the milestone runs.
+
+### Hardware bugs fixed (all in `phase1a-impl-verification.md`)
+gPTP: init_datapath flags, mapped ctl-ring RX vs PollRx, TX_TS status polarity,
+clock-gen seed/resync, SetClock vs bounded step. AVDECC: AVTP header byte-order
+inversion (adp/aecp/acmp), READ_DESCRIPTOR missing reserved field.
+
+<!-- superseded resume notes below -->
+
 3. `docs/phase1a-results.md` from the milestone runs.
 
 The ctl/audio/rec threads (§5.1) and the full `run`/`record` loops are wired
