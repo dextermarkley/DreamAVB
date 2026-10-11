@@ -670,6 +670,16 @@ pub extern "C" fn do_io_operation(
 
     let mut filled = 0usize;
     if let Ok(mut guard) = IO.lock() {
+        // Lazy attach-retry: StartIO may have run before the daemon created
+        // the ring file, and attach is otherwise one-shot. Retry here so we
+        // pick it up whenever the daemon appears — regardless of start order.
+        if guard.is_none() {
+            if let Ok(shm) = ShmRing::attach() {
+                let read_frame = Consumer::new(shm.ring()).write_frame();
+                *guard = Some(IoState { shm, read_frame });
+                oslog("[avb-coreaudio] IO: attached ring (lazy retry in DoIO)");
+            }
+        }
         if let Some(state) = guard.as_mut() {
             let ring = state.shm.ring();
             // Seed from OUR saved cursor (set live on StartIO), not the ring's
