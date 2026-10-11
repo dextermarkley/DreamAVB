@@ -108,21 +108,15 @@ extern "C" fn get_zero_time_stamp(
     out_seed: *mut u64,
 ) -> OSStatus {
     // The HAL models device timing as (sampleTime, hostTime) pairs spaced
-    // ZeroTimeStampPeriod (RING_FRAMES) apart. We compute both as a pure
-    // function of `now` and a single captured anchor, so the returned pair is
-    // always mutually consistent even under concurrent calls (no mutable
-    // per-call counter to race on — unlike BlackHole, which must hold its IO
-    // mutex because it advances a counter).
+    // RING_FRAMES apart. Both are computed as a pure function of `now` and a
+    // single captured anchor, so the returned pair is always mutually
+    // consistent even under concurrent calls (no per-call counter to race on).
     //
-    // The ONE correction for our cross-clock device is the rate: frames arrive
-    // on the 16R MEDIA clock (disciplined rate_hz_vs_mach, e.g. 47994 Hz at
-    // −118 ppm), NOT the Mac host clock's nominal 48 kHz. Reporting nominal
-    // makes the HAL reclock the stream against a timeline that drifts from data
-    // arrival — audible as warble even though every ring byte is correct
-    // (BlackHole avoids this only as a shared-HAL-clock loopback; CamillaDSP's
-    // docs name adjusting the virtual clock rate as the fix). When the ring is
-    // unattached or unlocked we fall back to the nominal rate so the device
-    // stays alive.
+    // Cross-clock correction: frames arrive on the 16R MEDIA clock (disciplined
+    // rate_hz_vs_mach, e.g. ~47994 Hz at −118 ppm), not the Mac host clock's
+    // nominal 48 kHz. Reporting the true rate keeps the HAL's device timeline
+    // aligned with actual data arrival; falls back to nominal when the ring is
+    // unattached or the media clock is not yet locked.
     use std::sync::atomic::{AtomicU64, Ordering};
     static ANCHOR_HOST: AtomicU64 = AtomicU64::new(0);
 

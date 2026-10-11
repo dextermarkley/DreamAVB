@@ -84,52 +84,6 @@ pub const kAudioFormatFlagsNativeEndian: UInt32 = kAudioFormatFlagIsBigEndian;
 #[cfg(target_endian = "little")]
 pub const kAudioFormatFlagsNativeEndian: UInt32 = 0;
 
-/// `SMPTETime` (<CoreAudio/CoreAudioBaseTypes.h>). We never read its fields;
-/// it exists only so `AudioTimeStamp` has the correct size/alignment and
-/// `mSampleTime` lands at the right offset in `AudioServerPlugInIOCycleInfo`.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct SMPTETime {
-    pub mSubframes: i16,
-    pub mSubframeDivisor: i16,
-    pub mCounter: UInt32,
-    pub mType: UInt32,
-    pub mFlags: UInt32,
-    pub mHours: i16,
-    pub mMinutes: i16,
-    pub mSeconds: i16,
-    pub mFrames: i16,
-}
-
-/// `AudioTimeStamp` (<CoreAudio/CoreAudioBaseTypes.h>). `mSampleTime` is the
-/// device-timeline frame position the HAL is referring to this cycle.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct AudioTimeStamp {
-    pub mSampleTime: Float64,
-    pub mHostTime: u64,
-    pub mRateScalar: Float64,
-    pub mWordClockTime: u64,
-    pub mSMPTETime: SMPTETime,
-    pub mFlags: UInt32,
-    pub mReserved: UInt32,
-}
-
-/// `AudioServerPlugInIOCycleInfo` (<CoreAudio/AudioServerPlugIn.h>). Passed by
-/// const pointer to DoIOOperation; `mInputTime.mSampleTime` is the ring index
-/// the HAL wants filled for a ReadInput operation.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct AudioServerPlugInIOCycleInfo {
-    pub mIOCycleCounter: u64,
-    pub mNominalIOBufferFrameSize: UInt32,
-    pub mCurrentTime: AudioTimeStamp,
-    pub mInputTime: AudioTimeStamp,
-    pub mOutputTime: AudioTimeStamp,
-    pub mMainHostTicksPerFrame: Float64,
-    pub mDeviceHostTicksPerFrame: Float64,
-}
-
 // `AudioServerPlugInClientInfo` and the remaining IO timing structs are passed
 // through as opaque for the skeleton; declared as raw pointers in the vtable
 // below.
