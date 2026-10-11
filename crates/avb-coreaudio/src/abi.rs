@@ -250,4 +250,31 @@ pub const kAudioHardwareIllegalOperationError: OSStatus = u32::from_be_bytes(*b"
 /// IO operation ids we care about (read-input).
 pub const kAudioServerPlugInIOOperationReadInput: UInt32 = u32::from_be_bytes(*b"read");
 
+// --- CoreFoundation: minimal CFString creation --------------------------
+//
+// coreaudiod requires the device UID/name/manufacturer as CFStringRefs. We
+// link against CoreFoundation symbols by name; they are resolved by the host
+// at load time (`-undefined dynamic_lookup`, see build.rs).
+pub const kCFStringEncodingUTF8: u32 = 0x0800_0100;
+
+extern "C" {
+    pub fn CFStringCreateWithCString(
+        alloc: CFAllocatorRef,
+        c_str: *const std::os::raw::c_char,
+        encoding: u32,
+    ) -> CFStringRef;
+}
+
+/// Create a CoreFoundation CFStringRef from a Rust &str. Returns null on
+/// failure (the HAL treats that as "no value"). The caller hands ownership to
+/// the HAL, which releases it.
+pub fn cfstring(s: &str) -> CFStringRef {
+    match std::ffi::CString::new(s) {
+        Ok(cs) => unsafe {
+            CFStringCreateWithCString(std::ptr::null(), cs.as_ptr(), kCFStringEncodingUTF8)
+        },
+        Err(_) => std::ptr::null(),
+    }
+}
+
 const _: () = assert!(std::mem::size_of::<c_int>() == 4);

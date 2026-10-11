@@ -15,17 +15,12 @@ use std::ptr;
 
 use crate::abi::*;
 
-// Device defaults (overridden later from the daemon control API, 1b-2). The
-// string constants are published once the CoreFoundation CFString bindings are
-// wired (follow-up); kept here so the values live with the model.
+// Device defaults (overridden later from the daemon control API, 1b-2).
 const DEVICE_CHANNELS: u32 = 8;
 const DEVICE_RATE: f64 = 48_000.0;
 const DEVICE_BITS: u32 = 32;
-#[allow(dead_code)]
 const DEVICE_UID: &str = "com.avbaudio.16r.input";
-#[allow(dead_code)]
 const DEVICE_NAME: &str = "AVB StudioLive 16R (Input)";
-#[allow(dead_code)]
 const MANUFACTURER: &str = "AVB-Audio";
 
 /// Write a value of type `T` into `out_data` if there is room; set the written
@@ -75,6 +70,7 @@ pub extern "C" fn has_property(
             a.mSelector,
             x if x == kAudioDevicePropertyDeviceUID
                 || x == kAudioObjectPropertyName
+                || x == kAudioObjectPropertyManufacturer
                 || x == kAudioDevicePropertyNominalSampleRate
                 || x == kAudioDevicePropertyStreams
         ),
@@ -82,6 +78,7 @@ pub extern "C" fn has_property(
             a.mSelector,
             x if x == kAudioStreamPropertyDirection
                 || x == kAudioStreamPropertyVirtualFormat
+                || x == kAudioObjectPropertyName
         ),
         _ => false,
     };
@@ -194,9 +191,26 @@ pub extern "C" fn get_property_data(
                 };
                 put(asbd, in_data_size, out_data_size, out_data)
             }
-            // CFString properties (UID/name/manufacturer) require creating a
-            // CFStringRef via CoreFoundation; wired in a follow-up with the CF
-            // bindings. For now report unknown so the HAL uses defaults.
+            // CFString properties: the HAL requires the device UID to list the
+            // device at all. Hand back an owned CFStringRef (the HAL releases
+            // it).
+            (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyDeviceUID => {
+                put(cfstring(DEVICE_UID), in_data_size, out_data_size, out_data)
+            }
+            (_, s) if s == kAudioObjectPropertyName => {
+                let name = if object_id == K_STREAM_OBJECT {
+                    "AVB 16R Input Stream"
+                } else {
+                    DEVICE_NAME
+                };
+                put(cfstring(name), in_data_size, out_data_size, out_data)
+            }
+            (_, s) if s == kAudioObjectPropertyManufacturer => put(
+                cfstring(MANUFACTURER),
+                in_data_size,
+                out_data_size,
+                out_data,
+            ),
             _ => kAudioHardwareUnknownPropertyError,
         }
     }
