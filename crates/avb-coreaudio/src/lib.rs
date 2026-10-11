@@ -38,9 +38,13 @@ extern "C" fn query_interface(
         return kAudioHardwareIllegalOperationError;
     }
     // Hand back our interface pointer for any requested UUID (the HAL asks
-    // only for the driver / IUnknown UUIDs).
+    // only for the driver / IUnknown UUIDs). It must be the SAME shape the
+    // factory returns: a pointer to the pointer-to-vtable (COM `interface**`).
+    // Writing `&DRIVER_INTERFACE` (a single pointer straight at the vtable)
+    // makes the HAL dereference once and read `_reserved` (0) as the vtable
+    // pointer, then call through 0x10 (AddRef) -> SIGSEGV at 0x10.
     unsafe {
-        *out = &DRIVER_INTERFACE as *const _ as *mut c_void;
+        *out = &DRIVER_INTERFACE_PTR as *const _ as *mut c_void;
     }
     kAudioHardwareNoError
 }
@@ -249,6 +253,7 @@ pub extern "C" fn avb_coreaudio_factory(
     _alloc: CFAllocatorRef,
     _requested_type: CFUUIDRef,
 ) -> *mut c_void {
+    abi::oslog("[avb-coreaudio] factory called");
     // Return &(&DRIVER_INTERFACE): the HAL dereferences once to reach the
     // vtable, matching the COM `IUnknown**` convention.
     &DRIVER_INTERFACE_PTR as *const _ as *mut c_void

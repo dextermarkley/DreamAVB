@@ -31,8 +31,15 @@ cp "$ROOT/crates/avb-coreaudio/Info.plist" "$BUNDLE/Contents/Info.plist"
 # CFBundleExecutable is "AVBAudio".
 cp "$DYLIB" "$BUNDLE/Contents/MacOS/AVBAudio"
 
-echo "ad-hoc signing..."
-codesign --force --sign - --timestamp=none "$BUNDLE"
+# Sign with a real signing identity, not ad-hoc. On macOS 11+ the sandboxed HAL
+# host (library validation) silently refuses to load an ad-hoc AudioServerPlugIn
+# — no log, no device. Every other HAL plug-in on a stock machine is Developer-ID
+# signed; ours must be signed with a real identity too. Override the identity with
+# CODESIGN_IDENTITY; defaults to the Apple Development cert on this machine.
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-Apple Development: armitage787@gmail.com (32P75VK9W8)}"
+echo "signing as: $CODESIGN_IDENTITY"
+codesign --force --options runtime --timestamp=none \
+  --sign "$CODESIGN_IDENTITY" "$BUNDLE"
 
 echo "done: $BUNDLE"
 echo
