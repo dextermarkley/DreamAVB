@@ -132,9 +132,32 @@ impl ShmRing {
     /// [`SHM_NAME_OUT`](crate::SHM_NAME_OUT) for the output ring).
     pub fn attach_at(path: &str) -> Result<Self, RingError> {
         let name = CString::new(path).map_err(|_| RingError::BadConfig)?;
-        // Open the backing FILE read/write (not shm_open — see SHM_NAME doc).
+        Self::attach_inner(name, true)
+    }
+
+    /// Attach READ-ONLY: open `O_RDONLY` and map `PROT_READ`. For consumers
+    /// that only read counters and the clock block (the companion app's stats
+    /// panel), so a GUI process never holds a writable mapping of the live
+    /// audio ring (review L10). Writing through this ring would fault.
+    pub fn attach_ro() -> Result<Self, RingError> {
+        Self::attach_ro_at(SHM_NAME)
+    }
+
+    /// As [`attach_ro`](Self::attach_ro) but at an explicit path.
+    pub fn attach_ro_at(path: &str) -> Result<Self, RingError> {
+        let name = CString::new(path).map_err(|_| RingError::BadConfig)?;
+        Self::attach_inner(name, false)
+    }
+
+    fn attach_inner(name: CString, writable: bool) -> Result<Self, RingError> {
+        // Open the backing FILE (not shm_open — see SHM_NAME doc).
         // SAFETY: name is a valid C string.
-        let fd = unsafe { libc::open(name.as_ptr(), libc::O_RDWR) };
+        let flags = if writable {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+        let fd = unsafe { libc::open(name.as_ptr(), flags) };
         if fd < 0 {
             return Err(RingError::MapFailed);
         }
@@ -147,7 +170,7 @@ impl ShmRing {
             return Err(RingError::MapFailed);
         }
         let len = st.st_size as usize;
-        let ptr = Self::map(fd, len)?;
+        let ptr = Self::map_prot(fd, len, writable)?;
         // SAFETY: ptr/len map a segment the creator initialised; from_raw
         // validates magic/version/sizes and refuses a bad or partial mapping.
         let ring = match unsafe { AudioRing::from_raw(ptr, len) } {
@@ -171,17 +194,17 @@ impl ShmRing {
     }
 
     fn map(fd: c_int, len: usize) -> Result<*mut u8, RingError> {
-        // SAFETY: mapping the whole fd shared read/write.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
+        Self::map_prot(fd, len, true)
+    }
+
+    fn map_prot(fd: c_int, len: usize, writable: bool) -> Result<*mut u8, RingError> {
+        let prot = if writable {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
         };
+        // SAFETY: mapping the whole fd shared, with the requested protection.
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, libc::MAP_SHARED, fd, 0) };
         if ptr == libc::MAP_FAILED {
             // SAFETY: fd is ours.
             unsafe { libc::close(fd) };
