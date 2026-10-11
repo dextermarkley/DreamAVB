@@ -8,7 +8,6 @@
 #![cfg(test)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use avb_audioring::producer::{Producer, SampleFormat};
 use avb_audioring::{AudioRing, Consumer, RingConfig, StreamSlot};
@@ -21,17 +20,32 @@ use avb_mediaclock::{MediaClock, RateConsts};
 use crate::audio::{AudioEngine, BoundStream, StreamCounters};
 use crate::wav::{finalize_header, initial_header, WavFormat};
 
-// --- Counting allocator (counts allocations while ARMED is true) ---
+// --- Counting allocator (counts allocations on the MEASURING thread while
+// armed). A thread-local flag, set only on the thread running the measured
+// region, gates counting — so the two pipeline tests are safe to run in
+// parallel with each other and with any other test in this binary: an
+// allocation on a different thread never perturbs the measured count. ---
 
 struct CountingAlloc;
-static ARMED: AtomicBool = AtomicBool::new(false);
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// True only on the thread currently inside `run_pipeline`'s measured
+    /// region. Checked by the allocator; a sibling test thread leaves this
+    /// false and never counts.
+    static MEASURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Per-thread allocation count while measuring — thread-local so two
+    /// pipeline tests measuring concurrently never share a counter.
+    static TL_ALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
+        // Cell reads only — re-entrancy-safe (never allocates itself).
+        let _ = MEASURING.try_with(|m| {
+            if m.get() {
+                TL_ALLOCS.with(|c| c.set(c.get().wrapping_add(1)));
+            }
+        });
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -178,14 +192,14 @@ fn run_pipeline(p: &Pipeline) {
         pt += packet_period;
     }
 
-    // Arm the allocator and run the per-packet path.
-    ARMED.store(true, Ordering::SeqCst);
-    ALLOCS.store(0, Ordering::SeqCst);
+    // Arm the allocator on THIS thread and run the per-packet path.
+    TL_ALLOCS.with(|c| c.set(0));
+    MEASURING.with(|m| m.set(true));
     for (pkt, arrival) in &packets {
         engine.on_packet(pkt, *arrival);
     }
-    let allocs = ALLOCS.load(Ordering::SeqCst);
-    ARMED.store(false, Ordering::SeqCst);
+    MEASURING.with(|m| m.set(false));
+    let allocs = TL_ALLOCS.with(|c| c.get());
     assert_eq!(allocs, 0, "{} allocations in the per-packet path", allocs);
 
     engine.commit();

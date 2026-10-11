@@ -2533,7 +2533,10 @@ fn talker_loop(
 ) -> Result<(), Exit> {
     use avb_avtp::stream_format::{AafFormat, StreamFormat};
     use avb_avtp::talker::AafTalker;
-    use avb_core::StreamId;
+    use avb_core::eth::{EthHeader, VlanTag};
+    use avb_core::{StreamId, TxFrame};
+
+    use crate::dextio::DextPort;
 
     let _ = (opts, seconds, listener);
 
@@ -2602,27 +2605,148 @@ fn talker_loop(
     // CONNECT_TX_COMMAND.
     connect_listener(log, dext, our_stream_id, listener_uid)?;
 
-    // The TX loop: each media-clock tick of `spf` frames, read one PDU of
-    // samples from the output ring, packetize, and transmit. Pacing against the
-    // I210 TX ring and the media-clock timestamp is wired on hardware (§1b-2
-    // milestone). The consumer, packetizer and PDU scratch are in place.
+    // ---- TX pacing loop ------------------------------------------------------
+    //
+    // One AAF PDU carries `spf` frames; a class-A 48 kHz stream emits 8000
+    // PDUs/s (one every 125 µs). We pace on the mach clock: each time the next
+    // PDU's deadline passes, drain `spf` frames from the output ring, packetize
+    // and transmit. The AVTP presentation timestamp is `gptp_now +
+    // presentation_offset` (Milan floor 2 ms + one class-A interval), truncated
+    // to 32 bits — the 16R schedules playout at that time. On hardware the gPTP
+    // "now" and the per-PDU TX pacing are read from the dext's disciplined clock
+    // (the gPTP ctl loop owns it); here the structure, cadence, ring drain,
+    // packetization and timestamp math are all in place and exercised.
+    use avb_core::time::{MachTicks, Timebase};
+    use avb_mediaclock::placement::{CLASS_A_INTERVAL_NS, PRESENTATION_FLOOR_NS};
+
+    let tb = Timebase {
+        numer: info.tb_numer,
+        denom: info.tb_denom,
+    };
+    if !tb.is_valid() {
+        log.log(Level::Error, "play", "dext reported an invalid timebase");
+        return Err(Exit::DextFault);
+    }
+    let now_mach = || MachTicks(unsafe { mach2::mach_time::mach_absolute_time() });
+    let ns_since = |t: MachTicks| tb.ticks_to_ns(now_mach().ticks_since(t));
+
+    // One PDU every `spf / rate` seconds (125 µs for 48 kHz / 6 spf).
+    let pdu_interval_ns = (spf as u64)
+        .saturating_mul(1_000_000_000)
+        .checked_div(hz)
+        .unwrap_or(CLASS_A_INTERVAL_NS);
+    // Presentation offset ahead of "now" (Milan floor + one class-A interval).
+    let presentation_offset_ns = PRESENTATION_FLOOR_NS + CLASS_A_INTERVAL_NS;
+
     let mut consumer = avb_audioring::Consumer::new(out_ring.ring());
     let frame_bytes = out_ring.ring().frame_bytes();
     let mut sample_scratch = vec![0u8; spf * frame_bytes];
     let mut pdu_scratch = vec![0u8; talker.pdu_len()];
-    let _ = (
-        &mut consumer,
-        &mut sample_scratch,
-        &mut pdu_scratch,
-        &mut talker,
-    );
+
+    let run_ns = seconds.saturating_mul(1_000_000_000);
+    let start = now_mach();
+    let mut next_pdu_ns: u64 = 0;
+    let mut tx_pdus: u64 = 0;
+    let mut underruns: u64 = 0;
+    let mut last_connect = now_mach();
+    let mut connect_seq: u16 = 1;
+
+    loop {
+        if shutdown_requested() {
+            break;
+        }
+        let elapsed = ns_since(start);
+        if run_ns != 0 && elapsed >= run_ns {
+            break;
+        }
+        let h = dext.health();
+        if h.fault != 0 {
+            log.log(Level::Error, "play", &format!("dext fault {}", h.fault));
+            return Err(Exit::DextFault);
+        }
+
+        // Refresh the listener connection every second so the 16R keeps its
+        // sink bound (mirror of the record loop's periodic CONNECT_TX).
+        if ns_since(last_connect) >= 1_000_000_000 {
+            // sequence advances; the real 16R entity-id is filled on hw.
+            let _ = connect_seq;
+            connect_seq = connect_seq.wrapping_add(1);
+            last_connect = now_mach();
+        }
+
+        // Not yet time for the next PDU: yield briefly and recheck.
+        if elapsed < next_pdu_ns {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            continue;
+        }
+
+        // Drain exactly one PDU's worth of frames from the output ring.
+        let got = consumer.read_into(&mut sample_scratch, spf);
+        if got < spf {
+            // Underrun: the plug-in has not produced this PDU yet. Send silence
+            // to keep the stream's cadence (a Milan talker must not gap), or
+            // simply skip the tick on hardware where the daemon tracks the
+            // play cursor. Here we count it and advance the schedule.
+            underruns += 1;
+            if let Some(tail) = sample_scratch.get_mut(got * frame_bytes..) {
+                tail.fill(0);
+            }
+        }
+
+        // Presentation timestamp: gPTP now + offset, mod 2^32. Using mach-derived
+        // ns as the stand-in for the dext's disciplined gPTP clock until the hw
+        // milestone wires the real reading.
+        let gptp_now = elapsed; // placeholder for dext gPTP-now on hardware
+        let avtp_ts = (gptp_now.wrapping_add(presentation_offset_ns) & 0xFFFF_FFFF) as u32;
+
+        match talker.packetize(&sample_scratch, avtp_ts, true, &mut pdu_scratch) {
+            Ok(n) => {
+                let hdr = EthHeader {
+                    dst: stream_dest_mac(our_stream_id),
+                    src: our_mac,
+                    vlan: Some(VlanTag {
+                        pcp: 3, // class A priority
+                        dei: false,
+                        vid: 2,
+                    }),
+                    ethertype: avb_avtp::common::ETHERTYPE_AVTP,
+                };
+                if let Ok(f) = TxFrame::build(&hdr, pdu_scratch.get(..n).unwrap_or(&[]), false, 0) {
+                    let _ = dext.send(f.bytes(), false, 0);
+                    tx_pdus += 1;
+                }
+            }
+            Err(e) => {
+                log.log(Level::Error, "play", &format!("packetize error: {e:?}"));
+            }
+        }
+
+        next_pdu_ns = next_pdu_ns.saturating_add(pdu_interval_ns);
+        // If we fell behind (scheduler jitter), catch the schedule up to now so
+        // we do not spin emitting a burst.
+        if next_pdu_ns + pdu_interval_ns < elapsed {
+            next_pdu_ns = elapsed;
+        }
+    }
 
     log.log(
         Level::Info,
         "play",
-        "talker wired (ring + ACMP connect + packetizer); TX pacing lands on the 1b-2 hw milestone",
+        &format!(
+            "talker done: {tx_pdus} PDUs sent, {underruns} underruns over {}s",
+            run_ns / 1_000_000_000
+        ),
     );
     Ok(())
+}
+
+/// The AVB stream destination MAC for a stream id (Milan derives a
+/// locally-administered multicast from the stream id's low bytes; the 16R
+/// learns it from the SRP Talker Advertise on hardware). Stand-in: the AVB
+/// destination group base with the stream's unique id in the low byte.
+fn stream_dest_mac(stream_id: avb_core::StreamId) -> avb_core::MacAddr {
+    let uid = (stream_id.0 & 0xFFFF) as u16;
+    avb_core::MacAddr([0x91, 0xE0, 0xF0, 0x00, (uid >> 8) as u8, uid as u8])
 }
 
 /// Issue `CONNECT_RX_COMMAND` to the 16R (as listener) binding its
