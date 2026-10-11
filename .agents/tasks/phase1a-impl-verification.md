@@ -453,3 +453,42 @@ neighbor rate ratio 1.0000000; 2454/2456 Syncs used; **0 unlocks, 0 GM changes,
 review fixes (TX-ts owner-tag routing, the 8 ms Pdelay_Resp gate) are exercised
 by this path.
 
+---
+
+### Milestone hw-avdecc — AEM enumeration of the StudioLive 16R (PASSED)
+
+The `avb-daemon aem-dump` runner (`stack::aem_dump_loop`) was implemented: ADP
+discovery (passive + a periodic ENTITY_DISCOVER broadcast), then an AECP
+READ_DESCRIPTOR walk driven by `avb_avdecc::AecpEngine` — ENTITY → CONFIGURATION
+→ the configuration's STREAM_INPUT / STREAM_OUTPUT / AUDIO_UNIT children — with
+each descriptor decoded and written to the `avb-aem-dump/1` JSON. It reuses the
+hw-gptp bring-up and the mapped control-ring RX path.
+
+Two bugs surfaced on hardware (both fixed):
+
+6. **AVTP common control header byte order inverted** (whole `avb-avdecc`
+   crate). `encode`/`decode` in `adp`, `aecp` and `acmp` wrote byte 0 =
+   `0x80|message_type`, byte 1 = subtype. The real wire (IEEE 1722 §5.3, and the
+   16R's own ADPDU `[fa,00,50,38,…]`) is **byte 0 = subtype, byte 1 =
+   sv|version|message_type**. Every real ADPDU/AECP/ACMP was rejected by
+   `decode` (subtype test on the wrong byte). The 87 unit tests all passed
+   because encode+decode shared the same inverted order (round-trip symmetric).
+   Fixed all six encode/decode sites; corrected the three byte-order assertions
+   and the two "rejects non-X" tests; added `decodes_real_16r_wire_order`, a
+   golden-bytes test built from the captured 16R ADPDU prefix, to lock the wire
+   order against regression (88 avdecc tests now).
+7. **READ_DESCRIPTOR command missing the reserved field.** The command payload
+   is `configuration_index(2) + reserved(2) + descriptor_type(2) +
+   descriptor_index(2)` (§7.4.5); the reserved(2) was omitted, so
+   `descriptor_type` landed in the reserved slot and read as 0 — the 16R
+   returned the ENTITY descriptor for every request. Added the reserved field.
+
+**Result:** discovered entity `0x000a92fffe033ba9` (model `0x000a92e001080501`),
+`talker_stream_sources = 9`, `listener_stream_sinks = 9`; the walk retrieved
+**21/21** descriptors (ENTITY, CONFIGURATION, AUDIO_UNIT, 9×STREAM_INPUT,
+9×STREAM_OUTPUT) with **0 timeouts**, written as `avb-aem-dump/1` JSON. The
+stream counts match the device's advertised ADP capabilities.
+
+Post-milestone gate (green): fmt, `clippy --workspace --all-targets -D
+warnings`, 320 workspace tests (avdecc 88), C++ tg3 97 + i210 341,
+`package.sh --adhoc`.

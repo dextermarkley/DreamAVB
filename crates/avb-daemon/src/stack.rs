@@ -159,15 +159,453 @@ pub fn run(
     Ok(())
 }
 
-pub fn aem_dump(opts: &GlobalOpts, out: &Path, _talker: Option<u64>) -> Result<(), Exit> {
+pub fn aem_dump(opts: &GlobalOpts, out: &Path, talker: Option<u64>) -> Result<(), Exit> {
+    install_signal_handlers();
     let log = Logger::new(opts.level);
-    let _dext = bring_up(opts, &log)?;
+    let mut dext = bring_up(opts, &log)?;
+    aem_dump_loop(opts, &log, &mut dext, out, talker)
+}
+
+/// Discover the 16R via ADP and walk its AEM via AECP READ_DESCRIPTOR, writing
+/// the `avb-aem-dump/1` JSON (design §9.2). Exits `TalkerNotFound` (6) if no
+/// talker (or an ambiguous set, when `--talker` is not given) is discovered.
+fn aem_dump_loop(
+    opts: &GlobalOpts,
+    log: &Logger,
+    dext: &mut RealDext,
+    out: &Path,
+    want_talker: Option<u64>,
+) -> Result<(), Exit> {
+    use avb_avdecc::adp::Adpdu;
+    use avb_avdecc::aecp::{AecpEngine, AecpOutcome, AemPdu};
+    use avb_avdecc::constants::{aecp_msg, aem_cmd, desc as aem_desc, subtype};
+    use avb_avdecc::EntityTable;
+    use avb_avtp::common::ETHERTYPE_AVTP;
+    use avb_core::eth::{EthFrame, EthHeader};
+    use avb_core::time::{MachTicks, Timebase};
+    use avb_core::{Eui64, MacAddr, TxFrame};
+
+    use crate::dextio::{DextPort, SendResult};
+
+    let info = dext.device().info().map_err(|_| Exit::DextFault)?;
+    let our_mac = MacAddr::new(info.mac);
+    let tb = Timebase {
+        numer: info.tb_numer,
+        denom: info.tb_denom,
+    };
+    let our_id = Eui64::from_mac(our_mac);
+    let now_mach = || MachTicks(unsafe { mach2::mach_time::mach_absolute_time() });
+    let start = now_mach();
+    let ns_since = |t: MachTicks| tb.ticks_to_ns(now_mach().ticks_since(t));
+
+    // --- Phase 1: ADP discovery ---
+    let mut table = EntityTable::new(our_id);
+    let discover_deadline_ns = opts.discover_timeout.saturating_mul(1_000_000_000);
+    // Build a global ENTITY_DISCOVER (entity_id 0 = discover all), broadcast
+    // periodically to prompt entities that advertise only on demand (§6.2.2).
+    let discover_adp = Adpdu {
+        message_type: avb_avdecc::constants::adp_msg::ENTITY_DISCOVER,
+        valid_time: 0,
+        entity_id: Eui64([0; 8]),
+        entity_model_id: 0,
+        entity_capabilities: 0,
+        talker_stream_sources: 0,
+        talker_capabilities: 0,
+        listener_stream_sinks: 0,
+        listener_capabilities: 0,
+        controller_capabilities: 0,
+        available_index: 0,
+        gptp_grandmaster_id: 0,
+        gptp_domain_number: 0,
+        identify_control_index: 0,
+        interface_index: 0,
+        association_id: 0,
+    };
+    let mut last_discover = MachTicks(0);
+    let mut rx_total = 0u64;
+    let mut rx_avtp = 0u64;
+    let mut rx_adp = 0u64;
+    let mut rx_other_et: std::collections::BTreeMap<u16, u64> = Default::default();
+    let talker: Eui64 = loop {
+        if shutdown_requested() {
+            return Err(Exit::Interrupted);
+        }
+        // Re-broadcast ENTITY_DISCOVER about every 2 s.
+        if last_discover.0 == 0 || ns_since(last_discover) >= 2_000_000_000 {
+            let hdr = EthHeader {
+                dst: avb_core::AVDECC_MULTICAST,
+                src: our_mac,
+                vlan: None,
+                ethertype: ETHERTYPE_AVTP,
+            };
+            if let Ok(f) = TxFrame::build(&hdr, &discover_adp.encode(), false, 0) {
+                let _ = dext.send(f.bytes(), false, 0);
+            }
+            last_discover = now_mach();
+        }
+        for slot in dext.rx_ctl() {
+            rx_total += 1;
+            // Parse the Ethernet frame; AVDECC rides AVTP (ethertype 0x22F0).
+            if let Ok(p) = EthFrame::parse(&slot.data) {
+                if p.hdr.ethertype == ETHERTYPE_AVTP {
+                    rx_avtp += 1;
+                    // IEEE 1722 common header: byte0 = subtype.
+                    let st = p.payload.first().copied();
+                    if st == Some(subtype::ADP) {
+                        rx_adp += 1;
+                        if let Some(adp) = Adpdu::decode(p.payload) {
+                            let _ = table.observe(&adp, p.hdr.src, ns_since(start), false);
+                        }
+                    }
+                } else {
+                    *rx_other_et.entry(p.hdr.ethertype).or_insert(0) += 1;
+                }
+            }
+        }
+        if let Some(id) = want_talker {
+            let tid = Eui64(id.to_be_bytes());
+            if table.get(tid).is_some() {
+                break tid;
+            }
+        } else {
+            match table.sole_talker() {
+                Ok(Some(id)) => break id,
+                Ok(None) => {}
+                Err(ids) => {
+                    log.log(
+                        Level::Error,
+                        "adp",
+                        &format!("{} talkers discovered; pass --talker <id>", ids.len()),
+                    );
+                    return Err(Exit::TalkerNotFound);
+                }
+            }
+        }
+        if ns_since(start) >= discover_deadline_ns {
+            log.log(
+                Level::Error,
+                "adp",
+                &format!(
+                    "no AVDECC talker discovered (rx_total={rx_total} rx_avtp={rx_avtp} rx_adp={rx_adp} other_ethertypes={:04x?})",
+                    rx_other_et.keys().collect::<Vec<_>>()
+                ),
+            );
+            return Err(Exit::TalkerNotFound);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+
+    let entry = table.get(talker).ok_or(Exit::TalkerNotFound)?;
+    let talker_mac = entry.mac;
+    let adp = entry.adp;
+    log.log(
+        Level::Info,
+        "adp",
+        &format!(
+            "talker {} at {:02x?} (model 0x{:016x})",
+            u64::from_be_bytes(talker.0),
+            talker_mac.octets(),
+            adp.entity_model_id
+        ),
+    );
+
+    // --- Phase 2: AEM READ_DESCRIPTOR walk ---
+    let mut eng = AecpEngine::new(our_id);
+    // Collected descriptor bytes, keyed by (type, index).
+    let mut descriptors: std::collections::BTreeMap<(u16, u16), Vec<u8>> = Default::default();
+    // The walk's work list: (descriptor_type, descriptor_index). Seed with
+    // ENTITY; CONFIGURATION and its children are added as responses arrive.
+    let read_payload = |dtype: u16, dindex: u16| -> Vec<u8> {
+        let mut v = Vec::with_capacity(6);
+        v.extend_from_slice(&0u16.to_be_bytes()); // configuration_index
+        v.extend_from_slice(&0u16.to_be_bytes()); // reserved (§7.4.5)
+        v.extend_from_slice(&dtype.to_be_bytes()); // descriptor_type
+        v.extend_from_slice(&dindex.to_be_bytes()); // descriptor_index
+        v
+    };
+    eng.enqueue(
+        talker,
+        talker_mac,
+        aem_cmd::READ_DESCRIPTOR,
+        read_payload(aem_desc::ENTITY, 0),
+    );
+    let mut requested: std::collections::BTreeSet<(u16, u16)> = Default::default();
+    requested.insert((aem_desc::ENTITY, 0));
+
+    let walk_deadline_ns = ns_since(start) + 20_000_000_000; // 20 s cap
+                                                             // Idle grace: after the engine drains, wait briefly for any late response
+                                                             // before declaring the walk complete (robust to duplicate/late responses).
+    let idle_grace_ns = 500_000_000u64; // 500 ms
+    let mut last_activity_ns = ns_since(start);
+    loop {
+        if shutdown_requested() {
+            return Err(Exit::Interrupted);
+        }
+        let engine_busy = eng.queued_count() > 0 || eng.in_flight_count() > 0;
+        if !engine_busy && ns_since(start).saturating_sub(last_activity_ns) >= idle_grace_ns {
+            break;
+        }
+        if ns_since(start) >= walk_deadline_ns {
+            log.log(
+                Level::Warn,
+                "aecp",
+                "AEM walk timed out; writing partial dump",
+            );
+            break;
+        }
+        let now = ns_since(start);
+
+        // Emit a queued command (pacing handled by the engine).
+        if let Some(send) = eng.poll(now) {
+            let hdr = EthHeader {
+                dst: send.target_mac,
+                src: our_mac,
+                vlan: None,
+                ethertype: ETHERTYPE_AVTP,
+            };
+            if let Ok(frame) = TxFrame::build(&hdr, &send.frame, false, 0) {
+                log.log(
+                    Level::Debug,
+                    "aecp",
+                    &format!(
+                        "sent cmd=0x{:04x} seq={} ({} B) to {:02x?}",
+                        send.command_type,
+                        send.sequence_id,
+                        frame.bytes().len(),
+                        send.target_mac.octets()
+                    ),
+                );
+                match dext.send(frame.bytes(), false, 0) {
+                    SendResult::Ok => last_activity_ns = ns_since(start),
+                    SendResult::Busy | SendResult::NoResources => { /* retried by engine */ }
+                    SendResult::BadArgument => {}
+                    SendResult::Fatal => return Err(Exit::DextFault),
+                }
+            }
+        }
+
+        // Drain responses.
+        for slot in dext.rx_ctl() {
+            let Ok(p) = EthFrame::parse(&slot.data) else {
+                continue;
+            };
+            if p.hdr.ethertype != ETHERTYPE_AVTP
+                || p.payload.first().copied() != Some(subtype::AECP)
+            {
+                continue;
+            }
+            let Some(resp) = AemPdu::decode(p.payload) else {
+                continue;
+            };
+            if resp.message_type != aecp_msg::AEM_RESPONSE {
+                continue;
+            }
+            log.log(
+                Level::Debug,
+                "aecp",
+                &format!(
+                    "rx resp cmd=0x{:04x} seq={} status={} target={:016x}",
+                    resp.command_type,
+                    resp.sequence_id,
+                    resp.status,
+                    u64::from_be_bytes(resp.target_entity_id.0)
+                ),
+            );
+            if let Some(outcome) = eng.on_rx(&resp, now) {
+                last_activity_ns = ns_since(start);
+                if let AecpOutcome::Response(r) = outcome {
+                    log.log(
+                        Level::Debug,
+                        "aecp",
+                        &format!(
+                            "matched resp cmd=0x{:04x} payload_len={}",
+                            r.command_type,
+                            r.payload.len()
+                        ),
+                    );
+                    if r.command_type == aem_cmd::READ_DESCRIPTOR && r.payload.len() >= 8 {
+                        // Response payload: config_index(2) + reserved(2) + descriptor.
+                        let dbytes = match r.payload.get(4..) {
+                            Some(b) if b.len() >= 4 => b.to_vec(),
+                            _ => continue,
+                        };
+                        let dtype = u16::from_be_bytes([
+                            *dbytes.first().unwrap_or(&0),
+                            *dbytes.get(1).unwrap_or(&0),
+                        ]);
+                        let dindex = u16::from_be_bytes([
+                            *dbytes.get(2).unwrap_or(&0),
+                            *dbytes.get(3).unwrap_or(&0),
+                        ]);
+                        let is_new = !descriptors.contains_key(&(dtype, dindex));
+                        descriptors.insert((dtype, dindex), dbytes.clone());
+                        if is_new {
+                            log.log(
+                                Level::Info,
+                                "aecp",
+                                &format!(
+                                    "descriptor type=0x{dtype:04x} index={dindex} ({} bytes)",
+                                    dbytes.len()
+                                ),
+                            );
+                        }
+                        // Expand the walk from ENTITY → CONFIGURATION, and from
+                        // CONFIGURATION → its child descriptor counts.
+                        let enqueue = |dt: u16,
+                                       di: u16,
+                                       req: &mut std::collections::BTreeSet<(u16, u16)>,
+                                       eng: &mut AecpEngine| {
+                            if req.insert((dt, di)) {
+                                eng.enqueue(
+                                    talker,
+                                    talker_mac,
+                                    aem_cmd::READ_DESCRIPTOR,
+                                    read_payload(dt, di),
+                                );
+                            }
+                        };
+                        if dtype == aem_desc::ENTITY {
+                            enqueue(aem_desc::CONFIGURATION, 0, &mut requested, &mut eng);
+                        } else if dtype == aem_desc::CONFIGURATION {
+                            // Configuration descriptor: a descriptor_counts list
+                            // of (descriptor_type, count) pairs (§7.2.1). Walk
+                            // the audio/stream/clock descriptor families.
+                            for (dt, count) in config_descriptor_counts(&dbytes) {
+                                if matches!(
+                                    dt,
+                                    aem_desc::AUDIO_UNIT
+                                        | aem_desc::STREAM_INPUT
+                                        | aem_desc::STREAM_OUTPUT
+                                ) {
+                                    for di in 0..count {
+                                        enqueue(dt, di, &mut requested, &mut eng);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Age the engine (retries / timeouts).
+        let (_resends, outcomes) = eng.on_tick(now);
+        for o in outcomes {
+            if let AecpOutcome::TimedOut {
+                command_type,
+                sequence_id,
+            } = o
+            {
+                log.log(
+                    Level::Warn,
+                    "aecp",
+                    &format!("command 0x{command_type:04x} seq {sequence_id} timed out"),
+                );
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    // --- Phase 3: assemble and write the dump ---
     log.log(
         Level::Info,
         "aecp",
-        &format!("AEM dump -> {}", out.display()),
+        &format!(
+            "walk done: requested={} collected={}",
+            requested.len(),
+            descriptors.len(),
+        ),
+    );
+    let dump = build_aem_dump(&adp, our_mac, talker, &descriptors);
+    match serde_json::to_string_pretty(&dump) {
+        Ok(j) => {
+            std::fs::write(out, j).map_err(|e| {
+                log.log(
+                    Level::Error,
+                    "aecp",
+                    &format!("write {}: {e}", out.display()),
+                );
+                Exit::DiskOrPath
+            })?;
+        }
+        Err(e) => {
+            log.log(Level::Error, "aecp", &format!("serialize dump: {e}"));
+            return Err(Exit::Internal);
+        }
+    }
+    log.log(
+        Level::Info,
+        "aecp",
+        &format!(
+            "AEM dump: {} descriptors -> {}",
+            descriptors.len(),
+            out.display()
+        ),
     );
     Ok(())
+}
+
+/// Parse the `descriptor_counts` list of an AEM CONFIGURATION descriptor into
+/// `(descriptor_type, count)` pairs (IEEE 1722.1 §7.2.1). The list starts at
+/// `descriptor_counts_offset` (u16 at a fixed position) with `descriptor_counts_count`
+/// pairs. Returns an empty list if the layout cannot be read.
+fn config_descriptor_counts(d: &[u8]) -> Vec<(u16, u16)> {
+    // CONFIGURATION: descriptor_type(2) index(2) object_name(64) localized(2)
+    // descriptor_counts_count(2) descriptor_counts_offset(2) ... = fixed 74.
+    let rd_u16 = |off: usize| -> Option<u16> {
+        d.get(off..off + 2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
+    };
+    let count = match rd_u16(70) {
+        Some(c) => c as usize,
+        None => return Vec::new(),
+    };
+    let offset = match rd_u16(72) {
+        // offset is from the start of the descriptor (§7.2.1).
+        Some(o) => o as usize,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let base = offset + i * 4;
+        match (rd_u16(base), rd_u16(base + 2)) {
+            (Some(dt), Some(n)) => out.push((dt, n)),
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Assemble the `avb-aem-dump/1` JSON from the discovered ADPDU and the raw
+/// descriptor bytes collected during the walk (design §9.2).
+fn build_aem_dump(
+    adp: &avb_avdecc::adp::Adpdu,
+    controller_mac: avb_core::MacAddr,
+    talker: avb_core::Eui64,
+    descriptors: &std::collections::BTreeMap<(u16, u16), Vec<u8>>,
+) -> serde_json::Value {
+    use serde_json::json;
+    let descs: Vec<serde_json::Value> = descriptors
+        .iter()
+        .map(|((dtype, dindex), bytes)| {
+            json!({
+                "descriptor_type": format!("0x{dtype:04x}"),
+                "descriptor_index": dindex,
+                "raw": bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            })
+        })
+        .collect();
+    json!({
+        "schema": avb_avdecc::aem::json::SCHEMA,
+        "entity_id": format!("0x{:016x}", u64::from_be_bytes(talker.0)),
+        "entity_model_id": format!("0x{:016x}", adp.entity_model_id),
+        "talker_stream_sources": adp.talker_stream_sources,
+        "listener_stream_sinks": adp.listener_stream_sinks,
+        "controller_mac": format!("{:02x?}", controller_mac.octets()),
+        "descriptor_count": descriptors.len(),
+        "descriptors": descs,
+    })
 }
 
 pub fn gptp(opts: &GlobalOpts, seconds: u64, json_out: Option<PathBuf>) -> Result<(), Exit> {

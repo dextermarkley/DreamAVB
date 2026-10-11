@@ -53,12 +53,12 @@ impl Acmpdu {
     /// buffer or a non-ACMP subtype.
     pub fn decode(pdu: &[u8]) -> Option<Self> {
         let mut r = Rd::new(pdu);
-        let b0 = r.u8()?;
-        let st = r.u8()?;
-        if b0 & 0x80 == 0 || st != subtype::ACMP {
+        let st = r.u8()?; // byte0 = subtype
+        let b1 = r.u8()?; // byte1 = sv(1)|version(3)|message_type(4)
+        if st != subtype::ACMP {
             return None;
         }
-        let message_type = b0 & 0x0F;
+        let message_type = b1 & 0x0F;
         let b2 = r.u8()?;
         let status = (b2 >> 3) & 0x1F;
         r.skip(1)?; // low byte of control_data_length
@@ -94,9 +94,10 @@ impl Acmpdu {
     /// [`avb_core::AVDECC_MULTICAST`]; see [`dest_mac`].
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Wr::new();
-        w.u8(0x80 | (self.message_type & 0x0F)); // cd=1
+        // IEEE 1722 common control header: byte0 = subtype; byte1 = message_type.
         w.u8(subtype::ACMP);
-        w.u8((self.status & 0x1F) << 3); // sv=0 version=0 | status(5) | cdl hi
+        w.u8(self.message_type & 0x0F);
+        w.u8((self.status & 0x1F) << 3); // status(5) | cdl hi
         w.u8(ACMP_CONTROL_DATA_LENGTH as u8);
         w.put(&self.stream_id.to_be_bytes());
         w.put(&self.controller_entity_id.0);
@@ -149,8 +150,8 @@ mod tests {
         let a = sample();
         let bytes = a.encode();
         assert_eq!(bytes.len(), ACMPDU_LEN);
-        assert_eq!(bytes.first(), Some(&(0x80 | acmp_msg::CONNECT_RX_COMMAND)));
-        assert_eq!(bytes.get(1), Some(&subtype::ACMP));
+        assert_eq!(bytes.first(), Some(&subtype::ACMP)); // byte0 = subtype
+        assert_eq!(bytes.get(1), Some(&acmp_msg::CONNECT_RX_COMMAND)); // byte1 = message_type
         assert_eq!(Acmpdu::decode(&bytes), Some(a));
     }
 
@@ -164,8 +165,8 @@ mod tests {
     #[test]
     fn acmpdu_rejects_non_acmp() {
         let mut bytes = sample().encode();
-        if let Some(b) = bytes.get_mut(1) {
-            *b = subtype::ADP;
+        if let Some(b) = bytes.get_mut(0) {
+            *b = subtype::ADP; // byte0 = subtype
         }
         assert_eq!(Acmpdu::decode(&bytes), None);
         assert_eq!(Acmpdu::decode(&[0u8; 4]), None);

@@ -42,16 +42,15 @@ impl Adpdu {
     /// short buffer or a PDU that is not an ADPDU.
     pub fn decode(pdu: &[u8]) -> Option<Self> {
         let mut r = Rd::new(pdu);
-        let b0 = r.u8()?;
-        let st = r.u8()?;
-        // cd must be 1, subtype ADP, version 0.
-        if b0 & 0x80 == 0 || st != subtype::ADP {
+        let st = r.u8()?; // byte0 = subtype
+        let b1 = r.u8()?; // byte1 = sv(1)|version(3)|message_type(4)
+        if st != subtype::ADP {
             return None;
         }
         let b2 = r.u8()?;
-        let message_type = b0 & 0x0F;
+        let message_type = b1 & 0x0F;
         let valid_time = (b2 >> 3) & 0x1F;
-        let _version = (st >> 4) & 0x07; // sv in bit7 of st not used by ADP
+        let _version = (b1 >> 4) & 0x07;
         r.skip(1)?; // low byte of control_data_length
         let entity_id = Eui64::from_u64(r.u64()?);
         let entity_model_id = r.u64()?;
@@ -91,10 +90,12 @@ impl Adpdu {
     /// Encode to the AVTP payload (goes to `91:E0:F0:01:00:00`).
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Wr::new();
-        // cd=1, subtype=ADP.
-        w.u8(0x80 | adp_msg_nibble(self.message_type));
+        // IEEE 1722 common control header: byte0 = subtype; byte1 =
+        // sv(1)|version(3)|message_type(4). (ADP has no cd bit; the subtype
+        // identifies the control PDU.)
         w.u8(subtype::ADP);
-        // sv=0 version=0 | valid_time(5) | control_data_length high (3).
+        w.u8(adp_msg_nibble(self.message_type));
+        // valid_time(5) | control_data_length high (3).
         w.u8((self.valid_time & 0x1F) << 3);
         w.u8(ADP_CONTROL_DATA_LENGTH as u8);
         w.u64(self.entity_id.to_u64());
@@ -338,8 +339,8 @@ mod tests {
         let a = sample();
         let bytes = a.encode();
         assert_eq!(bytes.len(), ADPDU_LEN);
-        assert_eq!(bytes.first(), Some(&0x80)); // cd=1, mt=0
-        assert_eq!(bytes.get(1), Some(&subtype::ADP));
+        assert_eq!(bytes.first(), Some(&subtype::ADP)); // byte0 = subtype
+        assert_eq!(bytes.get(1), Some(&0x00)); // byte1 = message_type (ENTITY_AVAILABLE)
         let d = Adpdu::decode(&bytes).unwrap();
         assert_eq!(d, a);
         assert!(d.is_available());
@@ -348,11 +349,29 @@ mod tests {
     #[test]
     fn adpdu_rejects_non_adp() {
         let mut bytes = sample().encode();
-        if let Some(b) = bytes.get_mut(1) {
-            *b = 0xFB; // AECP subtype
+        if let Some(b) = bytes.get_mut(0) {
+            *b = 0xFB; // byte0 = subtype; AECP subtype
         }
         assert_eq!(Adpdu::decode(&bytes), None);
         assert_eq!(Adpdu::decode(&bytes[..10]), None);
+    }
+
+    #[test]
+    fn decodes_real_16r_wire_order() {
+        // Captured from a PreSonus StudioLive 16R: the IEEE 1722 common header
+        // is byte0 = subtype (0xFA = ADP), byte1 = sv|version|message_type
+        // (0x00 = ENTITY_AVAILABLE). Locks the on-wire byte order so the
+        // encode/decode inversion that hardware exposed cannot regress.
+        let mut pdu = vec![0u8; ADPDU_LEN];
+        pdu[0] = subtype::ADP; // 0xFA
+        pdu[1] = adp_msg::ENTITY_AVAILABLE; // 0x00
+        pdu[2] = 0x50; // valid_time=10 (<<3)
+        pdu[3] = ADP_CONTROL_DATA_LENGTH as u8;
+        // entity_id = 00:0a:92:ff:fe:03:3b:a9 (PreSonus OUI 00:0a:92).
+        pdu[4..12].copy_from_slice(&[0x00, 0x0a, 0x92, 0xff, 0xfe, 0x03, 0x3b, 0xa9]);
+        let d = Adpdu::decode(&pdu).expect("real 16R ADPDU must decode");
+        assert!(d.is_available());
+        assert_eq!(d.entity_id.to_u64(), 0x000a_92ff_fe03_3ba9);
     }
 
     #[test]

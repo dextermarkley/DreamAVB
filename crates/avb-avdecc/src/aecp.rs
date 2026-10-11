@@ -35,12 +35,12 @@ pub struct AemPdu {
 impl AemPdu {
     pub fn decode(pdu: &[u8]) -> Option<Self> {
         let mut r = Rd::new(pdu);
-        let b0 = r.u8()?;
-        let st = r.u8()?;
-        if b0 & 0x80 == 0 || st != subtype::AECP {
+        let st = r.u8()?; // byte0 = subtype
+        let b1 = r.u8()?; // byte1 = sv(1)|version(3)|message_type(4)
+        if st != subtype::AECP {
             return None;
         }
-        let message_type = b0 & 0x0F;
+        let message_type = b1 & 0x0F;
         if message_type != aecp_msg::AEM_COMMAND && message_type != aecp_msg::AEM_RESPONSE {
             return None;
         }
@@ -66,10 +66,10 @@ impl AemPdu {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Wr::new();
-        w.u8(0x80 | (self.message_type & 0x0F)); // cd=1
-        w.u8(subtype::AECP);
-        // control_data_length = everything after the first 12 bytes:
-        // 20 fixed (target+controller+seq+cmd) + payload.
+        w.u8(subtype::AECP); // byte0 = subtype
+        w.u8(self.message_type & 0x0F); // byte1 = sv|version|message_type
+                                        // control_data_length = everything after the first 12 bytes:
+                                        // 20 fixed (target+controller+seq+cmd) + payload.
         let cdl = (12 + self.payload.len()) as u16;
         w.u8((self.status & 0x1F) << 3 | ((cdl >> 8) as u8 & 0x07));
         w.u8(cdl as u8);
@@ -102,12 +102,12 @@ pub struct MvuPdu {
 impl MvuPdu {
     pub fn decode(pdu: &[u8]) -> Option<Self> {
         let mut r = Rd::new(pdu);
-        let b0 = r.u8()?;
-        let st = r.u8()?;
-        if b0 & 0x80 == 0 || st != subtype::AECP {
+        let st = r.u8()?; // byte0 = subtype
+        let b1 = r.u8()?; // byte1 = sv(1)|version(3)|message_type(4)
+        if st != subtype::AECP {
             return None;
         }
-        let message_type = b0 & 0x0F;
+        let message_type = b1 & 0x0F;
         if message_type != aecp_msg::VENDOR_UNIQUE_COMMAND
             && message_type != aecp_msg::VENDOR_UNIQUE_RESPONSE
         {
@@ -138,8 +138,8 @@ impl MvuPdu {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Wr::new();
-        w.u8(0x80 | (self.message_type & 0x0F));
-        w.u8(subtype::AECP);
+        w.u8(subtype::AECP); // byte0 = subtype
+        w.u8(self.message_type & 0x0F); // byte1 = sv|version|message_type
         let cdl = (12 + 6 + 2 + self.payload.len()) as u16;
         w.u8((self.status & 0x1F) << 3 | ((cdl >> 8) as u8 & 0x07));
         w.u8(cdl as u8);
@@ -406,8 +406,8 @@ mod tests {
             payload: vec![0, 0, 0, 0],
         };
         let bytes = p.encode();
-        assert_eq!(bytes.first(), Some(&0x80));
-        assert_eq!(bytes.get(1), Some(&subtype::AECP));
+        assert_eq!(bytes.first(), Some(&subtype::AECP)); // byte0 = subtype
+        assert_eq!(bytes.get(1), Some(&aecp_msg::AEM_COMMAND)); // byte1 = message_type
         assert_eq!(AemPdu::decode(&bytes), Some(p));
     }
 
