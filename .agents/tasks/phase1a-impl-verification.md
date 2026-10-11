@@ -375,3 +375,36 @@ Gate (all green):
 4. `AudioRing` is `unsafe impl Send + Sync`: all header access is atomic and the
    data region is single-producer / single-consumer, so sharing the `&AudioRing`
    across the audio and rec threads is sound.
+
+## Implement-and-review loop (whole phase1a-listener diff)
+
+A four-way parallel review of the FEAT-004/005 crates (`avb-avtp`, `avb-avdecc`,
+`avb-mediaclock`+`avb-audioring`, `avb-daemon`) against the design and
+`AGENTS.md` was run. `avb-avtp` and `avb-avdecc` came back with no Critical/High
+findings. Four High findings were raised and all fixed:
+
+1. **avb-audioring `producer.rs` overrun double-count** — `commit_to` recomputed
+   `frontier − read − cap` on every commit, so a static consumer made each tick
+   re-count the same lost frames. Fixed with an `overrun_counted_upto` watermark
+   so each lost frame is counted once (`overrun_frames_counted_once_not_per_commit`
+   test added).
+2. **avb-audioring `producer.rs` negative frame cast** — `place` cast the `i128`
+   frame index to `u64` after only the `f < committed` check; a negative index
+   could in principle wrap. Added an explicit `f < 0` late-drop guard before any
+   cast (`negative_frame_is_dropped_not_wrapped` test added).
+3. **avb-daemon `txsched.rs` missing 8 ms Pdelay_Resp late-drop** — the rule
+   (§5.2 / §7.3) and its `pdelay_resp_late_drop` counter were declared but
+   unimplemented, and the §14.1-mandated test was absent. Added
+   `push_pdelay_resp(frame, harvest_ns)`, a harvest-age table, the drop pass at
+   the top of `tick`, and the `pdelay_resp_dropped_after_8ms` test (one dropped
+   at 9 ms, one sent at 7.9 ms).
+4. **avb-daemon `realdext.rs` discarded the TX-timestamp owner tag** — `send`
+   computed `seq.max(tag).min(seq)` (always the hw seq), so a gPTP TX timestamp
+   could not be routed back to its Pdelay exchange. Fixed to keep `(hw_seq,
+   owner_tag)` and return the owner tag in `TxTsResult::Ready`.
+
+Post-fix gate (green): `fmt --all --check` clean; `clippy --workspace
+--all-targets --locked -- -D warnings` clean; `cargo test --workspace --locked`
+= 319 tests pass (audioring 12, daemon 28, plus the rest); C++ tg3 97 + i210
+341; release build clean. The hardware milestones (hw-gptp … hw-audio) are the
+remaining Phase 1a work and require the real 16R/I210 and the user.

@@ -19,7 +19,8 @@ const K_IO_RETURN_BAD_ARGUMENT: u32 = 0xe00002c2;
 /// TX-timestamp sequence; the mapped rings are owned by the stack wiring.
 pub struct RealDext {
     dev: Device,
-    pending_ts_seq: Option<u64>,
+    /// (hw sequence used to query GetTxTimestamp, owner tag to return).
+    pending_ts: Option<(u64, u64)>,
     timebase_numer: u32,
     timebase_denom: u32,
     /// Updated by the stack from the mapped shm header each ctl tick.
@@ -31,7 +32,7 @@ impl RealDext {
     pub fn new(dev: Device, timebase_numer: u32, timebase_denom: u32) -> Self {
         Self {
             dev,
-            pending_ts_seq: None,
+            pending_ts: None,
             timebase_numer,
             timebase_denom,
             producer_running: false,
@@ -53,7 +54,10 @@ impl DextPort for RealDext {
         match self.dev.send_frame(frame, want_ts) {
             Ok((seq, _)) => {
                 if want_ts {
-                    self.pending_ts_seq = Some(seq.max(tag).min(seq));
+                    // Keep the hw sequence to query GetTxTimestamp, and the
+                    // caller's tag to route the result back to its owner (the
+                    // Pdelay exchange, §5.2 / §7.2).
+                    self.pending_ts = Some((seq, tag));
                 }
                 SendResult::Ok
             }
@@ -68,20 +72,17 @@ impl DextPort for RealDext {
     }
 
     fn poll_tx_ts(&mut self) -> TxTsResult {
-        let Some(seq) = self.pending_ts_seq else {
+        let Some((seq, tag)) = self.pending_ts else {
             return TxTsResult::Idle;
         };
         match self.dev.get_tx_timestamp(seq) {
             Ok((0, systim_ns, _)) => {
-                self.pending_ts_seq = None;
-                TxTsResult::Ready {
-                    tag: seq,
-                    systim_ns,
-                }
+                self.pending_ts = None;
+                TxTsResult::Ready { tag, systim_ns }
             }
             Ok(_) => TxTsResult::Pending,
             Err(_) => {
-                self.pending_ts_seq = None;
+                self.pending_ts = None;
                 TxTsResult::Timeout
             }
         }

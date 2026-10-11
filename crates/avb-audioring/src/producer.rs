@@ -54,6 +54,10 @@ pub struct Producer<'a> {
     silent_lag: u64,
     /// Fixed at construction: the committed frontier never regresses.
     committed: u64,
+    /// Highest frontier whose overrun loss has already been counted, so lost
+    /// frames are counted once (not re-counted on every static-consumer
+    /// commit).
+    overrun_counted_upto: u64,
 }
 
 impl<'a> Producer<'a> {
@@ -82,6 +86,7 @@ impl<'a> Producer<'a> {
             lag_frames,
             silent_lag,
             committed: 0,
+            overrun_counted_upto: 0,
         }
     }
 
@@ -127,6 +132,12 @@ impl<'a> Producer<'a> {
             None => return false,
         };
         let cap = self.ring.capacity_frames();
+        // A negative frame index (pt before n_base, e.g. just after a step)
+        // is never a valid ring slot: drop it as late before any u64 cast.
+        if f < 0 {
+            self.ring.add_counter(counter::LATE_DROPS, 1);
+            return false;
+        }
         // Late: already behind the committed frontier.
         if f < i128::from(self.committed) {
             self.ring.add_counter(counter::LATE_DROPS, 1);
@@ -225,10 +236,20 @@ impl<'a> Producer<'a> {
         let read = self.ring.read_frame();
         let cap = self.ring.capacity_frames();
         if frontier.saturating_sub(read) > cap {
-            // Overrun: still commit (never block), count the lost frames.
-            self.ring
-                .add_counter(counter::OVERRUN_FRAMES, frontier - read - cap);
-            self.ring.add_counter(counter::OVERRUN_EVENTS, 1);
+            // Overrun: still commit (never block, §10.6 RING-1). Count only the
+            // frames that fell off the back of the ring that have NOT already
+            // been counted, so a static consumer does not re-count the same
+            // loss on every commit. The lowest readable frame is now
+            // `frontier - cap`; everything below it and above the last counted
+            // point is lost.
+            let lost_floor = frontier - cap;
+            let count_from = self.overrun_counted_upto.max(read);
+            if lost_floor > count_from {
+                self.ring
+                    .add_counter(counter::OVERRUN_FRAMES, lost_floor - count_from);
+                self.ring.add_counter(counter::OVERRUN_EVENTS, 1);
+                self.overrun_counted_upto = lost_floor;
+            }
         }
         self.committed = frontier;
         self.ring.store_write_frame(frontier);

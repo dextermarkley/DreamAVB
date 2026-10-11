@@ -132,6 +132,45 @@ mod tests {
     }
 
     #[test]
+    fn overrun_frames_counted_once_not_per_commit() {
+        use crate::layout::counter;
+        use crate::producer::{Producer, SampleFormat};
+        let cfg = test_config(16); // tiny capacity
+        let r = AudioRing::new_anonymous(&cfg).unwrap();
+        let mut p = Producer::new(&r, &[(0, 4, 24)], 192, 192);
+        let data = vec![0u8; 2 * 4 * 4];
+        // Write well past capacity with a static consumer (read_frame stays 0),
+        // committing each tick. Overrun loss must be counted once per lost
+        // frame, not re-counted every commit.
+        for i in 0..40u64 {
+            p.place(0, (i * 2) as i128, 2, SampleFormat::Int32, &data);
+            p.commit(false, None);
+        }
+        // Final write_frame = 80, capacity 16 -> 80 - 16 = 64 frames fell off
+        // the back and must be counted exactly once each.
+        assert_eq!(r.write_frame(), 80);
+        assert_eq!(
+            r.counter(counter::OVERRUN_FRAMES),
+            80 - 16,
+            "overrun frames must be counted once, not accumulated per commit"
+        );
+    }
+
+    #[test]
+    fn negative_frame_is_dropped_not_wrapped() {
+        use crate::layout::counter;
+        use crate::producer::{Producer, SampleFormat};
+        let cfg = test_config(256);
+        let r = AudioRing::new_anonymous(&cfg).unwrap();
+        let mut p = Producer::new(&r, &[(0, 4, 24)], 192, 192);
+        let data = vec![0u8; 2 * 4 * 4];
+        // A negative frame index must be a late drop, never cast to a huge u64.
+        assert!(!p.place(0, -5, 2, SampleFormat::Int32, &data));
+        assert_eq!(r.counter(counter::LATE_DROPS), 1);
+        assert_eq!(r.write_frame(), 0);
+    }
+
+    #[test]
     fn spsc_producer_consumer_stress() {
         // One producer writes an increasing ramp; one consumer verifies it in
         // order with no torn frames. Capacity large enough to avoid overrun at

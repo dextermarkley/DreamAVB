@@ -47,7 +47,11 @@ pub struct TxSched {
     ts_outstanding: bool,
     /// A clock step is pending; new want_ts frames are blocked until issued.
     step_pending: bool,
-    /// Harvest time (ns) of a held Pdelay_Resp's Pdelay_Req, for the 8 ms rule.
+    /// Harvest time (ns) of a held Pdelay_Resp's Pdelay_Req, keyed by the
+    /// frame's `tag`, for the 8 ms late-drop rule (§5.2 / §7.3). A gPTP frame
+    /// whose tag has an entry here older than `PDELAY_RESP_LATE_NS` is dropped
+    /// before it is sent.
+    pdelay_harvest: Vec<(u64, u64)>, // (tag, harvest_ns)
     pub counters: TxCounters,
 }
 
@@ -65,6 +69,7 @@ impl TxSched {
             avdecc: Outbox::new(),
             ts_outstanding: false,
             step_pending: false,
+            pdelay_harvest: Vec::new(),
             counters: TxCounters::default(),
         }
     }
@@ -83,6 +88,18 @@ impl TxSched {
                 Class::Mrp => self.counters.queue_full_mrp += 1,
                 Class::Avdecc => self.counters.queue_full_avdecc += 1,
             }
+        }
+        r
+    }
+
+    /// Enqueue a Pdelay_Resp (gPTP class) tagged with the mach-ns `harvest_ns`
+    /// of its triggering Pdelay_Req, so `tick` can apply the 8 ms late-drop
+    /// rule (§5.2 / §7.3). `frame.tag` identifies it in the harvest table.
+    pub fn push_pdelay_resp(&mut self, frame: TxFrame, harvest_ns: u64) -> Result<(), TxFull> {
+        let tag = frame.tag;
+        let r = self.push(Class::Gptp, frame);
+        if r.is_ok() {
+            self.pdelay_harvest.push((tag, harvest_ns));
         }
         r
     }
@@ -125,6 +142,10 @@ impl TxSched {
     /// Try to send one frame this iteration (design §5.2). Returns true if a
     /// frame was sent (or dropped), false if nothing was sendable.
     pub fn tick<P: DextPort>(&mut self, dext: &mut P, now_ns: u64) -> bool {
+        // §5.2 / §7.3: drop any held Pdelay_Resp whose Pdelay_Req was harvested
+        // more than 8 ms ago (the exchange is stale; its Follow_Up is dropped
+        // by the daemon alongside it).
+        self.drop_late_pdelay_resps(now_ns);
         // Resolve an outstanding timestamp first.
         if self.ts_outstanding {
             match dext.poll_tx_ts() {
@@ -143,7 +164,10 @@ impl TxSched {
         // want_ts. Pop-and-reinsert the blocked head.
         let frame = self.take_sendable(class, idx);
         let Some(frame) = frame else { return false };
-        let _ = now_ns;
+        // A sent gPTP frame no longer needs its harvest-age tracking.
+        if class == Class::Gptp {
+            self.pdelay_harvest.retain(|(tag, _)| *tag != frame.tag);
+        }
         let res = dext.send(frame.bytes(), frame.want_ts, frame.tag);
         match res {
             SendResult::Ok => {
@@ -213,6 +237,40 @@ impl TxSched {
 
     fn requeue_front(&mut self, class: Class, frame: TxFrame) {
         self.push_front(class, frame);
+    }
+
+    /// Drop any held Pdelay_Resp whose Pdelay_Req harvest is older than
+    /// [`PDELAY_RESP_LATE_NS`] (§5.2 / §7.3), counting each drop. The frame is
+    /// removed from the gPTP outbox by its `tag`.
+    fn drop_late_pdelay_resps(&mut self, now_ns: u64) {
+        if self.pdelay_harvest.is_empty() {
+            return;
+        }
+        let late_tags: Vec<u64> = self
+            .pdelay_harvest
+            .iter()
+            .filter(|(_, harvest)| now_ns.saturating_sub(*harvest) > PDELAY_RESP_LATE_NS)
+            .map(|(tag, _)| *tag)
+            .collect();
+        if late_tags.is_empty() {
+            return;
+        }
+        // Rebuild the gPTP outbox without the late-tagged frames.
+        let mut kept: [TxFrame; GPTP_CAP] = [TxFrame::EMPTY; GPTP_CAP];
+        let mut n = 0;
+        while let Some(f) = self.gptp.pop() {
+            if late_tags.contains(&f.tag) {
+                self.counters.pdelay_resp_late_drop += 1;
+            } else if let Some(slot) = kept.get_mut(n) {
+                *slot = f;
+                n += 1;
+            }
+        }
+        for f in kept.iter().take(n).copied() {
+            let _ = self.gptp.push(f);
+        }
+        self.pdelay_harvest
+            .retain(|(tag, _)| !late_tags.contains(tag));
     }
 }
 
@@ -327,6 +385,27 @@ mod tests {
         tx.set_step_pending(false);
         tx.tick(&mut d, 0);
         assert_eq!(d.sent[1].2, 1);
+    }
+
+    #[test]
+    fn pdelay_resp_dropped_after_8ms() {
+        // A Pdelay_Resp whose Pdelay_Req was harvested > 8 ms ago is dropped
+        // and counted; one at 7.9 ms is still sent (§5.2 / §7.3, §14.1).
+        let mut tx = TxSched::new();
+        // Harvested at t=0; tick at 9 ms -> dropped.
+        tx.push_pdelay_resp(frame(0xD1, false), 0).unwrap();
+        let mut d = FakeDext::default();
+        tx.tick(&mut d, 9_000_000);
+        assert_eq!(tx.counters.pdelay_resp_late_drop, 1);
+        assert!(d.sent.is_empty(), "late Pdelay_Resp must not be sent");
+        assert_eq!(tx.pending(), 0);
+        // A fresh one at 7.9 ms since harvest is sent.
+        let mut tx2 = TxSched::new();
+        tx2.push_pdelay_resp(frame(0xD2, false), 0).unwrap();
+        let mut d2 = FakeDext::default();
+        tx2.tick(&mut d2, 7_900_000);
+        assert_eq!(tx2.counters.pdelay_resp_late_drop, 0);
+        assert_eq!(d2.sent.first().map(|s| s.2), Some(0xD2));
     }
 
     #[test]
