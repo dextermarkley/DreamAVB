@@ -87,20 +87,94 @@ fn helper_path(name: &str) -> PathBuf {
     PathBuf::from("/Users/dexter/AVB-Audio/target/release").join(name)
 }
 
-/// Enumerate candidate NICs. Today only the I210 is supported; the Broadcom and
-/// everything else are listed as UNSUPPORTED (and per project policy never
-/// touched). Real enumeration is wired to `avb-probe` on hardware; this returns
-/// the known set so the UI is populated.
+/// Enumerate candidate NICs by asking the system which network hardware ports
+/// exist, then tagging the one DreamAVB supports (the Intel I210). Read-only:
+/// `networksetup -listallhardwareports` + an `ioreg` check for the I210's PCI
+/// identity. Everything that is not the I210 is listed UNSUPPORTED (and, per
+/// project policy, never driven — the Broadcom included).
 #[tauri::command]
 fn list_nics() -> Vec<Nic> {
-    // A real build queries the system (SPNetworkDataType / ioreg) and tags each
-    // by PCI id. The I210 is the one DreamAVB drives.
-    vec![Nic {
-        bsd_name: "en7".into(),
-        display: "Intel I210 (Thunderbolt)".into(),
-        pci_id: "8086:1533 / 1ab6:0214".into(),
-        supported: true,
-    }]
+    let mut nics = Vec::new();
+
+    // Is the I210 present at all? It is present either as a normal Ethernet
+    // port (default driver owns it) or as our AVBI210Driver service (we own
+    // it). `ioreg` sees both; the PCI id 8086:1533 is the ground truth.
+    let i210_present = ioreg_has_i210();
+
+    if i210_present {
+        // BSD name only exists while the DEFAULT driver owns it (as enX); once
+        // our dext claims it, the enX interface disappears. Report whatever
+        // name networksetup still shows, else a placeholder.
+        let bsd = ethernet_bsd_name().unwrap_or_else(|| "en0".into());
+        nics.push(Nic {
+            bsd_name: bsd,
+            display: "Intel I210 (Thunderbolt)".into(),
+            pci_id: "8086:1533 / 1ab6:0214".into(),
+            supported: true,
+        });
+    }
+
+    // List other Ethernet ports as unsupported context (never driven).
+    for (port, dev) in list_hardware_ports() {
+        if nics.iter().any(|n| n.bsd_name == dev) {
+            continue;
+        }
+        if port.to_lowercase().contains("ethernet") || dev.starts_with("en") {
+            nics.push(Nic {
+                bsd_name: dev,
+                display: port,
+                pci_id: "—".into(),
+                supported: false,
+            });
+        }
+    }
+    nics
+}
+
+/// True if an Intel I210 (PCI 8086:1533) is attached, per `ioreg`.
+fn ioreg_has_i210() -> bool {
+    Command::new("/usr/sbin/ioreg")
+        .args(["-l", "-w", "0"])
+        .output()
+        .ok()
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            // Our dext's service, or the raw PCI device id, either proves it.
+            s.contains("AVBI210Driver") || s.contains("0x15338086")
+        })
+        .unwrap_or(false)
+}
+
+/// The BSD name (enX) of the first Ethernet hardware port, if any.
+fn ethernet_bsd_name() -> Option<String> {
+    list_hardware_ports()
+        .into_iter()
+        .find(|(port, dev)| dev.starts_with("en") && port.to_lowercase().contains("ethernet"))
+        .map(|(_, dev)| dev)
+}
+
+/// Parse `networksetup -listallhardwareports` into (port name, device) pairs.
+fn list_hardware_ports() -> Vec<(String, String)> {
+    let out = match Command::new("/usr/sbin/networksetup")
+        .arg("-listallhardwareports")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut pairs = Vec::new();
+    let mut cur_port: Option<String> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("Hardware Port: ") {
+            cur_port = Some(p.trim().to_string());
+        } else if let Some(d) = line.strip_prefix("Device: ") {
+            if let Some(p) = cur_port.take() {
+                pairs.push((p, d.trim().to_string()));
+            }
+        }
+    }
+    pairs
 }
 
 /// Enable DreamAVB on a NIC: activate the system extension so our dext claims
@@ -137,14 +211,101 @@ fn status() -> Status {
     current_status()
 }
 
+/// Classify the dext's `systemextensionsctl list` line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DextSysextState {
+    /// Not installed / deactivated — the default driver owns the NIC.
+    Absent,
+    /// Activated but not yet enabled/matched — mid-approval.
+    Activating,
+    /// Activated and enabled — our dext is in control.
+    Enabled,
+}
+
+/// Read the I210 dext's state from `systemextensionsctl list`.
+fn dext_sysext_state() -> DextSysextState {
+    let out = Command::new("/usr/bin/systemextensionsctl")
+        .arg("list")
+        .output();
+    let text = match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => return DextSysextState::Absent,
+    };
+    for line in text
+        .lines()
+        .filter(|l| l.contains("com.avbaudio.installer.i210"))
+    {
+        if line.contains("[activated enabled]") {
+            return DextSysextState::Enabled;
+        }
+        // "activated waiting for user", "terminated waiting to uninstall", etc.
+        if line.contains("activated") || line.contains("waiting") {
+            return DextSysextState::Activating;
+        }
+    }
+    DextSysextState::Absent
+}
+
 fn current_status() -> Status {
-    // Hands-off is the default and the safe assumption when nothing reports
-    // active. Hardware wiring reads `systemextensionsctl list` + `avb-probe
-    // info` to distinguish default/pending/active/fault.
-    Status {
-        state: DriverState::DefaultDriver,
-        nic: None,
-        summary: "Default driver in control".into(),
+    // Hands-off is the safe default: only a positive signal flips us to Active,
+    // so a read failure never falsely claims the driver owns the NIC.
+    let state = dext_sysext_state();
+    let faulted = state == DextSysextState::Enabled && probe_fault();
+    status_for(state, faulted)
+}
+
+/// Pure mapping from (sysext state, fault) to the UI Status. Separated from the
+/// system reads so the policy — Absent is always hands-off — is unit-testable
+/// without depending on this machine's actual dext state.
+fn status_for(state: DextSysextState, faulted: bool) -> Status {
+    match state {
+        DextSysextState::Enabled => {
+            let nic = Some(Nic {
+                bsd_name: "en7".into(),
+                display: "Intel I210 (Thunderbolt)".into(),
+                pci_id: "8086:1533 / 1ab6:0214".into(),
+                supported: true,
+            });
+            if faulted {
+                Status {
+                    state: DriverState::Fault,
+                    nic,
+                    summary: "DreamAVB driver reported a fault".into(),
+                }
+            } else {
+                Status {
+                    state: DriverState::Active,
+                    nic,
+                    summary: "DreamAVB active on the I210".into(),
+                }
+            }
+        }
+        DextSysextState::Activating => Status {
+            state: DriverState::Pending,
+            nic: None,
+            summary: "Activating — waiting for approval".into(),
+        },
+        DextSysextState::Absent => Status {
+            state: DriverState::DefaultDriver,
+            nic: None,
+            summary: "Default driver in control".into(),
+        },
+    }
+}
+
+/// True if `avb-probe info` reports a dext fault (non-zero exit or a fault
+/// marker in its output). Read-only.
+fn probe_fault() -> bool {
+    match Command::new(helper_path("avb-probe")).arg("info").output() {
+        Ok(o) => {
+            if !o.status.success() {
+                return true;
+            }
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.to_lowercase().contains("fault")
+        }
+        // Can't run the probe → don't assert a fault; treat as not-faulted.
+        Err(_) => false,
     }
 }
 
@@ -256,10 +417,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_state_is_hands_off() {
-        // The safety-critical default: nothing active -> OS default driver owns
-        // the NIC. The UI must never show Active without a positive signal.
-        assert_eq!(current_status().state, DriverState::DefaultDriver);
+    fn absent_dext_maps_to_hands_off() {
+        // The safety-critical invariant: when the dext is Absent (not
+        // activated), the state is DefaultDriver — the OS default driver owns
+        // the NIC. Tested on the pure classifier so it does not depend on this
+        // machine's actual dext state.
+        assert_eq!(
+            status_for(DextSysextState::Absent, false).state,
+            DriverState::DefaultDriver
+        );
+        // Activating -> Pending, enabled+ok -> Active, enabled+fault -> Fault.
+        assert_eq!(
+            status_for(DextSysextState::Activating, false).state,
+            DriverState::Pending
+        );
+        assert_eq!(
+            status_for(DextSysextState::Enabled, false).state,
+            DriverState::Active
+        );
+        assert_eq!(
+            status_for(DextSysextState::Enabled, true).state,
+            DriverState::Fault
+        );
     }
 
     #[test]
