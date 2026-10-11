@@ -167,6 +167,45 @@ impl Drop for ShmRing {
     }
 }
 
+/// A producer that OWNS its shm segment, so the `Producer`'s borrow of the ring
+/// is internal and sound (the daemon holds this for the whole run). Wraps the
+/// unavoidable self-reference — the ring mapping is pinned on the heap for the
+/// producer's lifetime and freed together on drop.
+pub struct ShmProducer {
+    // Boxed so the mapping address is stable while `producer` borrows it.
+    shm: Box<ShmRing>,
+    // SAFETY INVARIANT: borrows `*shm`, which outlives it (same struct, dropped
+    // after). Declared 'static and never handed out.
+    producer: crate::producer::Producer<'static>,
+}
+
+impl ShmProducer {
+    /// Create the shm segment from `config` and a producer over it.
+    /// `lag_frames`/`silent_lag` come from the media clock's `RateConsts`.
+    pub fn create(
+        config: &RingConfig,
+        streams: &[(usize, usize, u32)],
+        lag_frames: u64,
+        silent_lag: u64,
+    ) -> Result<Self, RingError> {
+        let shm = Box::new(ShmRing::create(config)?);
+        // SAFETY: the Producer borrows the ring inside `shm`, which is boxed
+        // (stable address) and dropped AFTER `producer` (field order), so the
+        // borrow never dangles. We never expose the 'static borrow.
+        let ring_ref: &'static AudioRing = unsafe { &*(shm.ring() as *const AudioRing) };
+        let producer = crate::producer::Producer::new(ring_ref, streams, lag_frames, silent_lag);
+        Ok(Self { shm, producer })
+    }
+
+    pub fn ring(&self) -> &AudioRing {
+        self.shm.ring()
+    }
+
+    pub fn producer(&mut self) -> &mut crate::producer::Producer<'static> {
+        &mut self.producer
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {

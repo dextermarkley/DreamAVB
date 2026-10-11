@@ -1938,6 +1938,16 @@ fn streams_loop(
     let mut wav_stream_id: u64 = 0;
     let mut wav_data_bytes: u64 = 0;
     let mut wav_frames: u64 = 0;
+    // 1b-1 producer: expose the PRIMARY stream's recovered PCM over the shm
+    // ring (/avb16r.ring) so the CoreAudio plug-in (a separate process) can
+    // read it. Built lazily on the first primary-stream packet once the AAF
+    // format (channels/rate/spf) is known — never hardcoded. `ShmProducer`
+    // owns the mapping and the producer together. The media clock drives the
+    // ring's clock block for the plug-in's timebase.
+    let mut ring: Option<avb_audioring::ShmProducer> = None;
+    let mut mclk: Option<avb_mediaclock::MediaClock> = None;
+    let mut ring_stream_id: u64 = 0;
+    let mut ring_spf: usize = 0;
     let run_ns = seconds.saturating_mul(1_000_000_000);
     let interval_ns = interval.max(1).saturating_mul(1_000_000_000);
     let count_start = now_mach();
@@ -2060,6 +2070,115 @@ fn streams_loop(
                     }
                 }
                 last_seq.insert(sid, seq);
+                // 1b-1: build the shm ring + producer on the first AAF packet
+                // and bind it to that stream_id as the primary. Geometry comes
+                // from the packet's AAF header (channels/rate/spf), never a
+                // literal. The plug-in exposes exactly these channels.
+                if ring.is_none() {
+                    let ch = usize::from(pdu.hdr.channels_per_frame.max(1));
+                    let rate = avb_avtp::stream_format::nsr_hz(pdu.hdr.nsr).unwrap_or(48_000);
+                    // Samples per frame = data_len / (channels × bytes/sample).
+                    let bps = avb_avtp::aaf::bytes_per_sample(pdu.hdr.format).unwrap_or(4);
+                    let spf = (usize::from(pdu.hdr.stream_data_length) / (ch * bps.max(1))).max(1);
+                    if let Some(consts) = avb_mediaclock::RateConsts::new(rate, spf as u32) {
+                        let cfg = avb_audioring::RingConfig {
+                            channels: ch as u32,
+                            valid_bits: if pdu.hdr.bit_depth == 0 {
+                                24
+                            } else {
+                                u32::from(pdu.hdr.bit_depth)
+                            },
+                            nominal_rate_hz: rate,
+                            capacity_frames: consts.capacity_frames as u32,
+                            streams: vec![avb_audioring::StreamSlot {
+                                stream_id: sid,
+                                first_channel: 0,
+                                channels: ch as u32,
+                                bit_depth: if pdu.hdr.bit_depth == 0 {
+                                    24
+                                } else {
+                                    u32::from(pdu.hdr.bit_depth)
+                                },
+                            }],
+                            channel_map: (0..ch).map(|c| (0u16, c as u16)).collect(),
+                        };
+                        match avb_audioring::ShmProducer::create(
+                            &cfg,
+                            &[(0, ch, u32::from(pdu.hdr.bit_depth.max(24)))],
+                            consts.lag_frames,
+                            consts.silent_lag,
+                        ) {
+                            Ok(rp) => {
+                                mclk = Some(avb_mediaclock::MediaClock::new(consts, 0));
+                                ring = Some(rp);
+                                ring_stream_id = sid;
+                                ring_spf = spf;
+                                log.log(
+                                    Level::Info,
+                                    "ring",
+                                    &format!(
+                                        "shm ring {} bound: stream 0x{sid:016x}, {ch} ch @ {rate} Hz, spf={spf}, cap={}",
+                                        avb_audioring::SHM_NAME,
+                                        consts.capacity_frames
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                log.log(
+                                    Level::Error,
+                                    "ring",
+                                    &format!("shm ring create failed: {e}"),
+                                );
+                            }
+                        }
+                    }
+                }
+                // Feed the primary stream into the ring: drive the media clock
+                // on its tv=1 packets, place the PCM at the clock's ring frame,
+                // publish the clock model, and commit the frontier.
+                if sid == ring_stream_id {
+                    if let (Some(rp), Some(mc)) = (ring.as_mut(), mclk.as_mut()) {
+                        let arrival = ns_since(count_start);
+                        let pt = if pdu.hdr.stream.tv {
+                            avb_mediaclock::presentation_time_ns(
+                                pdu.hdr.stream.avtp_timestamp,
+                                arrival,
+                            )
+                            .unwrap_or(arrival)
+                        } else {
+                            arrival
+                        };
+                        if pdu.hdr.stream.tv {
+                            mc.on_reference_packet(
+                                avb_mediaclock::RefPacket { pt_ns: pt, k: 1 },
+                                arrival,
+                                arrival,
+                            );
+                        }
+                        if let Some(rf) = mc.ring_frame(pt) {
+                            let fmt = if pdu.hdr.format == avb_avtp::aaf::format::INT_24BIT {
+                                avb_audioring::SampleFormat::Int24
+                            } else {
+                                avb_audioring::SampleFormat::Int32
+                            };
+                            rp.producer().place(0, rf, ring_spf, fmt, pdu.data);
+                            rp.producer().commit(false, None);
+                        }
+                        if mc.should_publish() {
+                            let model = mc.clock_model(arrival as f64, 0.0, 0.0);
+                            rp.ring().publish_clock(&avb_audioring::ClockBlock {
+                                anchor_frame: model.anchor_frame,
+                                anchor_mach: model.anchor_mach,
+                                mach_per_frame: model.mach_per_frame,
+                                rate_hz_vs_mach: model.rate_hz_vs_mach,
+                                media_ppm_vs_gptp: model.media_ppm_vs_gptp,
+                                uncertainty_ns: model.uncertainty_ns,
+                                locked: model.locked,
+                                reset_count: model.reset_count,
+                            });
+                        }
+                    }
+                }
                 // WAV: record the PRIMARY stream (first AAF stream we see,
                 // which is the lowest stream_id -> 16R channels 1..N).
                 if wav_out.is_some() {
