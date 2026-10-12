@@ -172,6 +172,20 @@ enum Command {
         /// media-clock stream, not audio).
         #[arg(long)]
         listener_uid: Option<u16>,
+        /// EXPERIMENTAL: bind EVERY one of the 16R's AAF audio sources, giving
+        /// a 64-channel input ring instead of 8.
+        ///
+        /// Off by default and deliberately so. The data path works — all eight
+        /// streams place, per-slot frame counts stay within ~20 frames of each
+        /// other and the channel map is deterministic — but the cross-stream
+        /// timestamp alignment still shows a residual defect (about 15% of
+        /// packets reporting an implausible forward offset) that has not been
+        /// root-caused, and the CoreAudio plug-in pins its device at 8
+        /// channels and REFUSES a ring that disagrees. Until both are
+        /// resolved, turning this on gives a 64-channel ring that CoreAudio
+        /// will not attach to.
+        #[arg(long)]
+        all_inbound_streams: bool,
         #[arg(long, default_value_t = 30)]
         start_timeout: u64,
         #[arg(long)]
@@ -287,6 +301,7 @@ fn run() -> Result<(), Exit> {
             seconds,
             listener,
             listener_uid,
+            all_inbound_streams,
             start_timeout,
             summary_out,
         } => {
@@ -305,6 +320,7 @@ fn run() -> Result<(), Exit> {
                 seconds.unwrap_or(0),
                 listener,
                 listener_uid,
+                all_inbound_streams,
                 start_timeout,
                 summary_out,
             )

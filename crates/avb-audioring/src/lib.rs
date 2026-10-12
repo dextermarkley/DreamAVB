@@ -21,7 +21,7 @@ pub mod ring;
 pub mod shm;
 
 pub use consumer::Consumer;
-pub use layout::{RingConfig, StreamSlot};
+pub use layout::{counter, RingConfig, StreamSlot};
 pub use producer::{Producer, SampleFormat};
 pub use ring::{AudioRing, RingError};
 pub use shm::{ShmProducer, ShmRing, SHM_NAME, SHM_NAME_OUT};

@@ -2277,6 +2277,7 @@ pub fn play(
         listener,
         listener_uid,
         false,
+        false,
     )
 }
 
@@ -2291,11 +2292,13 @@ pub fn play(
 /// gone for the other.
 ///
 /// `seconds == 0` means run until SIGINT, which is how the companion runs it.
+#[allow(clippy::too_many_arguments)]
 pub fn duplex(
     opts: &GlobalOpts,
     seconds: u64,
     listener: Option<u64>,
     listener_uid: Option<u16>,
+    all_inbound_streams: bool,
     _start_timeout: u64,
     _summary_out: Option<PathBuf>,
 ) -> Result<(), Exit> {
@@ -2317,7 +2320,16 @@ pub fn duplex(
             )
         },
     );
-    talker_loop(opts, &log, &mut dext, seconds, listener, listener_uid, true)
+    talker_loop(
+        opts,
+        &log,
+        &mut dext,
+        seconds,
+        listener,
+        listener_uid,
+        true,
+        all_inbound_streams,
+    )
 }
 
 /// The talker TX loop (design §5.2 TX side, Phase 1b-2). Creates the output
@@ -2334,6 +2346,7 @@ pub fn duplex(
 /// `kIOReturnExclusiveAccess` and exits `Owned`. They also have to share one
 /// control-ring drain and one gPTP service, because the control ring is a
 /// single queue — a slot read by one direction is gone for the other.
+#[allow(clippy::too_many_arguments)]
 fn talker_loop(
     opts: &GlobalOpts,
     log: &Logger,
@@ -2342,6 +2355,7 @@ fn talker_loop(
     listener: Option<u64>,
     listener_uid: Option<u16>,
     duplex: bool,
+    all_inbound_streams: bool,
 ) -> Result<(), Exit> {
     use avb_avtp::stream_format::AafFormat;
     use avb_avtp::talker::AafTalker;
@@ -2387,22 +2401,73 @@ fn talker_loop(
     let spf = usize::from(fmt.spf);
     let channels = usize::from(fmt.channels);
 
-    // Which of the 16R's STREAM_OUTPUT sources we listen to, for duplex. Read
-    // from its AEM for the same reason as the sink: index 0 is `Send CRF`, its
-    // media-clock source, so a hardcoded 0 asked for a stream with no audio.
-    let inbound_uid = if duplex {
-        let (in_fmt, in_uid) = derive_inbound_source(log, dext, peers, None, listener_timeout_ns)?;
+    // Which of the 16R's STREAM_OUTPUT sources we listen to, for duplex.
+    //
+    // ALL of its AAF audio sources, read from its AEM. Index 0 is `Send CRF`,
+    // its media-clock source, so a hardcoded 0 asked for a stream with no
+    // audio at all; binding only one of the eight audio sources kept 8 of the
+    // device's 64 channels. The stream ids come from GET_STREAM_INFO in
+    // descriptor-index order, which is what makes the inbound channel map
+    // reproducible: ring channels 1-8 are the device's "Send 1-8" on every
+    // run, not whichever stream's packet arrived first.
+    let (inbound_uids, inbound_stream_ids) = if duplex {
+        let (in_fmt, mut uids) = derive_inbound_sources(log, dext, peers, listener_timeout_ns)?;
+        if !all_inbound_streams {
+            // Default: ONE source, today's verified behaviour. Binding all
+            // eight is behind --all-inbound-streams because the cross-stream
+            // alignment still has a residual defect and the CoreAudio plug-in
+            // refuses a ring wider than its own 8-channel device.
+            uids.truncate(1);
+            log.log(
+                Level::Info,
+                "duplex",
+                "binding ONE inbound source (8 of the 16R's 64 channels); pass \
+                 --all-inbound-streams for all eight",
+            );
+        }
+        let ids_by_index = read_stream_ids(log, dext, peers, &uids, listener_timeout_ns)?;
+        // Keep only the sources whose id the 16R actually told us: a slot
+        // whose stream id we had to invent could never match an arriving
+        // packet, and would sit in the channel map as permanent silence.
+        let mut uid_kept: Vec<u16> = Vec::new();
+        let mut ids: Vec<u64> = Vec::new();
+        for u in &uids {
+            match ids_by_index.get(u) {
+                Some(&id) => {
+                    uid_kept.push(*u);
+                    ids.push(id);
+                }
+                None => log.log(
+                    Level::Warn,
+                    "duplex",
+                    &format!(
+                        "16R STREAM_OUTPUT {u} did not report a stream id, so it cannot be bound \
+                         — its 8 channels will be absent rather than silent-but-mapped"
+                    ),
+                ),
+            }
+        }
+        if ids.is_empty() {
+            log.log(
+                Level::Error,
+                "duplex",
+                "no 16R audio source reported a stream id, so nothing can be bound inbound",
+            );
+            return Err(Exit::TalkerNotFound);
+        }
         log.log(
             Level::Info,
             "duplex",
             &format!(
-                "inbound from 16R STREAM_OUTPUT {in_uid}, format 0x{:016x}",
-                in_fmt.0
+                "inbound: {} stream(s) from 16R STREAM_OUTPUT {uid_kept:?}, format 0x{:016x}, {} channels",
+                ids.len(),
+                in_fmt.0,
+                ids.len() * usize::from(in_fmt.aaf().map(|a| a.channels).unwrap_or(0)),
             ),
         );
-        in_uid
+        (uid_kept, ids)
     } else {
-        0
+        (Vec::new(), Vec::new())
     };
 
     // Create the OUTPUT ring (daemon = consumer, plug-in = producer). We create
@@ -2720,7 +2785,9 @@ fn talker_loop(
     // `streams_loop`. What is needed here is the declaration side: the 16R
     // only streams to a listener that has declared MSRP Listener Ready for its
     // stream, and the dext only delivers frames matching an installed filter.
-    let mut lrx = crate::listenerrx::ListenerRx::new();
+    // Multi-slot in duplex (one slot per 16R audio source, in its own
+    // descriptor-index order), single-stream otherwise.
+    let mut lrx = crate::listenerrx::ListenerRx::with_streams(inbound_stream_ids.clone());
     // Dext RX filter entries: (stream_id, dest_mac, vlan).
     let mut in_filter: Vec<(u64, [u8; 6], u16)> = Vec::new();
     // Stream ids we have already declared Listener Ready for.
@@ -3072,33 +3139,45 @@ fn talker_loop(
         // them. Draining here means audio flows IN during the lock wait
         // instead of being blocked by an unrelated condition.
         if duplex {
-            // Ask the 16R to connect its STREAM_OUTPUT to us, re-asserted on
-            // the same ~1 s cadence Apple's controller uses so the Milan
-            // talker holds the connection and keeps advertising.
+            // Ask the 16R to connect EVERY one of its audio STREAM_OUTPUTs to
+            // us, re-asserted on the same ~1 s cadence Apple's controller uses
+            // so the Milan talker holds the connections and keeps advertising.
+            //
+            // One connect per source. The 16R only advertises a source a
+            // controller has connected, so connecting one of eight is why a
+            // run saw a single Talker Advertise and bound 8 of 64 channels —
+            // the Listener Ready and dext-filter code below was already
+            // multi-stream and had nothing to work with.
             if last_in_connect.0 == 0 || ns_since(last_in_connect) >= 1_000_000_000 {
                 use avb_avdecc::acmp::Acmpdu;
                 use avb_avdecc::constants::{acmp_msg, acmp_status};
-                let pdu = Acmpdu {
-                    message_type: acmp_msg::CONNECT_TX_COMMAND,
-                    status: acmp_status::SUCCESS,
-                    stream_id: avb_core::StreamId(0),
-                    controller_entity_id: our_id,
-                    talker_entity_id: listener_id,
-                    listener_entity_id: our_id,
-                    talker_unique_id: inbound_uid,
-                    listener_unique_id: 0,
-                    sequence_id: in_connect_seq,
-                    ..Default::default()
-                };
-                in_connect_seq = in_connect_seq.wrapping_add(1);
-                let hdr = EthHeader {
-                    dst: avb_core::AVDECC_MULTICAST,
-                    src: our_mac,
-                    vlan: None,
-                    ethertype: avb_avtp::common::ETHERTYPE_AVTP,
-                };
-                if let Ok(f) = TxFrame::build(&hdr, &pdu.encode(), false, 0) {
-                    let _ = dext.send(f.bytes(), false, 0);
+                for &uid in &inbound_uids {
+                    let pdu = Acmpdu {
+                        message_type: acmp_msg::CONNECT_TX_COMMAND,
+                        status: acmp_status::SUCCESS,
+                        stream_id: avb_core::StreamId(0),
+                        controller_entity_id: our_id,
+                        talker_entity_id: listener_id,
+                        listener_entity_id: our_id,
+                        talker_unique_id: uid,
+                        // Our own STREAM_INPUT index for this source. Distinct
+                        // per source: a listener that named the same sink for
+                        // all eight would be asking to put eight streams into
+                        // one input.
+                        listener_unique_id: uid,
+                        sequence_id: in_connect_seq,
+                        ..Default::default()
+                    };
+                    in_connect_seq = in_connect_seq.wrapping_add(1);
+                    let hdr = EthHeader {
+                        dst: avb_core::AVDECC_MULTICAST,
+                        src: our_mac,
+                        vlan: None,
+                        ethertype: avb_avtp::common::ETHERTYPE_AVTP,
+                    };
+                    if let Ok(f) = TxFrame::build(&hdr, &pdu.encode(), false, 0) {
+                        let _ = dext.send(f.bytes(), false, 0);
+                    }
                 }
                 last_in_connect = now_mach();
             }
@@ -3399,6 +3478,78 @@ fn talker_loop(
             ),
         );
         report_discarded_streams(log, "duplex", &lrx);
+        // Per-slot frames and alignment health. A slot that bound and
+        // delivered nothing is 8 silent channels in the middle of the device,
+        // which the total frames_placed hides completely.
+        let per = lrx.per_slot_frames();
+        if per.len() > 1 {
+            let silent: Vec<usize> = per
+                .iter()
+                .enumerate()
+                .filter(|(_, &f)| f == 0)
+                .map(|(i, _)| i)
+                .collect();
+            log.log(
+                Level::Info,
+                "duplex",
+                &format!(
+                    "inbound slots: {} bound, frames per slot {per:?}",
+                    per.len()
+                ),
+            );
+            if !silent.is_empty() {
+                log.log(
+                    Level::Warn,
+                    "duplex",
+                    &format!(
+                        "slot(s) {silent:?} delivered NOT ONE frame — that is {} channels of the \
+                         device reading as silence rather than as absent",
+                        silent.len() * usize::from(lrx.channels_per_slot())
+                    ),
+                );
+            }
+            // Cross-stream health, MEASURED. A correctly-stepped stream set
+            // stays within one 125 us observation interval of the shared
+            // timeline basis; a large value means the device's streams are not
+            // in step or one of them is gapping, and the ring's own late-drop
+            // and placement-reject counters say what became of those packets.
+            log.log(
+                Level::Info,
+                "duplex",
+                &format!(
+                    "cross-stream offsets: largest observed {} frame(s) ({:.2} ms); placed on \
+                     assumption: {} with no timestamp, {} with an implausible forward jump",
+                    lrx.max_offset_frames(),
+                    lrx.max_offset_frames() as f64 * 1000.0 / 48_000.0,
+                    lrx.assumed().0,
+                    lrx.assumed().1,
+                ),
+            );
+            if lrx.assumed().1 > 0 {
+                log.log(
+                    Level::Warn,
+                    "duplex",
+                    &format!(
+                        "implausible forward jumps per slot: {:?} — a count concentrated in one \
+                         slot means that stream is not timestamped on the same base as the rest",
+                        lrx.suspect_per_slot()
+                    ),
+                );
+            }
+            // What the ring itself says became of every packet. A large
+            // offset only matters if it cost frames.
+            if let Some((late, rejects, zero_fill, gaps, overrun)) = lrx.ring_counters() {
+                log.log(
+                    Level::Info,
+                    "duplex",
+                    &format!(
+                        "ring placement: {late} late drop(s), {rejects} placement reject(s), \
+                         {zero_fill} zero-filled frame(s), {gaps} gap frame(s), {overrun} \
+                         overrun frame(s)"
+                    ),
+                );
+            }
+        }
         if in_declared.is_empty() {
             log.log(
                 Level::Warn,
@@ -3591,6 +3742,130 @@ struct AecpPeers {
 /// `NOT_IMPLEMENTED`) is logged and left ABSENT, so the caller can tell "the
 /// 16R said no" from "nothing came back" by which keys are missing rather than
 /// by a sentinel value.
+/// Read the 16R's `stream_id` for each of the given STREAM_OUTPUT indices via
+/// AECP `GET_STREAM_INFO`.
+///
+/// This is how the inbound channel map becomes REPRODUCIBLE. The ring's slots
+/// must be in the 16R's own STREAM_OUTPUT index order so that ring channels
+/// 1-8 are its "Send 1-8" on every run; binding streams in the order their
+/// packets happen to arrive would reshuffle 64 channels between runs. The
+/// stream id is not in the STREAM_OUTPUT descriptor, and deriving it from the
+/// entity id by pattern would be a guess about how this device forms ids —
+/// `GET_STREAM_INFO` states it.
+///
+/// Returns only the indices the 16R actually answered, so a missing one is
+/// absent rather than defaulted to a plausible-looking id.
+fn read_stream_ids(
+    log: &Logger,
+    dext: &mut RealDext,
+    peers: AecpPeers,
+    indices: &[u16],
+    timeout_ns: u64,
+) -> Result<std::collections::BTreeMap<u16, u64>, Exit> {
+    use avb_avdecc::aecp::{AecpEngine, AecpOutcome, AemPdu};
+    use avb_avdecc::constants::{aecp_msg, aecp_status, aem_cmd, desc as aem_desc, subtype};
+    use avb_avtp::common::ETHERTYPE_AVTP;
+    use avb_core::eth::{EthFrame, EthHeader};
+    use avb_core::time::{MachTicks, Timebase};
+    use avb_core::TxFrame;
+
+    use crate::dextio::{DextPort, SendResult};
+
+    let info = dext.device().info().map_err(|_| Exit::DextFault)?;
+    let tb = Timebase {
+        numer: info.tb_numer,
+        denom: info.tb_denom,
+    };
+    let now_mach = || MachTicks(unsafe { mach2::mach_time::mach_absolute_time() });
+    let start = now_mach();
+    let ns_since = |t: MachTicks| tb.ticks_to_ns(now_mach().ticks_since(t));
+
+    let mut eng = AecpEngine::new(peers.our_id);
+    for &i in indices {
+        // §7.4.15 command payload: descriptor_type(2), descriptor_index(2).
+        let mut pl = Vec::with_capacity(4);
+        pl.extend_from_slice(&aem_desc::STREAM_OUTPUT.to_be_bytes());
+        pl.extend_from_slice(&i.to_be_bytes());
+        eng.enqueue(peers.target, peers.target_mac, aem_cmd::GET_STREAM_INFO, pl);
+    }
+
+    let mut got: std::collections::BTreeMap<u16, u64> = Default::default();
+    while got.len() < indices.len() && ns_since(start) < timeout_ns {
+        if shutdown_requested() {
+            return Err(Exit::Interrupted);
+        }
+        let now = ns_since(start);
+        if let Some(send) = eng.poll(now) {
+            let hdr = EthHeader {
+                dst: send.target_mac,
+                src: peers.our_mac,
+                vlan: None,
+                ethertype: ETHERTYPE_AVTP,
+            };
+            if let Ok(f) = TxFrame::build(&hdr, &send.frame, false, 0) {
+                if matches!(dext.send(f.bytes(), false, 0), SendResult::Fatal) {
+                    return Err(Exit::DextFault);
+                }
+            }
+        }
+        for slot in dext.rx_ctl() {
+            let Ok(p) = EthFrame::parse(&slot.data) else {
+                continue;
+            };
+            if p.hdr.ethertype != ETHERTYPE_AVTP
+                || p.payload.first().copied() != Some(subtype::AECP)
+            {
+                continue;
+            }
+            let Some(resp) = AemPdu::decode(p.payload) else {
+                continue;
+            };
+            if resp.message_type != aecp_msg::AEM_RESPONSE {
+                continue;
+            }
+            let Some(AecpOutcome::Response(r)) = eng.on_rx(&resp, ns_since(start)) else {
+                continue;
+            };
+            if r.command_type != aem_cmd::GET_STREAM_INFO || r.status != aecp_status::SUCCESS {
+                continue;
+            }
+            // §7.4.16 response: descriptor_type(2) descriptor_index(2)
+            // flags(4) stream_format(8) stream_id(8) ... — the same offsets
+            // the record path reads, which answered 9 of 9 on this device.
+            let b = &r.payload;
+            let Some(idx) = b
+                .get(2..4)
+                .and_then(|x| <[u8; 2]>::try_from(x).ok())
+                .map(u16::from_be_bytes)
+            else {
+                continue;
+            };
+            let Some(sid) = b
+                .get(16..24)
+                .and_then(|x| <[u8; 8]>::try_from(x).ok())
+                .map(u64::from_be_bytes)
+            else {
+                continue;
+            };
+            if sid != 0 && indices.contains(&idx) {
+                got.insert(idx, sid);
+            }
+        }
+        let _ = eng.on_tick(ns_since(start));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    log.log(
+        Level::Info,
+        "aecp",
+        &format!(
+            "16R stream ids: {} of {} STREAM_OUTPUT(s) answered GET_STREAM_INFO",
+            got.len(),
+            indices.len()
+        ),
+    );
+    Ok(got)
+}
+
 fn read_descriptors(
     log: &Logger,
     dext: &mut RealDext,
@@ -4101,6 +4376,171 @@ fn derive_inbound_source(
         ),
     );
     Ok((fmt, uid))
+}
+
+/// Resolve which of the 16R's STREAM_OUTPUT sources our listener direction
+/// should bind, and their format, from the 16R's own AEM.
+///
+/// Returns EVERY AAF audio source in descriptor-index order, not just the
+/// first. The 16R exposes nine STREAM_OUTPUTs — index 0 is `Send CRF`, its
+/// media-clock source, and 1..=8 are `Send 1-8` .. `Send 57-64`, eight
+/// channels each. Binding one of them keeps 8 of the device's 64 channels.
+///
+/// Every bound source must share one format, because the ring has a single
+/// geometry across its slots. A source that differs is refused rather than
+/// placed into a slot whose width does not match it.
+fn derive_inbound_sources(
+    log: &Logger,
+    dext: &mut RealDext,
+    peers: AecpPeers,
+    timeout_ns: u64,
+) -> Result<(avb_avtp::stream_format::StreamFormat, Vec<u16>), Exit> {
+    use avb_avdecc::aem::desc::decode_stream;
+    use avb_avdecc::constants::desc as aem_desc;
+
+    let base = read_descriptors(
+        log,
+        dext,
+        peers,
+        &[(aem_desc::CONFIGURATION, 0)],
+        timeout_ns,
+    )?;
+    let Some(config) = base.get(&(aem_desc::CONFIGURATION, 0)) else {
+        log.log(
+            Level::Error,
+            "aecp",
+            "the 16R did not return its CONFIGURATION descriptor, so its STREAM_OUTPUT count is unknown and the inbound sources cannot be chosen",
+        );
+        return Err(Exit::TalkerNotFound);
+    };
+    let source_count = config_descriptor_counts(config)
+        .into_iter()
+        .find(|(dt, _)| *dt == aem_desc::STREAM_OUTPUT)
+        .map(|(_, n)| n)
+        .unwrap_or(0);
+    if source_count == 0 {
+        log.log(
+            Level::Error,
+            "aecp",
+            "the 16R's CONFIGURATION lists no STREAM_OUTPUT descriptors, so it has nothing to send us",
+        );
+        return Err(Exit::TalkerNotFound);
+    }
+
+    let want: Vec<(u16, u16)> = (0..source_count)
+        .map(|i| (aem_desc::STREAM_OUTPUT, i))
+        .collect();
+    let raw = read_descriptors(log, dext, peers, &want, timeout_ns)?;
+    let mut sources = Vec::with_capacity(usize::from(source_count));
+    for i in 0..source_count {
+        match raw
+            .get(&(aem_desc::STREAM_OUTPUT, i))
+            .and_then(|b| decode_stream(b))
+        {
+            Some(s) => sources.push(s),
+            None => break,
+        }
+    }
+    log.log(
+        Level::Info,
+        "aecp",
+        &format!(
+            "16R AEM: {} of {} STREAM_OUTPUT sources read",
+            sources.len(),
+            source_count
+        ),
+    );
+
+    // Every AAF source we can depacketize, in descriptor-index order.
+    let mut audio: Vec<u16> = Vec::new();
+    let mut fmt: Option<avb_avtp::stream_format::StreamFormat> = None;
+    for (i, s) in sources.iter().enumerate() {
+        let Ok(idx) = u16::try_from(i) else { break };
+        let Some(a) = s.current_format.aaf() else {
+            log.log(
+                Level::Info,
+                "aecp",
+                &format!(
+                    "16R STREAM_OUTPUT {idx} ({}) is {} — not audio, skipping",
+                    s.object_name,
+                    s.current_format.subtype_name()
+                ),
+            );
+            continue;
+        };
+        if a.ut || !s.current_format.decodable() {
+            log.log(
+                Level::Warn,
+                "aecp",
+                &format!(
+                    "16R STREAM_OUTPUT {idx} ({}) is AAF but not an exact format this build can \
+                     depacketize — skipping",
+                    s.object_name
+                ),
+            );
+            continue;
+        }
+        match fmt {
+            None => fmt = Some(s.current_format),
+            Some(f) if f == s.current_format => {}
+            Some(f) => {
+                // Mixed formats would need per-slot channel widths in the
+                // ring. Refuse the odd one out rather than place it into a
+                // slot sized for something else.
+                log.log(
+                    Level::Warn,
+                    "aecp",
+                    &format!(
+                        "16R STREAM_OUTPUT {idx} ({}) is 0x{:016x} but the others are 0x{:016x}; \
+                         this build binds one geometry across all slots, so it is skipped",
+                        s.object_name, s.current_format.0, f.0
+                    ),
+                );
+                continue;
+            }
+        }
+        audio.push(idx);
+    }
+
+    let Some(fmt) = fmt else {
+        log.log(
+            Level::Error,
+            "aecp",
+            &format!(
+                "none of the 16R's {} STREAM_OUTPUT sources is an AAF audio source we can \
+                 depacketize (they are: {}); nothing to record from",
+                sources.len(),
+                sources
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| format!(
+                        "{i}={} {}",
+                        s.object_name,
+                        s.current_format.subtype_name()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+        return Err(Exit::TalkerNotFound);
+    };
+    let a = fmt.aaf();
+    log.log(
+        Level::Info,
+        "aecp",
+        &format!(
+            "selected {} 16R audio source(s) {audio:?}: 0x{:016x} ({} Hz, {} ch each, {} spf, \
+             {}-bit) = {} channels inbound",
+            audio.len(),
+            fmt.0,
+            a.map(|a| a.nsr_hz().unwrap_or(0)).unwrap_or(0),
+            a.map(|a| a.channels).unwrap_or(0),
+            a.map(|a| a.spf).unwrap_or(0),
+            a.map(|a| a.bit_depth).unwrap_or(0),
+            audio.len() * usize::from(a.map(|a| a.channels).unwrap_or(0)),
+        ),
+    );
+    Ok((fmt, audio))
 }
 
 /// Resolve the 16R's entity id AND MAC — the LISTENER for the playback
