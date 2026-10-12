@@ -125,13 +125,20 @@ covered by a test that would have):
 
 ### Resume point
 
-The dext must be REINSTALLED for (5) to take effect — the ceiling is compiled
-into it. Packaged dext is `284.1.16`; `283.0.31` is installed. The HAL plug-in
-installed on this machine already postdates every plug-in fix above, so only
-the dext needs replacing.
+The dext for (5) is now INSTALLED and attached: `284.2.33` is `activated
+enabled` and driving the I210 (`avb-probe info` reads the device through it).
+Do not re-activate for the TX ceiling. Note that `package.sh` derives its
+version from the wall clock, so a repackage bumps the PACKAGE version while
+the installed one stays `284.2.33` — that difference is a version-number
+artifact, not a content difference.
+
+The HAL plug-in is currently NOT installed (it was removed by hand while
+chasing a coreaudiod CPU spike that turned out not to be ours — see "Hard-won
+lessons"). It must be reinstalled before a playback test:
 
 ```
-/Users/dexter/AVB-Audio/build/AVBInstaller.app/Contents/MacOS/avb-installer activate
+sudo cp -R /Users/dexter/AVB-Audio/build/AVBAudio.driver /Library/Audio/Plug-Ins/HAL/
+sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
 /Users/dexter/AVB-Audio/build/AVBInstaller.app/Contents/MacOS/avb-daemon play --seconds 60 --log-level info
 ```
 
@@ -143,8 +150,35 @@ undisciplined clock. Then read the summary: `PDUs on the wire` should be
 it is zero the 16R never tried to enumerate us, which is a different fault),
 and `listener_ready` must become true.
 
+The output format is no longer hardcoded (`d01d534`). `play` now discovers the
+16R, reads its CONFIGURATION, every STREAM_INPUT and AUDIO_UNIT 0 over AECP,
+and derives the format from the sink named by `--listener-uid`. Two
+consequences to expect on hardware:
+
+- A new log line, `16R AEM: N of M STREAM_INPUT sinks read`, then
+  `output format derived from 16R STREAM_INPUT <uid>`. Any failure REFUSES to
+  transmit rather than falling back to a default.
+- `--listener <id>` now selects which entity to WAIT for rather than skipping
+  discovery, because a unicast AECP read needs the 16R's MAC and only an
+  observed ADPDU carries it.
+- UNVERIFIED RISK: we no longer advertise ourselves during the discovery
+  window, because our ADP is built from the entity model and the model is
+  built from the format we are going to read. If the 16R declines AECP from a
+  controller it has not discovered, the AEM read times out with a clear
+  message. That is an empirical question for the next hardware run; the fix,
+  if needed, is a bootstrap advertisement before the read.
+
 Still unbuilt, and the next likely blockers:
 
+- **Bidirectional audio needs ONE daemon process.** The dext enforces
+  `kIOReturnExclusiveAccess` ("one RingAttach per connection"), so `play` and
+  `record` CANNOT run as two processes — the second gets `Exit::Owned`. The
+  companion app is supposed to start everything needed for full duplex, so
+  this is the blocking piece of that feature: merge the listener loop
+  (`streams_loop`) and the talker loop (`talker_loop`) behind one control-ring
+  drain and one shared `GptpService`, exposed as a single long-running
+  subcommand with no `--seconds`. `run` is currently a stub and is the natural
+  home for it.
 - **GET_STREAM_INFO answers NOT_IMPLEMENTED on purpose.** Its 32-bit flags
   word needs bit positions from 1722.1-2021 Table 7.206. The working group's
   own clarification (Illouz, "AVDECC clarifications Part 2 — AEM commands",
@@ -162,6 +196,65 @@ Still unbuilt, and the next likely blockers:
   host clock while we transmit paced by gPTP, so the two drift. This is the
   mirror image of the listener's ring problem and is why STREAM_OUTPUT does
   not advertise CLOCK_SYNC_SOURCE. Unaddressed.
+
+## Product packaging and the companion app (at `22dbef0`)
+
+The five product goals the user set, and where each stands:
+
+1. **Install from a macOS package — DONE.** `scripts/build-pkg.sh` produces
+   `build/DreamAVB-<version>.pkg` installing `/Applications/DreamAVB.app`,
+   `/Applications/AVBInstaller.app` (which keeps the dext inside it) and
+   `/Library/Audio/Plug-Ins/HAL/AVBAudio.driver`. The dext deliberately stays
+   inside AVBInstaller.app: macOS only honours an `OSSystemExtensionRequest`
+   from the bundle that CONTAINS the extension, so relocating it into
+   DreamAVB.app would break the verified activation path. Payload staged with
+   `ditto` so the adhoc-signed plug-in stays byte-identical. Bundle relocation
+   is pinned OFF via a component plist — `pkgbuild` defaults app bundles to
+   relocatable, which would install over a stray copy found elsewhere instead
+   of `/Applications`. Verify with `pkgutil --expand`; `PackageInfo` must show
+   `<relocate/>` EMPTY.
+2. **Driver does nothing until told — DONE.** The postinstall only kickstarts
+   coreaudiod and fixes ownership. It must never contain the string
+   `activate`; that is worth grepping after any change to it. Taking control
+   of the device remains the companion's toggle, which calls
+   `avb-installer activate`.
+3. **Optional launch at login — DONE.** Hand-written LaunchAgent at
+   `~/Library/LaunchAgents/com.avbaudio.companion.plist`, default OFF. NOT
+   `tauri-plugin-autostart` — its transitive deps float and break this build.
+   Off DELETES the plist. Validated with `plutil -lint`; whether this
+   machine's session accepts `launchctl bootstrap` is only confirmed by
+   toggling it in the real app.
+4. **Optional auto-select NIC — DONE.** Default OFF. Exactly one supported NIC
+   is selected; zero or two-or-more selects nothing and says why. It SELECTS
+   ONLY — it never activates the driver, so (2) still holds.
+5. **Companion starts everything for full duplex — NOT DONE.** Blocked on the
+   single-process duplex daemon described in the Phase 1b resume point above.
+   The app-side start/stop UI was deliberately not built yet: there is no
+   subcommand for it to drive, and a supervisor for a binary that does not
+   exist cannot be verified.
+
+Settings live in `~/Library/Application Support/DreamAVB/config.txt`, keys
+`clock_source`, `launch_at_login`, `auto_select_nic`. `avb-config` is
+deliberately dependency-free and serde-free: the main workspace pins serde
+`=1.0.229` and the Tauri app pins `=1.0.210`, and two exact requirements on
+one major version cannot resolve together. Any writer of that file must
+load-then-mutate, never construct a fresh `Config` — doing the latter silently
+clobbered the other settings (fixed in `22dbef0`).
+
+## Verified at `22dbef0`
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo test --workspace --locked`: 418 pass (avdecc 116 -> 123, daemon 44).
+- Companion app (its OWN cargo workspace): 25 tests, clippy `-D warnings`
+  clean, fmt clean. `node --check ui/main.js` OK.
+- `scripts/build-pkg.sh`: `DreamAVB-284.16.50.pkg`, payload verified by
+  `pkgutil --expand`, `<relocate/>` empty, postinstall free of `activate`.
+
+Note: `cargo` is NOT on the default subprocess `PATH` in this environment, and
+the rustup default-host is x86_64, so a bare `cargo` resolves the 1.99.0 pin
+to the wrong host. Prefix cargo commands with
+`PATH="/Users/dexter/.rustup/toolchains/1.99.0-aarch64-apple-darwin/bin:$PATH"`.
 
 ## Verified at `04f7541` (Phase 1b)
 
