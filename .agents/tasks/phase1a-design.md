@@ -108,7 +108,7 @@ enum AvbMemType : uint64_t {
 #define AVB_CONSUMER_MEM_SIZE   16384u
 #define AVB_MAX_STREAMS         16u         // S_max
 #define AVB_STEP_CLOCK_MAX_NS   1000000000ll
-#define AVB_TX_RATE_PER_SEC     1000u       // dext token bucket (SAF-6)
+#define AVB_TX_RATE_PER_SEC     20000u      // dext token bucket (SAF-6)
 #define AVB_TX_BURST            64u
 
 // AvbRxSlot.cls
@@ -433,7 +433,7 @@ All four counters must be unreachable through `ReadReg32`, so their clear-on-rea
 `SendFrame` is unchanged in shape: 14–1514 B, padded to 60 by the dext.
 
 Changes:
-- Token bucket of `AVB_TX_RATE_PER_SEC` with burst `AVB_TX_BURST`, refilled from mach time. When empty, the call returns `kIOReturnNoResources` and counts TxRateLimited. The frame is not queued.
+- Token bucket of `AVB_TX_RATE_PER_SEC` with burst `AVB_TX_BURST`, refilled from mach time. When empty, the call returns `kIOReturnNoResources` and counts TxRateLimited. The frame is not queued. The ceiling is shared across EVERY transmitted frame, audio and control alike, so it must clear one SR class A stream (8000 frames/s) with headroom for gPTP/MSRP/MVRP/AVDECC; at the original 1000/s a talker lost 7 of every 8 PDUs and starved its own MSRP declarations of tokens.
 - `want_ts` while a timestamp is pending → `kIOReturnBusy` and TxTsBusyRejected (unchanged semantics, now counted).
 - A stale-latch release now counts TxStaleLatch.
 - Timeout drops to 20 ms. Normal latency is 24 µs (G4).

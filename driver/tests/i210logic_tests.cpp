@@ -54,7 +54,10 @@ static_assert(AVB_RX_SLOT_DATA_MAX == 1984 && AVB_RX_CTL_SLOTS == 512 && AVB_RX_
 static_assert(AVB_RX_CTL_OFFSET == 16384 && AVB_RX_AUDIO_OFFSET == 16384 + 512 * 2048);
 static_assert(AVB_RX_MEM_SIZE == 17842176u && AVB_CONSUMER_MEM_SIZE == 16384);
 static_assert(AVB_MAX_STREAMS == 16 && AVB_STEP_CLOCK_MAX_NS == 1000000000ll);
-static_assert(AVB_TX_RATE_PER_SEC == 1000 && AVB_TX_BURST == 64);
+static_assert(AVB_TX_RATE_PER_SEC == 20000 && AVB_TX_BURST == 64);
+// The ceiling must clear one SR class A stream (8000 frames/s, one per 125 us)
+// with headroom for control traffic, since the bucket is shared across all TX.
+static_assert(AVB_TX_RATE_PER_SEC > 8000, "a class A talker must fit under SAF-6");
 static_assert(kAvbRxNone == 0 && kAvbRxGptp == 1 && kAvbRxMsrp == 2 && kAvbRxMvrp == 3 && kAvbRxAvdecc == 4 &&
               kAvbRxMaap == 5 && kAvbRxStream == 6 && AVB_RX_CLASS_COUNT == 7);
 static_assert(AVB_RXF_TS_HW == 1 && AVB_RXF_VLAN_FRAME == 2 && AVB_RXF_VLAN_DESC == 4 &&
@@ -595,25 +598,40 @@ static void testTokenBucket() {
         okCount += tokenBucketTake(&b, t0) ? 1 : 0;
     }
     CHECK(okCount == 64);  // burst 64, then empty
-    CHECK(tokenBucketTake(&b, t0 + 1000000));   // +1 ms: one token
-    CHECK(!tokenBucketTake(&b, t0 + 1000000));
-    CHECK(!tokenBucketTake(&b, t0 + 1500000));  // +0.5 ms: no whole token yet
-    CHECK(tokenBucketTake(&b, t0 + 2000000));   // credit carried over
-    CHECK(!tokenBucketTake(&b, t0 + 500));      // time going backwards: no refill
+    // Refill is expressed in token PERIODS, not a hardcoded wall time, so these
+    // describe the bucket's semantics at any AVB_TX_RATE_PER_SEC. Written as
+    // "+1 ms = one token" they silently only ever described 1000/s.
+    CHECK(tokenBucketTake(&b, t0 + kTxTokenNs));                      // one token
+    CHECK(!tokenBucketTake(&b, t0 + kTxTokenNs));
+    CHECK(!tokenBucketTake(&b, t0 + kTxTokenNs + kTxTokenNs / 2));    // no whole token yet
+    CHECK(tokenBucketTake(&b, t0 + 2 * kTxTokenNs));                  // credit carried over
+    CHECK(!tokenBucketTake(&b, t0));            // time going backwards: no refill
     // Long idle refills to the burst, never more.
     okCount = 0;
     for (int i = 0; i < 70; i++) {
         okCount += tokenBucketTake(&b, t0 + 10000000000ull) ? 1 : 0;
     }
     CHECK(okCount == 64);
-    // Sustained: one attempt every 100 us for 1 s -> burst + ~1000/s.
+    // Sustained: an attempt every half token period for 1 s -> burst + rate.
     TokenBucket s{};
     okCount = 0;
-    for (uint64_t i = 0; i < 10000; i++) {
-        okCount += tokenBucketTake(&s, i * 100000) ? 1 : 0;
+    const uint64_t attempts = 2ull * AVB_TX_RATE_PER_SEC;
+    for (uint64_t i = 0; i < attempts; i++) {
+        okCount += tokenBucketTake(&s, i * (kTxTokenNs / 2)) ? 1 : 0;
     }
-    CHECK(okCount >= 1060 && okCount <= 1064);
-    std::printf("pass: tokenBucketTake (1000/s, burst 64; %d in 1 s)\n", okCount);
+    const int sustained = int(AVB_TX_RATE_PER_SEC) + int(AVB_TX_BURST);
+    CHECK(okCount >= sustained - 4 && okCount <= sustained);
+    // The ceiling must pass an SR class A talker: one frame per 125 us for a
+    // full second, none rate-limited. At 1000/s this denied 7000 of 8000 and
+    // nothing in the suite noticed -- the stream was silent on real hardware.
+    TokenBucket a{};
+    int denied = 0;
+    for (uint64_t i = 0; i < 8000; i++) {
+        denied += tokenBucketTake(&a, i * 125000ull) ? 0 : 1;
+    }
+    CHECK(denied == 0);
+    std::printf("pass: tokenBucketTake (%u/s, burst %u; %d in 1 s; class A 8000/8000)\n",
+                AVB_TX_RATE_PER_SEC, AVB_TX_BURST, okCount);
 }
 
 static void testStatsAccumulate() {

@@ -172,7 +172,21 @@ struct AvbRxBatch {
 #define AVB_CONSUMER_MEM_SIZE   16384u
 #define AVB_MAX_STREAMS         16u         // S_max
 #define AVB_STEP_CLOCK_MAX_NS   1000000000ll
-#define AVB_TX_RATE_PER_SEC     1000u       // dext token bucket (SAF-6)
+// Dext TX token bucket (SAF-6): a hard ceiling on frames/s the dext will put
+// on the wire, independent of the client, so a runaway daemon cannot flood the
+// network. It applies to EVERY frame, audio and control alike.
+//
+// Derivation: an SR class A stream is one frame per 125 us observation
+// interval = 8000 frames/s. The ceiling must clear that with room left over,
+// because the bucket is shared -- at 1000/s a talker consumed every token and
+// starved gPTP, MSRP and MVRP of theirs, so the stream reservation handshake
+// could not complete (measured: 382 553 of 441 373 frames dropped in one 60 s
+// run). 20 000/s = 2.5 class-A streams, leaving >= 12 000 frames/s for control
+// traffic that a stream can never take. It remains a real bound: 20 000 frames
+// at the 1522 B maximum is ~243 Mbit/s, under a quarter of a 1 Gbit link.
+//
+// Must divide 1e9 evenly (see the static_assert on kTxTokenNs).
+#define AVB_TX_RATE_PER_SEC     20000u      // dext token bucket (SAF-6)
 #define AVB_TX_BURST            64u
 
 // AvbRxSlot.cls

@@ -2693,6 +2693,7 @@ fn talker_loop(
     // Without this the stream was transmitted into a void: the hardware
     // session showed the 16R listing no input device at all, because nothing
     // had ever announced one.
+    use crate::dextio::SendResult;
     use avb_core::eth::EthFrame;
     use avb_core::{Now, Outbox, RxMeta};
     use avb_srp::attr::{Attribute, Talker, DEFAULT_DOMAIN, ETHERTYPE_MSRP, ETHERTYPE_MVRP};
@@ -2759,6 +2760,11 @@ fn talker_loop(
     let start = now_mach();
     let mut next_pdu_ns: u64 = 0;
     let mut tx_pdus: u64 = 0;
+    // PDUs the dext refused, split by cause so "sent" can never again mean
+    // "attempted": the SAF-6 TX ceiling, versus anything else.
+    let mut tx_rate_limited: u64 = 0;
+    let mut tx_rejected: u64 = 0;
+    let mut last_send_err: Option<SendResult> = None;
     let mut underruns: u64 = 0;
     let mut last_connect = now_mach();
     let mut last_advert = now_mach();
@@ -2886,15 +2892,31 @@ fn talker_loop(
                     dst: stream_dest_mac(our_stream_id),
                     src: our_mac,
                     vlan: Some(VlanTag {
-                        pcp: 3, // class A priority
+                        // From the SR class A domain we advertised in the
+                        // TSpec, not a literal: the reservation and the frames
+                        // it covers must carry the same PCP and VID.
+                        pcp: DEFAULT_DOMAIN.priority,
                         dei: false,
-                        vid: 2,
+                        vid: DEFAULT_DOMAIN.vid,
                     }),
                     ethertype: avb_avtp::common::ETHERTYPE_AVTP,
                 };
                 if let Ok(f) = TxFrame::build(&hdr, pdu_scratch.get(..n).unwrap_or(&[]), false, 0) {
-                    let _ = dext.send(f.bytes(), false, 0);
-                    tx_pdus += 1;
+                    // Count what the dext ACCEPTED, not what we attempted. The
+                    // dext enforces its own TX ceiling (SAF-6) and returns an
+                    // error for a frame it drops; ignoring that made the
+                    // summary report 441 232 PDUs "sent" in a run where only
+                    // 58 820 reached the wire, which hid the real fault.
+                    match dext.send(f.bytes(), false, 0) {
+                        SendResult::Ok => tx_pdus += 1,
+                        // The dext's SAF-6 token bucket was empty: this frame
+                        // never reached the wire.
+                        SendResult::NoResources => tx_rate_limited += 1,
+                        other => {
+                            tx_rejected += 1;
+                            last_send_err = Some(other);
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -2914,10 +2936,27 @@ fn talker_loop(
         Level::Info,
         "play",
         &format!(
-            "talker done: {tx_pdus} PDUs sent, {underruns} underruns over {}s; 16R listener_ready={listener_ready}",
+            "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns over {}s; 16R listener_ready={listener_ready}",
             run_ns / 1_000_000_000
         ),
     );
+    if tx_rate_limited != 0 {
+        log.log(
+            Level::Warn,
+            "play",
+            &format!(
+                "the dext's TX ceiling dropped {tx_rate_limited} of {} PDUs -- it is below this stream's frame rate, so the 16R received a gapped stream and our MSRP declarations competed with audio for the same tokens",
+                tx_pdus + tx_rate_limited + tx_rejected
+            ),
+        );
+    }
+    if let Some(e) = last_send_err {
+        log.log(
+            Level::Warn,
+            "play",
+            &format!("{tx_rejected} PDUs refused by the dext, last reason {e:?}"),
+        );
+    }
     if !listener_ready {
         // Say so rather than letting a clean exit imply success: every PDU
         // went out, but nothing was listening.
