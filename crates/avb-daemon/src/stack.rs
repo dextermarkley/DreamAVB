@@ -2369,7 +2369,6 @@ fn talker_loop(
     // stream). The 16R identifies the stream it listens to by this id.
     let info = dext.device().info().map_err(|_| Exit::DextFault)?;
     let our_mac = avb_core::MacAddr::new(info.mac);
-    let our_stream_id = StreamId::from_parts(our_mac, 0);
     let our_id = avb_core::Eui64::from_mac(our_mac);
 
     // ---- The output format, read from the 16R ------------------------------
@@ -2394,7 +2393,7 @@ fn talker_loop(
         target: listener_id,
         target_mac: listener_mac,
     };
-    let (stream_format, listener_uid) =
+    let (stream_format, sink_uids) =
         derive_talker_format(log, dext, peers, listener_uid, listener_timeout_ns)?;
     let fmt: AafFormat = stream_format.aaf().ok_or(Exit::DextFault)?;
     let hz = fmt.nsr_hz().ok_or(Exit::DextFault)? as u64;
@@ -2470,28 +2469,53 @@ fn talker_loop(
         (Vec::new(), Vec::new())
     };
 
-    // The outbound stream set.
+    // The outbound stream set: one of OUR STREAM_OUTPUTs per 16R audio sink,
+    // in the sink's own descriptor-index order.
     //
-    // Shaped as a list because the device is eight streams wide in each
-    // direction, and the output ring's slot layout below is built from it — so
-    // the ring geometry is already the final one and adding the remaining
-    // talkers does not change what CoreAudio sees. Only the first is
-    // TRANSMITTED today: a second talker needs the AEM to advertise eight
-    // STREAM_OUTPUTs and sixty-four AUDIO_CLUSTERs, which `TalkerModel` is
-    // still single-stream for, and a Milan listener will not bind a stream the
-    // entity does not describe.
+    // `out_streams[i]` owns output-ring channels `i * channels ..`, the same
+    // layout the AEM describes and the TX gather uses — one ordering, so what
+    // a controller reads, what the ring holds and what goes on the wire cannot
+    // disagree.
     struct OutStream {
         /// Our STREAM_OUTPUT unique id, which is also the ring slot index.
         uid: u16,
         stream_id: StreamId,
         /// The 16R STREAM_INPUT sink this stream is bound to.
         sink_uid: u16,
+        /// The packetizer for this stream.
+        talker: AafTalker,
+        /// The 16R has answered this stream's Talker Advertise with Ready.
+        ready: bool,
     }
-    let out_streams: Vec<OutStream> = vec![OutStream {
-        uid: 0,
-        stream_id: our_stream_id,
-        sink_uid: listener_uid,
-    }];
+    let mut out_streams: Vec<OutStream> = Vec::with_capacity(sink_uids.len());
+    for (i, &sink_uid) in sink_uids.iter().enumerate() {
+        let Ok(uid) = u16::try_from(i) else { break };
+        let stream_id = StreamId::from_parts(our_mac, uid);
+        let Some(talker) = AafTalker::new(stream_id, fmt) else {
+            log.log(
+                Level::Error,
+                "play",
+                &format!("could not build a packetizer for stream {uid}"),
+            );
+            return Err(Exit::DextFault);
+        };
+        out_streams.push(OutStream {
+            uid,
+            stream_id,
+            sink_uid,
+            talker,
+            ready: false,
+        });
+    }
+    if out_streams.is_empty() {
+        log.log(Level::Error, "play", "no outbound stream to transmit");
+        return Err(Exit::DextFault);
+    }
+    let our_stream_id = out_streams
+        .first()
+        .map(|o| o.stream_id)
+        .unwrap_or(StreamId(0));
+    let listener_uid = out_streams.first().map_or(0, |o| o.sink_uid);
 
     // Create the OUTPUT ring (daemon = consumer, plug-in = producer). We create
     // it so the file exists with world perms before the plug-in attaches, the
@@ -2561,9 +2585,6 @@ fn talker_loop(
         );
     }
 
-    // The packetizer for our stream.
-    let mut talker = AafTalker::new(our_stream_id, fmt).ok_or(Exit::DextFault)?;
-
     // Our AEM, so the 16R can ENUMERATE us rather than merely discover us.
     //
     // ADP alone only tells a Milan controller that an entity exists; it then
@@ -2576,9 +2597,10 @@ fn talker_loop(
     // The model is derived from `fmt`, the format we actually packetize with,
     // so the channel count and rate in the AEM cannot disagree with the
     // stream on the wire.
+    let our_stream_ids: Vec<StreamId> = out_streams.iter().map(|o| o.stream_id).collect();
     let model = avb_avdecc::entity::talker_model(
         our_mac,
-        our_stream_id,
+        &our_stream_ids,
         stream_format,
         crate::FIRMWARE_VERSION,
     )
@@ -2587,11 +2609,14 @@ fn talker_loop(
         Level::Info,
         "aem",
         &format!(
-            "talker entity 0x{:016x} model 0x{:016x}: 1 STREAM_OUTPUT, {} ch @ {} Hz",
+            "talker entity 0x{:016x} model 0x{:016x}: {} STREAM_OUTPUT(s) x {} ch = {} channels @ {} Hz, {} AUDIO_CLUSTER(s)",
             u64::from_be_bytes(our_id.0),
             model.entity_model_id,
+            model.stream_count(),
             model.channels,
-            model.current_sampling_rate
+            usize::from(model.stream_count()) * usize::from(model.channels),
+            model.current_sampling_rate,
+            model.cluster_count(),
         ),
     );
     let mut entity = avb_avdecc::entity::TalkerEntity::new(model);
@@ -2603,21 +2628,27 @@ fn talker_loop(
     let adp = entity.advertise();
     send_adp(dext, our_mac, &adp);
 
-    // Connect as controller: tell the 16R to connect its STREAM_INPUT
-    // [listener_uid] to our talker stream. Mirror of the record path's
+    // Connect as controller: tell the 16R to connect each of its STREAM_INPUT
+    // sinks to the matching talker stream of ours. Mirror of the record path's
     // CONNECT_TX_COMMAND, with the 16R as listener_entity_id.
+    //
+    // ONE CONNECT PER STREAM. The 16R binds the sink a controller names, so
+    // connecting one of eight leaves the other seven sinks unbound no matter
+    // how many streams we advertise or transmit.
     let mut connect_seq: u16 = 0;
-    connect_listener(
-        log,
-        dext,
-        our_mac,
-        our_id,
-        listener_id,
-        our_stream_id,
-        listener_uid,
-        connect_seq,
-    );
-    connect_seq = connect_seq.wrapping_add(1);
+    for o in &out_streams {
+        connect_listener(
+            log,
+            dext,
+            our_mac,
+            our_id,
+            listener_id,
+            o.stream_id,
+            o.sink_uid,
+            connect_seq,
+        );
+        connect_seq = connect_seq.wrapping_add(1);
+    }
 
     // ---- TX pacing loop ------------------------------------------------------
     //
@@ -2758,18 +2789,28 @@ fn talker_loop(
     // `accumulated_latency_ns` starts at 0 -- it is the latency accumulated
     // ALONG THE PATH, which bridges add to as the advertise propagates, and we
     // are cabled directly to the 16R with no bridge in between.
-    let stream_dst = stream_dest_mac(our_stream_id);
-    let advertise = talker_tspec(our_stream_id, talker.pdu_len());
-    let max_frame_size = advertise.max_frame_size;
-    srp.declare(now_mach(), Attribute::Talker(Talker::Advertise(advertise)));
-    log.log(
-        Level::Info,
-        "msrp",
-        &format!(
-            "Talker Advertise declared: stream 0x{:016x} dest {} vid {} max_frame {}B 1 frame/interval prio {}",
-            our_stream_id.0, stream_dst, DEFAULT_DOMAIN.vid, max_frame_size, DEFAULT_DOMAIN.priority
-        ),
-    );
+    // ONE Talker Advertise PER STREAM. A Milan listener accepts no stream it
+    // has not been advertised, so eight streams need eight declarations; one
+    // declaration would have the 16R bind one and ignore the other seven
+    // however many we transmitted.
+    for o in &out_streams {
+        let advertise = talker_tspec(o.stream_id, o.talker.pdu_len());
+        let max_frame_size = advertise.max_frame_size;
+        srp.declare(now_mach(), Attribute::Talker(Talker::Advertise(advertise)));
+        log.log(
+            Level::Info,
+            "msrp",
+            &format!(
+                "Talker Advertise declared: stream {} 0x{:016x} dest {} vid {} max_frame {}B 1 frame/interval prio {}",
+                o.uid,
+                o.stream_id.0,
+                stream_dest_mac(o.stream_id),
+                DEFAULT_DOMAIN.vid,
+                max_frame_size,
+                DEFAULT_DOMAIN.priority
+            ),
+        );
+    }
 
     let mut srp_out: Outbox<32> = Outbox::new();
     // Whether the 16R has answered with Listener Ready for OUR stream. This is
@@ -2793,7 +2834,7 @@ fn talker_loop(
     let mut sample_scratch = vec![0u8; spf * frame_bytes];
     let stream_frame_bytes = channels * 4;
     let mut stream_scratch = vec![0u8; spf * stream_frame_bytes];
-    let mut pdu_scratch = vec![0u8; talker.pdu_len()];
+    let mut pdu_scratch = vec![0u8; out_streams.first().map_or(0, |o| o.talker.pdu_len())];
 
     let run_ns = seconds.saturating_mul(1_000_000_000);
     let start = now_mach();
@@ -2810,6 +2851,11 @@ fn talker_loop(
     // protocol worked and the audio was silence.
     let mut tx_peak: i64 = 0;
     let mut tx_peak_tick: u64 = 0;
+    // Observation intervals the loop could not service in time. Non-zero
+    // means the per-tick work does not fit in 125 us, so the stream is gapped
+    // — a different fault from the dext rate-limiting us, and it must not hide
+    // behind the PDU count.
+    let mut missed_intervals: u64 = 0;
     let mut last_connect = now_mach();
     let mut last_advert = now_mach();
     // AEM commands we answered, and how many we had to refuse. A run where the
@@ -2911,17 +2957,35 @@ fn talker_loop(
                 let Some(acmp) = avb_avdecc::Acmpdu::decode(p.payload) else {
                     continue;
                 };
-                if let Some(resp) = avb_avdecc::talker_response(
-                    &acmp,
-                    avb_avdecc::TalkerStream {
+                // Answer for the stream the listener NAMED, not always the
+                // first: a CONNECT_TX carries `talker_unique_id`, and handing
+                // back stream 0's addressing for a request about stream 5
+                // would have the 16R reserve one stream and listen for
+                // another. An id we do not have falls through to
+                // `talker_response`, which refuses it with
+                // TALKER_NO_STREAM_INDEX rather than substituting ours.
+                let named = out_streams.iter().find(|o| o.uid == acmp.talker_unique_id);
+                let ts = match named {
+                    Some(o) => avb_avdecc::TalkerStream {
                         our_id,
-                        our_unique_id: 0,
-                        stream_id: our_stream_id,
-                        stream_dest_mac: stream_dst,
+                        our_unique_id: o.uid,
+                        stream_id: o.stream_id,
+                        stream_dest_mac: stream_dest_mac(o.stream_id),
                         stream_vlan_id: DEFAULT_DOMAIN.vid,
                         connection_count: 1,
                     },
-                ) {
+                    None => avb_avdecc::TalkerStream {
+                        our_id,
+                        // Deliberately an id we do not serve, so the refusal
+                        // comes from the one place that decides it.
+                        our_unique_id: u16::MAX,
+                        stream_id: StreamId(0),
+                        stream_dest_mac: avb_core::MacAddr([0; 6]),
+                        stream_vlan_id: DEFAULT_DOMAIN.vid,
+                        connection_count: 0,
+                    },
+                };
+                if let Some(resp) = avb_avdecc::talker_response(&acmp, ts) {
                     let hdr = EthHeader {
                         dst: avb_core::AVDECC_MULTICAST,
                         src: our_mac,
@@ -3044,39 +3108,69 @@ fn talker_loop(
         while let Some(ev) = srp.pop_event() {
             log.log(Level::Debug, "srp", &format!("event: {ev:?}"));
             match ev {
-                // The 16R accepting our stream. Report it once: it is the
-                // difference between "transmitting" and "connected".
-                SrpEvent::ListenerRegistered { stream_id, .. }
-                    if stream_id.0 == our_stream_id.0 =>
-                {
-                    if !listener_ready {
-                        listener_ready = true;
-                        entity.set_stream_info(avb_avdecc::entity::StreamInfo {
-                            connected: true,
-                            dest_mac: stream_dst,
-                            vlan_id: DEFAULT_DOMAIN.vid,
-                            msrp_accumulated_latency_ns: 0,
-                        });
-                        log.log(
-                            Level::Info,
-                            "msrp",
-                            "16R declared Listener Ready for our stream — accepted",
-                        );
+                // The 16R accepting one of our streams. Tracked PER STREAM:
+                // with eight advertised it can accept some and not others,
+                // and one flag would report the whole direction connected on
+                // the strength of a single acceptance.
+                SrpEvent::ListenerRegistered { stream_id, .. } => {
+                    if let Some(o) = out_streams
+                        .iter_mut()
+                        .find(|o| o.stream_id.0 == stream_id.0)
+                    {
+                        if !o.ready {
+                            o.ready = true;
+                            log.log(
+                                Level::Info,
+                                "msrp",
+                                &format!(
+                                    "16R declared Listener Ready for our stream {} (0x{:016x}) — accepted",
+                                    o.uid, o.stream_id.0
+                                ),
+                            );
+                        }
+                    }
+                    // `StreamInfo` carries one stream, so the entity reports
+                    // the first. The per-stream truth is in `out_streams`.
+                    if let Some(first) = out_streams.first() {
+                        if first.ready && !listener_ready {
+                            listener_ready = true;
+                            entity.set_stream_info(avb_avdecc::entity::StreamInfo {
+                                connected: true,
+                                dest_mac: stream_dest_mac(first.stream_id),
+                                vlan_id: DEFAULT_DOMAIN.vid,
+                                msrp_accumulated_latency_ns: 0,
+                            });
+                        }
                     }
                 }
-                SrpEvent::ListenerWithdrawn { stream_id, .. } if stream_id.0 == our_stream_id.0 => {
-                    listener_ready = false;
-                    entity.set_stream_info(avb_avdecc::entity::StreamInfo {
-                        connected: false,
-                        dest_mac: stream_dst,
-                        vlan_id: DEFAULT_DOMAIN.vid,
-                        msrp_accumulated_latency_ns: 0,
-                    });
-                    log.log(
-                        Level::Warn,
-                        "msrp",
-                        "16R withdrew Listener Ready for our stream",
-                    );
+                SrpEvent::ListenerWithdrawn { stream_id, .. } => {
+                    if let Some(o) = out_streams
+                        .iter_mut()
+                        .find(|o| o.stream_id.0 == stream_id.0)
+                    {
+                        if o.ready {
+                            o.ready = false;
+                            log.log(
+                                Level::Warn,
+                                "msrp",
+                                &format!(
+                                    "16R withdrew Listener Ready for our stream {} (0x{:016x})",
+                                    o.uid, o.stream_id.0
+                                ),
+                            );
+                        }
+                    }
+                    if let Some(first) = out_streams.first() {
+                        if !first.ready && listener_ready {
+                            listener_ready = false;
+                            entity.set_stream_info(avb_avdecc::entity::StreamInfo {
+                                connected: false,
+                                dest_mac: stream_dest_mac(first.stream_id),
+                                vlan_id: DEFAULT_DOMAIN.vid,
+                                msrp_accumulated_latency_ns: 0,
+                            });
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -3158,17 +3252,19 @@ fn talker_loop(
         // sink bound (mirror of the record loop's periodic CONNECT_TX). This
         // used to only bump a counter and never re-send (review L1).
         if ns_since(last_connect) >= 1_000_000_000 {
-            connect_listener(
-                log,
-                dext,
-                our_mac,
-                our_id,
-                listener_id,
-                our_stream_id,
-                listener_uid,
-                connect_seq,
-            );
-            connect_seq = connect_seq.wrapping_add(1);
+            for o in &out_streams {
+                connect_listener(
+                    log,
+                    dext,
+                    our_mac,
+                    our_id,
+                    listener_id,
+                    o.stream_id,
+                    o.sink_uid,
+                    connect_seq,
+                );
+                connect_seq = connect_seq.wrapping_add(1);
+            }
             last_connect = now_mach();
         }
 
@@ -3434,86 +3530,128 @@ fn talker_loop(
         };
         let avtp_ts = (gptp_now.wrapping_add(presentation_offset_ns) & 0xFFFF_FFFF) as u32;
 
-        // Gather this stream's channels out of the 64-channel ring frame.
+        // Transmit ONE PDU PER STREAM for this observation interval.
         //
-        // The ring is the device's full width and each stream owns a
-        // contiguous block of it, so the packetizer's input is a per-stream
-        // copy rather than the ring bytes directly. Allocation-free: both
-        // buffers are sized once above.
-        let first_ch = usize::from(out_streams.first().map_or(0, |o| o.uid)) * channels;
-        for f in 0..spf {
-            let src = f * frame_bytes + first_ch * 4;
-            let dst = f * stream_frame_bytes;
-            if let (Some(s_in), Some(s_out)) = (
-                sample_scratch.get(src..src + stream_frame_bytes),
-                stream_scratch.get_mut(dst..dst + stream_frame_bytes),
-            ) {
-                s_out.copy_from_slice(s_in);
-            }
-        }
-
-        // Outbound peak |sample|, so "transmitting audio" is distinguishable
-        // from "transmitting correctly-formed silence". Without it a complete
-        // protocol success (listener_ready, zero underruns, 8000 PDUs/s) reads
-        // as healthy while every sample is zero — the exact shape of the dead
-        // WriteMix path that survived five reviews. Sampled every 8th PDU
-        // (~1000/s) to keep the 50 us pacing loop clean; a peak does not need
-        // every frame.
-        tx_peak_tick = tx_peak_tick.wrapping_add(1);
-        if tx_peak_tick.is_multiple_of(8) {
-            if let Some(bytes) = stream_scratch.get(..got.min(spf) * stream_frame_bytes) {
-                for s in bytes.as_chunks::<4>().0 {
-                    let a = i64::from(i32::from_ne_bytes(*s)).abs();
-                    if a > tx_peak {
-                        tx_peak = a;
-                    }
+        // Every stream carries the same sample instant, so they all take the
+        // SAME presentation timestamp — which is exactly what the 16R does in
+        // the other direction (all eight of its streams stamp identically for
+        // a given instant, read off the wire). One ring read feeds all eight:
+        // each takes its own contiguous block of channels out of the
+        // 64-channel frame.
+        //
+        // Eight streams at 8000 frames/s each is 64 000 frames/s, over three
+        // times the dext's old 20 000/s SAF-6 ceiling — which is why that
+        // ceiling had to be raised first, and why `rate-limited` in the
+        // summary is the number to read if this looks gapped.
+        for i in 0..out_streams.len() {
+            let (uid, dst) = match out_streams.get(i) {
+                Some(o) => (o.uid, stream_dest_mac(o.stream_id)),
+                None => break,
+            };
+            // Gather this stream's channels out of the 64-channel ring frame.
+            // Allocation-free: both buffers are sized once above.
+            let first_ch = usize::from(uid) * channels;
+            for f in 0..spf {
+                let src = f * frame_bytes + first_ch * 4;
+                let dst_off = f * stream_frame_bytes;
+                if let (Some(s_in), Some(s_out)) = (
+                    sample_scratch.get(src..src + stream_frame_bytes),
+                    stream_scratch.get_mut(dst_off..dst_off + stream_frame_bytes),
+                ) {
+                    s_out.copy_from_slice(s_in);
                 }
             }
-        }
 
-        match talker.packetize(&stream_scratch, avtp_ts, true, &mut pdu_scratch) {
-            Ok(n) => {
-                let hdr = EthHeader {
-                    dst: stream_dest_mac(our_stream_id),
-                    src: our_mac,
-                    vlan: Some(VlanTag {
-                        // From the SR class A domain we advertised in the
-                        // TSpec, not a literal: the reservation and the frames
-                        // it covers must carry the same PCP and VID.
-                        pcp: DEFAULT_DOMAIN.priority,
-                        dei: false,
-                        vid: DEFAULT_DOMAIN.vid,
-                    }),
-                    ethertype: avb_avtp::common::ETHERTYPE_AVTP,
-                };
-                if let Ok(f) = TxFrame::build(&hdr, pdu_scratch.get(..n).unwrap_or(&[]), false, 0) {
-                    // Count what the dext ACCEPTED, not what we attempted. The
-                    // dext enforces its own TX ceiling (SAF-6) and returns an
-                    // error for a frame it drops; ignoring that made the
-                    // summary report 441 232 PDUs "sent" in a run where only
-                    // 58 820 reached the wire, which hid the real fault.
-                    match dext.send(f.bytes(), false, 0) {
-                        SendResult::Ok => tx_pdus += 1,
-                        // The dext's SAF-6 token bucket was empty: this frame
-                        // never reached the wire.
-                        SendResult::NoResources => tx_rate_limited += 1,
-                        other => {
-                            tx_rejected += 1;
-                            last_send_err = Some(other);
+            // Outbound peak |sample|, so "transmitting audio" is
+            // distinguishable from "transmitting correctly-formed silence".
+            // Without it a complete protocol success (listener_ready, zero
+            // underruns, 8000 PDUs/s) reads as healthy while every sample is
+            // zero — the shape of the dead WriteMix path that survived five
+            // reviews. Sampled every 8th interval to keep the 50 us pacing
+            // loop clean; a peak does not need every frame.
+            if tx_peak_tick.is_multiple_of(8) {
+                if let Some(bytes) = stream_scratch.get(..got.min(spf) * stream_frame_bytes) {
+                    for sb in bytes.as_chunks::<4>().0 {
+                        let a = i64::from(i32::from_ne_bytes(*sb)).abs();
+                        if a > tx_peak {
+                            tx_peak = a;
                         }
                     }
                 }
             }
-            Err(e) => {
-                log.log(Level::Error, "play", &format!("packetize error: {e:?}"));
+
+            let packed = match out_streams.get_mut(i) {
+                Some(o) => o
+                    .talker
+                    .packetize(&stream_scratch, avtp_ts, true, &mut pdu_scratch),
+                None => break,
+            };
+            match packed {
+                Ok(n) => {
+                    let hdr = EthHeader {
+                        dst,
+                        src: our_mac,
+                        vlan: Some(VlanTag {
+                            // From the SR class A domain we advertised in the
+                            // TSpec, not a literal: the reservation and the
+                            // frames it covers must carry the same PCP and
+                            // VID.
+                            pcp: DEFAULT_DOMAIN.priority,
+                            dei: false,
+                            vid: DEFAULT_DOMAIN.vid,
+                        }),
+                        ethertype: avb_avtp::common::ETHERTYPE_AVTP,
+                    };
+                    if let Ok(f) =
+                        TxFrame::build(&hdr, pdu_scratch.get(..n).unwrap_or(&[]), false, 0)
+                    {
+                        // Count what the dext ACCEPTED, not what we attempted.
+                        // The dext enforces its own TX ceiling (SAF-6) and
+                        // returns an error for a frame it drops; ignoring that
+                        // made the summary report 441 232 PDUs "sent" in a run
+                        // where only 58 820 reached the wire, which hid the
+                        // real fault.
+                        match dext.send(f.bytes(), false, 0) {
+                            SendResult::Ok => tx_pdus += 1,
+                            // The token bucket was empty: never reached the
+                            // wire.
+                            SendResult::NoResources => tx_rate_limited += 1,
+                            other => {
+                                tx_rejected += 1;
+                                last_send_err = Some(other);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log.log(
+                        Level::Error,
+                        "play",
+                        &format!("packetize error on stream {uid}: {e:?}"),
+                    );
+                }
             }
         }
+        tx_peak_tick = tx_peak_tick.wrapping_add(1);
 
+        // Schedule the next interval, and NEVER resynchronise to "now".
+        //
+        // This used to set `next_pdu_ns = elapsed` when it fell behind. With
+        // one stream the per-tick work fitted inside 125 us and that never
+        // fired. With eight it does not always fit, and resyncing to now made
+        // the gate `elapsed < next_pdu_ns` immediately false again — so the
+        // loop sent group after group with no pacing at all, drained the
+        // dext's 64-token burst and had 415 140 of 935 952 frames denied while
+        // the wire still only saw 14 880/s. A pacing loop that falls behind
+        // must SLOW DOWN, not spin.
+        //
+        // Falling behind is now counted and the schedule placed on the next
+        // boundary in the FUTURE, which guarantees a sleep before the next
+        // group.
         next_pdu_ns = next_pdu_ns.saturating_add(pdu_interval_ns);
-        // If we fell behind (scheduler jitter), catch the schedule up to now so
-        // we do not spin emitting a burst.
-        if next_pdu_ns + pdu_interval_ns < elapsed {
-            next_pdu_ns = elapsed;
+        if next_pdu_ns <= elapsed {
+            missed_intervals += 1;
+            next_pdu_ns = elapsed.saturating_add(pdu_interval_ns);
         }
     }
 
@@ -3528,7 +3666,7 @@ fn talker_loop(
         Level::Info,
         dir,
         &format!(
-            "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns over {}s; outbound peak {tx_peak} ({}); 16R listener_ready={listener_ready}; AEM commands answered={aecp_answered} refused={aecp_refused}; ACMP talker commands answered={acmp_talker_answered}; gPTP servo={} offset {:.0} ns, {ts_unavailable} ticks with no clock anchor, {ticks_unlocked} unlocked",
+            "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns, {missed_intervals} intervals missed over {}s; outbound peak {tx_peak} ({}); 16R listener_ready={listener_ready}; AEM commands answered={aecp_answered} refused={aecp_refused}; ACMP talker commands answered={acmp_talker_answered}; gPTP servo={} offset {:.0} ns, {ts_unavailable} ticks with no clock anchor, {ticks_unlocked} unlocked",
             run_ns / 1_000_000_000,
             peak_label(tx_peak),
             final_gptp.servo_state.name(),
@@ -3665,6 +3803,44 @@ fn talker_loop(
             Level::Warn,
             "play",
             &format!("{tx_rejected} PDUs refused by the dext, last reason {e:?}"),
+        );
+    }
+    // Per-stream acceptance. With eight advertised the 16R can accept some
+    // and not others, and `listener_ready` alone would report the direction
+    // connected on the strength of the first.
+    let ready_count = out_streams.iter().filter(|o| o.ready).count();
+    log.log(
+        Level::Info,
+        dir,
+        &format!(
+            "outbound streams: {} of {} accepted by the 16R{}",
+            ready_count,
+            out_streams.len(),
+            if ready_count == out_streams.len() {
+                String::new()
+            } else {
+                format!(
+                    "; NOT accepted: {:?}",
+                    out_streams
+                        .iter()
+                        .filter(|o| !o.ready)
+                        .map(|o| o.uid)
+                        .collect::<Vec<_>>()
+                )
+            }
+        ),
+    );
+    if ready_count > 0 && ready_count < out_streams.len() {
+        log.log(
+            Level::Warn,
+            dir,
+            &format!(
+                "only {ready_count} of {} outbound streams were accepted, so {} of the device's \
+                 {} output channels reached the 16R and the rest went nowhere",
+                out_streams.len(),
+                ready_count * channels,
+                out_streams.len() * channels,
+            ),
         );
     }
     if !listener_ready {
@@ -4110,7 +4286,7 @@ fn derive_talker_format(
     peers: AecpPeers,
     listener_uid: Option<u16>,
     timeout_ns: u64,
-) -> Result<(avb_avtp::stream_format::StreamFormat, u16), Exit> {
+) -> Result<(avb_avtp::stream_format::StreamFormat, Vec<u16>), Exit> {
     use avb_avdecc::aem::desc::{decode_audio_unit, decode_stream};
     use avb_avdecc::constants::desc as aem_desc;
 
@@ -4184,29 +4360,58 @@ fn derive_talker_format(
         ),
     );
 
-    // Choose the sink unless one was named. The 16R's index 0 is `Return CRF`
-    // — a Clock Reference Format stream — and its audio sinks are 1..=8, so a
-    // fixed default of 0 bound the media clock: reservation and ACMP both
-    // succeeded and no audio went anywhere.
-    let uid = match listener_uid {
-        Some(u) => u,
-        None => match avb_avdecc::first_audio_stream(&sinks) {
-            Some(u) => {
-                let name = sinks
-                    .get(usize::from(u))
-                    .map(|s| s.object_name.clone())
-                    .unwrap_or_default();
-                log.log(
-                    Level::Info,
-                    "aecp",
-                    &format!(
-                        "selected 16R STREAM_INPUT {u} ({name}) as our audio sink; \
-                         pass --listener-uid to override"
-                    ),
-                );
-                u
+    // Choose the sinks. An explicit --listener-uid names exactly one;
+    // otherwise EVERY AAF audio sink is bound, in descriptor-index order.
+    //
+    // The 16R's STREAM_INPUT 0 is `Return CRF`, its media-clock sink, so a
+    // fixed default of 0 reserved and connected a stream that carries no
+    // audio. Its audio sinks are 1..=8 (`Return 1-8` .. `Return 57-64`), 8
+    // channels each — 64 in total, which is the device's full width.
+    let uids: Vec<u16> = match listener_uid {
+        Some(u) => vec![u],
+        None => {
+            let mut v: Vec<u16> = Vec::new();
+            let mut chosen_fmt: Option<avb_avtp::stream_format::StreamFormat> = None;
+            for (i, sink) in sinks.iter().enumerate() {
+                let Ok(idx) = u16::try_from(i) else { break };
+                let Some(a) = sink.current_format.aaf() else {
+                    log.log(
+                        Level::Info,
+                        "aecp",
+                        &format!(
+                            "16R STREAM_INPUT {idx} ({}) is {} — not audio, skipping",
+                            sink.object_name,
+                            sink.current_format.subtype_name()
+                        ),
+                    );
+                    continue;
+                };
+                if a.ut || !sink.current_format.decodable() {
+                    continue;
+                }
+                // Every bound sink must share one format: the output ring has
+                // a single geometry across its slots, so a sink configured
+                // differently cannot be fed from a slot sized for the rest.
+                match chosen_fmt {
+                    None => chosen_fmt = Some(sink.current_format),
+                    Some(f) if f == sink.current_format => {}
+                    Some(f) => {
+                        log.log(
+                            Level::Warn,
+                            "aecp",
+                            &format!(
+                                "16R STREAM_INPUT {idx} ({}) is 0x{:016x} but the others are \
+                                 0x{:016x}; this build sends one geometry on every stream, so it \
+                                 is skipped",
+                                sink.object_name, sink.current_format.0, f.0
+                            ),
+                        );
+                        continue;
+                    }
+                }
+                v.push(idx);
             }
-            None => {
+            if v.is_empty() {
                 log.log(
                     Level::Error,
                     "aecp",
@@ -4228,8 +4433,24 @@ fn derive_talker_format(
                 );
                 return Err(Exit::TalkerNotFound);
             }
-        },
+            let names: Vec<String> = v
+                .iter()
+                .filter_map(|&u| sinks.get(usize::from(u)))
+                .map(|s| s.object_name.clone())
+                .collect();
+            log.log(
+                Level::Info,
+                "aecp",
+                &format!(
+                    "selected {} 16R audio sink(s) {v:?} ({}); pass --listener-uid for one",
+                    v.len(),
+                    names.join(", ")
+                ),
+            );
+            v
+        }
     };
+    let uid = *uids.first().expect("uids is non-empty");
 
     match avb_avdecc::talker_output_format(&sinks, audio_unit_hz, uid) {
         Ok(fmt) => {
@@ -4250,7 +4471,7 @@ fn derive_talker_format(
                     .unwrap_or_else(|| "not AAF".into())
                 ),
             );
-            Ok((fmt, uid))
+            Ok((fmt, uids))
         }
         Err(e) => {
             log.log(

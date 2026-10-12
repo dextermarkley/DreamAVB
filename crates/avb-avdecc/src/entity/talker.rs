@@ -39,33 +39,68 @@ use crate::entity::GptpStatus;
 /// Advertisement `valid_time` (§9.3: 10 → 20 s validity).
 pub const VALID_TIME: u8 = 10;
 
-/// Our talker model: the single AAF stream the Mac sources, described in the
-/// terms the AEM needs. Built by [`talker_model`], which is the only
-/// constructor — the channel count, rate and spf come from the stream format
-/// the talker actually transmits, never from a literal (acceptance 3, and the
-/// project rule against hardcoded rates/channels).
+/// Our talker model: the AAF streams the Mac sources, described in the terms
+/// the AEM needs. Built by [`talker_model`], which is the only constructor —
+/// the channel count, rate and spf come from the stream format the talker
+/// actually transmits, never from a literal (acceptance 3, and the project
+/// rule against hardcoded rates/channels).
+///
+/// MULTI-STREAM. The 16R is 64 channels wide in each direction, carried as
+/// eight 8-channel AAF streams, so the entity has to DESCRIBE eight
+/// STREAM_OUTPUTs: a Milan listener will not bind a stream the entity does not
+/// describe, which is what blocked the outbound side at one stream regardless
+/// of how many the daemon was willing to packetize.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TalkerModel {
     pub entity_id: Eui64,
     pub entity_model_id: u64,
     pub mac: MacAddr,
-    pub stream_id: StreamId,
-    pub object_name: String,
+    /// Our STREAM_OUTPUTs in descriptor-index order. `streams[i]` owns ring
+    /// channels `i * channels ..`, which is the same layout the output ring
+    /// and the daemon's gather use — one ordering, so the AEM a controller
+    /// reads cannot disagree with what goes on the wire.
+    pub streams: Vec<TalkerStream>,
     pub current_format: StreamFormat,
     /// Every format we can source. Today exactly one: what we transmit.
     pub formats: Vec<StreamFormat>,
+    /// Channels PER STREAM.
     pub channels: u16,
-    /// Per-channel names, used for the AUDIO_CLUSTER descriptors.
+    /// Per-channel names across every stream, used for the AUDIO_CLUSTER
+    /// descriptors. Length is `streams.len() * channels`.
     pub channel_names: Vec<String>,
     pub sampling_rates: Vec<u32>,
     pub current_sampling_rate: u32,
     pub firmware_version: String,
 }
 
+/// One STREAM_OUTPUT we source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TalkerStream {
+    pub stream_id: StreamId,
+    pub object_name: String,
+}
+
 impl TalkerModel {
-    /// Channel count as the descriptor counts need it.
+    /// Total AUDIO_CLUSTERs: one per channel across every stream (64 for the
+    /// 16R's eight 8-channel streams).
     pub fn cluster_count(&self) -> u16 {
-        self.channels
+        u16::try_from(self.streams.len())
+            .unwrap_or(0)
+            .saturating_mul(self.channels)
+    }
+
+    /// How many STREAM_OUTPUTs we describe.
+    pub fn stream_count(&self) -> u16 {
+        u16::try_from(self.streams.len()).unwrap_or(0)
+    }
+
+    /// The first stream's id, for the places that still need a single handle
+    /// (the ADP's entity identity is the entity id, not a stream).
+    pub fn first_stream_id(&self) -> StreamId {
+        self.streams
+            .first()
+            .map(|s| s.stream_id)
+            .unwrap_or(StreamId(0))
     }
 }
 
@@ -76,22 +111,40 @@ impl TalkerModel {
 /// be read, rather than inventing a channel count.
 pub fn talker_model(
     our_mac: MacAddr,
-    stream_id: StreamId,
+    stream_ids: &[StreamId],
     fmt: StreamFormat,
     firmware_version: &str,
 ) -> Option<TalkerModel> {
     let aaf = fmt.aaf()?;
     let hz = aaf.nsr_hz()?;
     let channels = aaf.channels;
-    // Channel names are positional: we are the source, so there is no upstream
-    // cluster name to inherit the way the listener inherits the 16R's.
-    let channel_names = (0..channels).map(|k| format!("Mac ch{}", k + 1)).collect();
+    if stream_ids.is_empty() {
+        return None;
+    }
+    let streams: Vec<TalkerStream> = stream_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &stream_id)| TalkerStream {
+            stream_id,
+            // Named by the channel range it carries, so a controller's view
+            // lines up with the 16R's own "Send 1-8" style labels.
+            object_name: format!(
+                "Mac→16R {}-{}",
+                i * usize::from(channels) + 1,
+                (i + 1) * usize::from(channels)
+            ),
+        })
+        .collect();
+    // Channel names are positional and span every stream: we are the source,
+    // so there is no upstream cluster name to inherit the way the listener
+    // inherits the 16R's.
+    let total = streams.len() * usize::from(channels);
+    let channel_names = (0..total).map(|k| format!("Mac ch{}", k + 1)).collect();
     let mut m = TalkerModel {
         entity_id: Eui64::from_mac(our_mac),
         entity_model_id: 0, // filled below
         mac: our_mac,
-        stream_id,
-        object_name: "Mac→16R".to_string(),
+        streams,
         current_format: fmt,
         formats: vec![fmt],
         channels,
@@ -115,6 +168,10 @@ pub fn compute_talker_model_id(m: &TalkerModel) -> u64 {
     canon.extend_from_slice(b"talker");
     canon.extend_from_slice(&m.current_format.0.to_be_bytes());
     canon.extend_from_slice(&m.channels.to_be_bytes());
+    // The STREAM COUNT is part of the identity: a controller caches the model
+    // by this id, so a one-stream and an eight-stream entity must not share
+    // one — it would read a stale 8-channel model for a 64-channel device.
+    canon.extend_from_slice(&m.stream_count().to_be_bytes());
     for f in &m.formats {
         canon.extend_from_slice(&f.0.to_be_bytes());
     }
@@ -221,7 +278,7 @@ impl TalkerEntity {
             // means "no AEM to cache", which defeats enumeration.
             entity_model_id: self.model.entity_model_id,
             entity_capabilities: self.entity_capabilities(),
-            talker_stream_sources: 1,
+            talker_stream_sources: self.model.stream_count(),
             talker_capabilities: self.talker_capabilities(),
             listener_stream_sinks: 0,
             listener_capabilities: 0,
@@ -245,10 +302,12 @@ impl TalkerEntity {
     pub fn descriptor_counts(&self) -> Vec<(u16, u16)> {
         vec![
             (dt::AUDIO_UNIT, 1),
-            (dt::STREAM_OUTPUT, 1),
-            (dt::STREAM_PORT_OUTPUT, 1),
+            // One STREAM_OUTPUT, STREAM_PORT_OUTPUT and AUDIO_MAP per stream,
+            // and one AUDIO_CLUSTER per channel across all of them.
+            (dt::STREAM_OUTPUT, self.model.stream_count()),
+            (dt::STREAM_PORT_OUTPUT, self.model.stream_count()),
             (dt::AUDIO_CLUSTER, self.model.cluster_count()),
-            (dt::AUDIO_MAP, 1),
+            (dt::AUDIO_MAP, self.model.stream_count()),
             (dt::AVB_INTERFACE, 1),
             (dt::CLOCK_SOURCE, 1),
             (dt::CLOCK_DOMAIN, 1),
@@ -355,7 +414,7 @@ impl TalkerEntity {
                 entity_id: m.entity_id,
                 entity_model_id: m.entity_model_id,
                 entity_capabilities: self.entity_capabilities(),
-                talker_stream_sources: 1,
+                talker_stream_sources: self.model.stream_count(),
                 talker_capabilities: self.talker_capabilities(),
                 listener_stream_sinks: 0,
                 listener_capabilities: 0,
@@ -378,38 +437,46 @@ impl TalkerEntity {
                 object_name: "Mac audio".into(),
                 clock_domain_index: 0,
                 number_of_stream_input_ports: 0,
-                number_of_stream_output_ports: 1,
+                number_of_stream_output_ports: m.stream_count(),
                 current_sampling_rate: m.current_sampling_rate,
                 sampling_rates: m.sampling_rates.clone(),
             })),
-            dt::STREAM_OUTPUT if index == 0 => Some(desc::encode_stream(
-                &StreamDesc {
-                    object_name: m.object_name.clone(),
-                    clock_domain_index: 0,
-                    // CLASS_A only. NOT CLOCK_SYNC_SOURCE: that flag offers
-                    // this stream as a media-clock reference for the peer, and
-                    // our media clock is the Mac's, not disciplined to the
-                    // 16R's — advertising it would invite the 16R to slave to
-                    // a clock we do not control.
-                    stream_flags: stream_flags::CLASS_A,
-                    current_format: m.current_format,
-                    formats: m.formats.clone(),
-                    avb_interface_index: 0,
-                    buffer_length: 2_000_000,
-                },
-                false,
-            )),
-            dt::STREAM_PORT_OUTPUT if index == 0 => Some(desc::encode_stream_port(
-                &StreamPortDesc {
-                    clock_domain_index: 0,
-                    port_flags: 0,
-                    number_of_clusters: m.cluster_count(),
-                    base_cluster: 0,
-                    number_of_maps: 1,
-                    base_map: 0,
-                },
-                false,
-            )),
+            dt::STREAM_OUTPUT if usize::from(index) < m.streams.len() => {
+                let st = m.streams.get(usize::from(index))?;
+                Some(desc::encode_stream(
+                    &StreamDesc {
+                        object_name: st.object_name.clone(),
+                        clock_domain_index: 0,
+                        // CLASS_A only. NOT CLOCK_SYNC_SOURCE: that flag offers
+                        // this stream as a media-clock reference for the peer, and
+                        // our media clock is the Mac's, not disciplined to the
+                        // 16R's — advertising it would invite the 16R to slave to
+                        // a clock we do not control.
+                        stream_flags: stream_flags::CLASS_A,
+                        current_format: m.current_format,
+                        formats: m.formats.clone(),
+                        avb_interface_index: 0,
+                        buffer_length: 2_000_000,
+                    },
+                    false,
+                ))
+            }
+            // One port per stream, each owning that stream's own block of
+            // clusters and its own map — so cluster 9 belongs to stream 1 and
+            // a controller can tell which eight channels are which.
+            dt::STREAM_PORT_OUTPUT if usize::from(index) < m.streams.len() => {
+                Some(desc::encode_stream_port(
+                    &StreamPortDesc {
+                        clock_domain_index: 0,
+                        port_flags: 0,
+                        number_of_clusters: m.channels,
+                        base_cluster: index.saturating_mul(m.channels),
+                        number_of_maps: 1,
+                        base_map: index,
+                    },
+                    false,
+                ))
+            }
             dt::AUDIO_CLUSTER if index < m.cluster_count() => {
                 Some(desc::encode_audio_cluster(&AudioClusterDesc {
                     object_name: m
@@ -422,16 +489,22 @@ impl TalkerEntity {
                     format: 0x40,
                 }))
             }
-            dt::AUDIO_MAP if index == 0 => Some(desc::encode_audio_map(&AudioMapDesc {
-                mappings: (0..m.cluster_count())
-                    .map(|k| AudioMapping {
-                        stream_index: 0,
-                        stream_channel: k,
-                        cluster_offset: k,
-                        cluster_channel: 0,
-                    })
-                    .collect(),
-            })),
+            // The map for stream `index`: its eight stream channels onto its
+            // own eight clusters. `cluster_offset` is relative to the port's
+            // base_cluster, so each map is identical in shape and it is the
+            // port that places it in the 64-channel layout.
+            dt::AUDIO_MAP if usize::from(index) < m.streams.len() => {
+                Some(desc::encode_audio_map(&AudioMapDesc {
+                    mappings: (0..m.channels)
+                        .map(|k| AudioMapping {
+                            stream_index: index,
+                            stream_channel: k,
+                            cluster_offset: k,
+                            cluster_channel: 0,
+                        })
+                        .collect(),
+                }))
+            }
             dt::AVB_INTERFACE if index == 0 => {
                 Some(desc::encode_avb_interface(&AvbInterfaceDesc {
                     object_name: "I210".into(),
@@ -473,7 +546,10 @@ impl TalkerEntity {
 
     fn get_stream_format(&self, cmd: &AemPdu) -> (u8, Vec<u8>) {
         match (be_u16(&cmd.payload, 0), be_u16(&cmd.payload, 2)) {
-            (Some(dt::STREAM_OUTPUT), Some(0)) => {
+            // ANY stream we describe, not just index 0: a controller asks
+            // per stream before binding it, and refusing seven of eight stops
+            // the walk for those streams.
+            (Some(dt::STREAM_OUTPUT), Some(i)) if usize::from(i) < self.model.streams.len() => {
                 let mut p = cmd.payload.get(0..4).unwrap_or(&[0; 4]).to_vec();
                 p.extend_from_slice(&self.model.current_format.0.to_be_bytes());
                 (aecp_status::SUCCESS, p)
@@ -609,9 +685,21 @@ mod tests {
     /// 8 channels, 6 spf.
     const FMT: StreamFormat = StreamFormat(0x0205_0220_0200_6000);
 
+    /// The eight streams the 16R is wide, as the daemon builds them.
+    fn stream_ids(n: u16) -> Vec<StreamId> {
+        (0..n).map(|i| StreamId::from_parts(OUR_MAC, i)).collect()
+    }
+
     fn entity() -> TalkerEntity {
-        let sid = StreamId::from_parts(OUR_MAC, 0);
-        let m = talker_model(OUR_MAC, sid, FMT, "phase1b-test").expect("decodable format");
+        let m =
+            talker_model(OUR_MAC, &stream_ids(1), FMT, "phase1b-test").expect("decodable format");
+        TalkerEntity::new(m)
+    }
+
+    /// The full-width entity: eight streams, 64 channels.
+    fn wide_entity() -> TalkerEntity {
+        let m =
+            talker_model(OUR_MAC, &stream_ids(8), FMT, "phase1b-test").expect("decodable format");
         TalkerEntity::new(m)
     }
 
@@ -648,7 +736,7 @@ mod tests {
         // A different channel count must produce a different model id, or a
         // controller would serve a stale cached model.
         let other = StreamFormat(0x0205_0220_0100_6000); // 4 ch
-        let m2 = talker_model(OUR_MAC, m.stream_id, other, "x").unwrap();
+        let m2 = talker_model(OUR_MAC, &stream_ids(1), other, "x").unwrap();
         assert_ne!(m2.channels, m.channels);
         assert_ne!(m2.entity_model_id, m.entity_model_id);
     }
@@ -657,7 +745,10 @@ mod tests {
     fn talker_model_refuses_a_non_aaf_format() {
         // A CRF format has no AAF channel count; we must not invent one.
         let crf = StreamFormat(0x0410_6001_0000_BB80);
-        assert!(talker_model(OUR_MAC, StreamId(0), crf, "x").is_none());
+        assert!(talker_model(OUR_MAC, &stream_ids(1), crf, "x").is_none());
+        // And no streams at all is refused rather than producing an entity
+        // that describes nothing.
+        assert!(talker_model(OUR_MAC, &[], FMT, "x").is_none());
     }
 
     /// The whole point of this module: a controller walks ENTITY ->
@@ -666,7 +757,16 @@ mod tests {
     /// the 16R ended up listing no input device for us.
     #[test]
     fn every_advertised_descriptor_is_answerable() {
-        let e = entity();
+        for e in [entity(), wide_entity()] {
+            check_walk(&e);
+        }
+    }
+
+    /// The whole AEM walk against one entity, used for both the 1-stream and
+    /// the 8-stream configuration: advertising a count we cannot serve is
+    /// worse than advertising none, because the controller asks for it and
+    /// gets NO_SUCH_DESCRIPTOR mid-walk and gives up on the entity.
+    fn check_walk(e: &TalkerEntity) {
         // ENTITY and CONFIGURATION are the walk's roots and are not listed in
         // descriptor_counts, so check them explicitly.
         assert!(e.encode_descriptor(dt::ENTITY, 0).is_some());
@@ -1044,8 +1144,129 @@ mod tests {
     #[test]
     fn stream_id_is_our_mac_plus_a_unique_id() {
         let e = entity();
-        let sid = e.model().stream_id;
+        let sid = e.model().first_stream_id();
         assert_eq!(sid.mac(), OUR_MAC);
         assert_eq!(sid.unique_id(), 0);
+    }
+
+    /// The eight-stream entity must describe a 64-channel device: eight
+    /// STREAM_OUTPUTs, eight ports, eight maps and sixty-four clusters. These
+    /// are asserted as LITERALS, not as `model.cluster_count()`, so a change
+    /// to the arithmetic fails here instead of silently redefining the device.
+    #[test]
+    fn the_wide_entity_describes_sixty_four_channels() {
+        let e = wide_entity();
+        let m = e.model();
+        assert_eq!(m.stream_count(), 8);
+        assert_eq!(m.channels, 8);
+        assert_eq!(m.cluster_count(), 64);
+        assert_eq!(m.channel_names.len(), 64);
+
+        let counts = e.descriptor_counts();
+        let get = |t: u16| {
+            counts
+                .iter()
+                .copied()
+                .find(|&(ty, _)| ty == t)
+                .map(|(_, n)| n)
+        };
+        assert_eq!(get(dt::STREAM_OUTPUT), Some(8));
+        assert_eq!(get(dt::STREAM_PORT_OUTPUT), Some(8));
+        assert_eq!(get(dt::AUDIO_MAP), Some(8));
+        assert_eq!(get(dt::AUDIO_CLUSTER), Some(64));
+        assert_eq!(get(dt::AUDIO_UNIT), Some(1));
+
+        // ADP and the ENTITY descriptor must agree on the source count, or a
+        // controller treats the entity as misbehaving.
+        let d = desc::decode_entity(&e.encode_descriptor(dt::ENTITY, 0).unwrap()).unwrap();
+        assert_eq!(d.talker_stream_sources, 8);
+    }
+
+    /// Each port must own its OWN eight clusters, so cluster 9 belongs to
+    /// stream 1 and a controller can tell which eight channels are which. A
+    /// port that pointed at base_cluster 0 would map all eight streams onto
+    /// the same eight channels.
+    #[test]
+    fn each_stream_port_owns_its_own_cluster_block() {
+        let e = wide_entity();
+        let mut seen = Vec::new();
+        for i in 0..8u16 {
+            let raw = e
+                .encode_descriptor(dt::STREAM_PORT_OUTPUT, i)
+                .expect("port exists");
+            let p = desc::decode_stream_port(&raw).expect("decodes");
+            assert_eq!(p.number_of_clusters, 8, "port {i}");
+            assert_eq!(p.base_cluster, i * 8, "port {i}");
+            assert_eq!(p.number_of_maps, 1, "port {i}");
+            assert_eq!(p.base_map, i, "port {i}");
+            seen.push(p.base_cluster);
+        }
+        // Every block distinct and together covering 0..64.
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 8, 16, 24, 32, 40, 48, 56]);
+    }
+
+    /// Each stream's descriptor must carry ITS OWN stream id. All eight
+    /// sharing one id would have the 16R bind the same stream eight times.
+    #[test]
+    fn each_stream_output_carries_its_own_id() {
+        let e = wide_entity();
+        let ids: Vec<u64> = e.model().streams.iter().map(|s| s.stream_id.0).collect();
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 8, "stream ids must be distinct: {ids:#018x?}");
+        for (i, s) in e.model().streams.iter().enumerate() {
+            assert_eq!(s.stream_id.mac(), OUR_MAC);
+            assert_eq!(s.stream_id.unique_id(), i as u16);
+            // The name says which channels it carries.
+            assert!(
+                s.object_name
+                    .contains(&format!("{}-{}", i * 8 + 1, (i + 1) * 8)),
+                "stream {i} name {:?} should name its channel range",
+                s.object_name
+            );
+        }
+    }
+
+    /// GET_STREAM_FORMAT must answer for every stream we describe, not just
+    /// index 0 — a controller asks per stream before binding it.
+    #[test]
+    fn get_stream_format_answers_for_every_stream() {
+        let mut e = wide_entity();
+        for i in 0..8u16 {
+            let mut pl = Vec::new();
+            pl.extend_from_slice(&dt::STREAM_OUTPUT.to_be_bytes());
+            pl.extend_from_slice(&i.to_be_bytes());
+            let id = e.entity_id();
+            let r = e.handle_aecp(&cmd(aem_cmd::GET_STREAM_FORMAT, pl, id), OUR_MAC, 0);
+            assert_eq!(r.status, aecp_status::SUCCESS, "stream {i}");
+            let fmt = r
+                .payload
+                .get(4..12)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_be_bytes);
+            assert_eq!(fmt, Some(FMT.0), "stream {i}");
+        }
+        // One past the end is refused.
+        let mut pl = Vec::new();
+        pl.extend_from_slice(&dt::STREAM_OUTPUT.to_be_bytes());
+        pl.extend_from_slice(&8u16.to_be_bytes());
+        let id = e.entity_id();
+        assert_eq!(
+            e.handle_aecp(&cmd(aem_cmd::GET_STREAM_FORMAT, pl, id), OUR_MAC, 0)
+                .status,
+            aecp_status::NO_SUCH_DESCRIPTOR
+        );
+    }
+
+    /// A one-stream and an eight-stream entity must not share a model id: a
+    /// controller caches the model by it and would serve a stale 8-channel
+    /// model for a 64-channel device.
+    #[test]
+    fn the_stream_count_is_part_of_the_model_id() {
+        let narrow = talker_model(OUR_MAC, &stream_ids(1), FMT, "x").unwrap();
+        let wide = talker_model(OUR_MAC, &stream_ids(8), FMT, "x").unwrap();
+        assert_ne!(narrow.entity_model_id, wide.entity_model_id);
     }
 }
