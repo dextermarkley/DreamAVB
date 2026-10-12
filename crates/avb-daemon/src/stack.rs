@@ -2677,6 +2677,11 @@ fn talker_loop(
     let mut tx_rejected: u64 = 0;
     let mut last_send_err: Option<SendResult> = None;
     let mut underruns: u64 = 0;
+    // Peak |sample| we actually transmitted, and the tick counter that
+    // throttles the measurement. 0 after a run that transmitted PDUs means the
+    // protocol worked and the audio was silence.
+    let mut tx_peak: i64 = 0;
+    let mut tx_peak_tick: u64 = 0;
     let mut last_connect = now_mach();
     let mut last_advert = now_mach();
     // AEM commands we answered, and how many we had to refuse. A run where the
@@ -3252,6 +3257,25 @@ fn talker_loop(
             }
         }
 
+        // Outbound peak |sample|, so "transmitting audio" is distinguishable
+        // from "transmitting correctly-formed silence". Without it a complete
+        // protocol success (listener_ready, zero underruns, 8000 PDUs/s) reads
+        // as healthy while every sample is zero — the exact shape of the dead
+        // WriteMix path that survived five reviews. Sampled every 8th PDU
+        // (~1000/s) to keep the 50 us pacing loop clean; a peak does not need
+        // every frame.
+        tx_peak_tick = tx_peak_tick.wrapping_add(1);
+        if tx_peak_tick.is_multiple_of(8) {
+            if let Some(bytes) = sample_scratch.get(..got * frame_bytes) {
+                for s in bytes.as_chunks::<4>().0 {
+                    let a = i64::from(i32::from_ne_bytes(*s)).abs();
+                    if a > tx_peak {
+                        tx_peak = a;
+                    }
+                }
+            }
+        }
+
         // Presentation timestamp: gPTP now + offset, mod 2^32.
         //
         // This is the real disciplined clock, read from the gPTP service this
@@ -3330,8 +3354,9 @@ fn talker_loop(
         Level::Info,
         dir,
         &format!(
-            "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns over {}s; 16R listener_ready={listener_ready}; AEM commands answered={aecp_answered} refused={aecp_refused}; ACMP talker commands answered={acmp_talker_answered}; gPTP servo={} offset {:.0} ns, {ts_unavailable} ticks with no clock anchor, {ticks_unlocked} unlocked",
+            "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns over {}s; outbound peak {tx_peak} ({}); 16R listener_ready={listener_ready}; AEM commands answered={aecp_answered} refused={aecp_refused}; ACMP talker commands answered={acmp_talker_answered}; gPTP servo={} offset {:.0} ns, {ts_unavailable} ticks with no clock anchor, {ticks_unlocked} unlocked",
             run_ns / 1_000_000_000,
+            peak_label(tx_peak),
             final_gptp.servo_state.name(),
             final_gptp.offset_ns.last.unwrap_or(f64::NAN),
         ),
@@ -3876,6 +3901,21 @@ fn uid_label(uid: Option<u16>) -> String {
     }
 }
 
+/// A transmitted peak as dBFS against full-scale 32-bit, or the plain fact
+/// that it was digital silence.
+///
+/// Silence is NOT a transmit fault — nothing playing on the Mac is the normal
+/// idle state — but it must be stated, because a run that establishes the
+/// stream perfectly and sends all zeros otherwise reads as a success.
+fn peak_label(peak: i64) -> String {
+    if peak <= 0 {
+        return "digital silence — nothing is playing to the DreamAVB device".to_string();
+    }
+    let full = i64::from(i32::MAX) as f64;
+    let dbfs = 20.0 * (peak as f64 / full).log10();
+    format!("{dbfs:.1} dBFS")
+}
+
 /// Resolve which of the 16R's STREAM_OUTPUT sources our listener direction
 /// should bind, and its format, from the 16R's own AEM.
 ///
@@ -4241,6 +4281,35 @@ fn connect_rx_pdu(
 mod talker_tests {
     use super::*;
     use avb_core::{Eui64, MacAddr, StreamId};
+
+    /// A run can establish the stream perfectly and transmit all zeros, so the
+    /// summary must say which happened. These are the two readings the user
+    /// acts on differently: silence means "play something", a dBFS figure
+    /// means audio is really on the wire.
+    #[test]
+    fn peak_label_distinguishes_silence_from_signal() {
+        assert!(peak_label(0).contains("digital silence"));
+        assert!(peak_label(-1).contains("digital silence"));
+        // Full scale is 0 dBFS, half scale about -6 dB, and a quiet signal
+        // well below that — all reported as signal, never as silence.
+        assert!(peak_label(i64::from(i32::MAX)).starts_with("0.0 dBFS"));
+        assert!(peak_label(i64::from(i32::MAX) / 2).starts_with("-6.0 dBFS"));
+        for p in [1, 1_000, 1_000_000] {
+            let l = peak_label(p);
+            assert!(l.ends_with("dBFS"), "{p} -> {l}");
+            assert!(!l.contains("silence"), "{p} -> {l}");
+        }
+    }
+
+    /// `--listener-uid` omitted must read as derived, not as a silent default
+    /// of 0 — which is the 16R's CRF media-clock stream.
+    #[test]
+    fn uid_label_says_when_the_sink_is_derived() {
+        assert!(uid_label(None).contains("auto"));
+        assert!(!uid_label(None).contains('0'));
+        assert!(uid_label(Some(1)).starts_with('1'));
+        assert!(uid_label(Some(0)).contains("explicit"));
+    }
 
     /// The TSpec the 16R reserves against must describe the stream we actually
     /// send, and must match the frames' own VLAN priority — otherwise the
