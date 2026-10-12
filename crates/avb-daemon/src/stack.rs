@@ -2470,21 +2470,57 @@ fn talker_loop(
         (Vec::new(), Vec::new())
     };
 
+    // The outbound stream set.
+    //
+    // Shaped as a list because the device is eight streams wide in each
+    // direction, and the output ring's slot layout below is built from it — so
+    // the ring geometry is already the final one and adding the remaining
+    // talkers does not change what CoreAudio sees. Only the first is
+    // TRANSMITTED today: a second talker needs the AEM to advertise eight
+    // STREAM_OUTPUTs and sixty-four AUDIO_CLUSTERs, which `TalkerModel` is
+    // still single-stream for, and a Milan listener will not bind a stream the
+    // entity does not describe.
+    struct OutStream {
+        /// Our STREAM_OUTPUT unique id, which is also the ring slot index.
+        uid: u16,
+        stream_id: StreamId,
+        /// The 16R STREAM_INPUT sink this stream is bound to.
+        sink_uid: u16,
+    }
+    let out_streams: Vec<OutStream> = vec![OutStream {
+        uid: 0,
+        stream_id: our_stream_id,
+        sink_uid: listener_uid,
+    }];
+
     // Create the OUTPUT ring (daemon = consumer, plug-in = producer). We create
     // it so the file exists with world perms before the plug-in attaches, the
     // same ownership rule as the input ring.
+    // The output ring is the device's FULL width, like the input ring and for
+    // the same reason: the CoreAudio device's channel count is fixed when the
+    // device is published, so a ring of any other width is refused by the
+    // plug-in — silently, as no audio. Channels belonging to a stream we are
+    // not transmitting yet are produced by CoreAudio and simply not sent.
+    let out_total_ch = avb_audioring::DEVICE_CHANNELS as usize;
+    let out_slots = out_streams.len();
     let cfg = avb_audioring::RingConfig {
-        channels: channels as u32,
+        channels: out_total_ch as u32,
         valid_bits: u32::from(fmt.bit_depth),
         nominal_rate_hz: hz as u32,
         capacity_frames: 65_536,
-        streams: vec![avb_audioring::StreamSlot {
-            stream_id: our_stream_id.0,
-            first_channel: 0,
-            channels: channels as u32,
-            bit_depth: u32::from(fmt.bit_depth),
-        }],
-        channel_map: (0..channels).map(|c| (0u16, c as u16)).collect(),
+        streams: out_streams
+            .iter()
+            .enumerate()
+            .map(|(i, s)| avb_audioring::StreamSlot {
+                stream_id: s.stream_id.0,
+                first_channel: (i * channels) as u32,
+                channels: channels as u32,
+                bit_depth: u32::from(fmt.bit_depth),
+            })
+            .collect(),
+        channel_map: (0..out_total_ch)
+            .map(|k| ((k / channels.max(1)) as u16, (k % channels.max(1)) as u16))
+            .collect(),
     };
     let out_ring = match avb_audioring::ShmRing::create_at(avb_audioring::SHM_NAME_OUT, &cfg) {
         Ok(r) => r,
@@ -2501,14 +2537,29 @@ fn talker_loop(
         Level::Info,
         "play",
         &format!(
-            "output ring {} created: {} ch @ {} Hz, spf={}, stream 0x{:016x}",
+            "output ring {} created: {out_total_ch}-channel ring @ {} Hz, spf={}, {} of {} stream slot(s) transmitted (stream 0x{:016x} -> 16R sink {})",
             avb_audioring::SHM_NAME_OUT,
-            channels,
             hz,
             spf,
-            our_stream_id.0
+            out_slots,
+            avb_audioring::STREAMS_PER_DIRECTION,
+            our_stream_id.0,
+            listener_uid,
         ),
     );
+    if out_slots < avb_audioring::STREAMS_PER_DIRECTION as usize {
+        log.log(
+            Level::Warn,
+            "play",
+            &format!(
+                "output channels {}..{out_total_ch} are produced by CoreAudio and NOT transmitted: \
+                 only {out_slots} of {} talker stream(s) is built, so audio played to them goes \
+                 nowhere rather than to the 16R",
+                out_slots * channels + 1,
+                avb_audioring::STREAMS_PER_DIRECTION,
+            ),
+        );
+    }
 
     // The packetizer for our stream.
     let mut talker = AafTalker::new(our_stream_id, fmt).ok_or(Exit::DextFault)?;
@@ -2736,7 +2787,12 @@ fn talker_loop(
 
     let mut consumer = avb_audioring::Consumer::new(out_ring.ring());
     let frame_bytes = out_ring.ring().frame_bytes();
+    // One PDU's worth of FULL-WIDTH ring frames (64 channels), plus a
+    // per-stream buffer the packetizer gets: it wants one stream's channels
+    // interleaved, so each talker's eight are gathered out of the wide frame.
     let mut sample_scratch = vec![0u8; spf * frame_bytes];
+    let stream_frame_bytes = channels * 4;
+    let mut stream_scratch = vec![0u8; spf * stream_frame_bytes];
     let mut pdu_scratch = vec![0u8; talker.pdu_len()];
 
     let run_ns = seconds.saturating_mul(1_000_000_000);
@@ -3357,25 +3413,6 @@ fn talker_loop(
             }
         }
 
-        // Outbound peak |sample|, so "transmitting audio" is distinguishable
-        // from "transmitting correctly-formed silence". Without it a complete
-        // protocol success (listener_ready, zero underruns, 8000 PDUs/s) reads
-        // as healthy while every sample is zero — the exact shape of the dead
-        // WriteMix path that survived five reviews. Sampled every 8th PDU
-        // (~1000/s) to keep the 50 us pacing loop clean; a peak does not need
-        // every frame.
-        tx_peak_tick = tx_peak_tick.wrapping_add(1);
-        if tx_peak_tick.is_multiple_of(8) {
-            if let Some(bytes) = sample_scratch.get(..got * frame_bytes) {
-                for s in bytes.as_chunks::<4>().0 {
-                    let a = i64::from(i32::from_ne_bytes(*s)).abs();
-                    if a > tx_peak {
-                        tx_peak = a;
-                    }
-                }
-            }
-        }
-
         // Presentation timestamp: gPTP now + offset, mod 2^32.
         //
         // This is the real disciplined clock, read from the gPTP service this
@@ -3397,7 +3434,44 @@ fn talker_loop(
         };
         let avtp_ts = (gptp_now.wrapping_add(presentation_offset_ns) & 0xFFFF_FFFF) as u32;
 
-        match talker.packetize(&sample_scratch, avtp_ts, true, &mut pdu_scratch) {
+        // Gather this stream's channels out of the 64-channel ring frame.
+        //
+        // The ring is the device's full width and each stream owns a
+        // contiguous block of it, so the packetizer's input is a per-stream
+        // copy rather than the ring bytes directly. Allocation-free: both
+        // buffers are sized once above.
+        let first_ch = usize::from(out_streams.first().map_or(0, |o| o.uid)) * channels;
+        for f in 0..spf {
+            let src = f * frame_bytes + first_ch * 4;
+            let dst = f * stream_frame_bytes;
+            if let (Some(s_in), Some(s_out)) = (
+                sample_scratch.get(src..src + stream_frame_bytes),
+                stream_scratch.get_mut(dst..dst + stream_frame_bytes),
+            ) {
+                s_out.copy_from_slice(s_in);
+            }
+        }
+
+        // Outbound peak |sample|, so "transmitting audio" is distinguishable
+        // from "transmitting correctly-formed silence". Without it a complete
+        // protocol success (listener_ready, zero underruns, 8000 PDUs/s) reads
+        // as healthy while every sample is zero — the exact shape of the dead
+        // WriteMix path that survived five reviews. Sampled every 8th PDU
+        // (~1000/s) to keep the 50 us pacing loop clean; a peak does not need
+        // every frame.
+        tx_peak_tick = tx_peak_tick.wrapping_add(1);
+        if tx_peak_tick.is_multiple_of(8) {
+            if let Some(bytes) = stream_scratch.get(..got.min(spf) * stream_frame_bytes) {
+                for s in bytes.as_chunks::<4>().0 {
+                    let a = i64::from(i32::from_ne_bytes(*s)).abs();
+                    if a > tx_peak {
+                        tx_peak = a;
+                    }
+                }
+            }
+        }
+
+        match talker.packetize(&stream_scratch, avtp_ts, true, &mut pdu_scratch) {
             Ok(n) => {
                 let hdr = EthHeader {
                     dst: stream_dest_mac(our_stream_id),

@@ -135,6 +135,9 @@ pub struct ListenerRx {
     /// implausible jump, so the basis was left alone and the packet placed at
     /// the current leading edge.
     suspect_jumps: u64,
+    /// Packets belonging to a timestamp group EARLIER than the leading edge,
+    /// i.e. a stream running behind the others.
+    behind_groups: u64,
     /// Suspect jumps per slot, so a single misbehaving stream is identifiable
     /// instead of showing up only as a fraction of the total.
     suspect_per_slot: Vec<u64>,
@@ -196,6 +199,7 @@ impl ListenerRx {
             non_primary_streams: std::collections::BTreeSet::new(),
             untimed: 0,
             suspect_jumps: 0,
+            behind_groups: 0,
             suspect_per_slot: Vec::new(),
             dumped: 0,
             max_advance_frames: 0,
@@ -254,6 +258,11 @@ impl ListenerRx {
     /// jumped the shared basis implausibly far forward.
     pub fn assumed(&self) -> (u64, u64) {
         (self.untimed, self.suspect_jumps)
+    }
+
+    /// Packets whose timestamp group was behind the leading edge.
+    pub fn behind_groups(&self) -> u64 {
+        self.behind_groups
     }
 
     /// Suspect forward jumps per slot, in ring-channel order.
@@ -421,57 +430,79 @@ impl ListenerRx {
         // packets that looked like implausible forward jumps.
         let timed = pdu.hdr.stream.tv && ts != 0;
 
+        // Whether this packet closes a timestamp group, i.e. the next one
+        // belongs to a later instant and the frontier can move.
+        let mut commit_now = false;
         let frame: i128 = if timed {
+            // Group packets by presentation timestamp.
+            //
+            // Read off the wire: the 16R stamps ALL eight streams with the
+            // SAME value for a given sample instant (at seq 136 every slot
+            // carried ts 3529219834), and consecutive instants differ by one
+            // 125 us observation interval. So a timestamp is a GROUP id, and
+            // the ring frame advances by one packet's worth per new group —
+            // not by an arithmetic delta between streams, whose true value
+            // here is exactly zero.
+            //
+            // This is deliberately insensitive to a bad timestamp. An earlier
+            // delta-driven version let one implausible value drag the shared
+            // basis, which cost a zero-filled hole across all 64 channels and
+            // made every later packet read as hundreds of milliseconds
+            // "behind"; 15% of packets ended up on that path. Here the worst a
+            // bogus timestamp can do is open one new group early.
             match self.basis_ts {
                 None => {
-                    // First timestamped packet of the session fixes the
-                    // origin. It also seeds the media clock.
                     self.basis_ts = Some(ts);
                     self.basis_frame = 0;
+                    commit_now = true;
                     0
                 }
+                // Same group: this is another stream's eight channels for the
+                // instant already being written. Exactly the common case.
+                Some(basis_ts) if basis_ts == ts => i128::from(self.basis_frame),
                 Some(basis_ts) => {
                     let d = delta_frames(basis_ts, ts, self.frame_period_ns);
                     if d.abs() > self.max_abs_delta_frames {
                         self.max_abs_delta_frames = d.abs();
                     }
-                    let f = i128::from(self.basis_frame) + d;
-                    if d > self.max_advance_frames {
-                        // A forward jump this big is not a stream leading the
-                        // others, it is a timestamp we should not believe: one
-                        // bogus far-future value would drag the basis with it
-                        // permanently, leaving a zero-filled hole across all
-                        // 64 channels and making every later packet read as
-                        // hundreds of milliseconds "behind". The largest
-                        // offset observed on the live 16R grew run to run
-                        // (494 ms, then 1473 ms), which is that signature.
-                        //
-                        // Asymmetric on purpose: a large BACKWARD offset is a
-                        // genuinely lagging stream and `place` arbitrates it
-                        // as a late drop. Only the forward direction can move
-                        // the timeline, so only it needs guarding.
-                        self.suspect_jumps += 1;
-                        if let Some(c) = self.suspect_per_slot.get_mut(slot) {
-                            *c += 1;
-                        }
+                    if d > 0 {
+                        // A later group. Advance by the measured amount when
+                        // that is plausible, otherwise by exactly one packet:
+                        // a timestamp we do not believe must not move the
+                        // timeline further than a real interval does.
+                        let adv = if d <= self.max_advance_frames {
+                            d
+                        } else {
+                            self.suspect_jumps += 1;
+                            if let Some(c) = self.suspect_per_slot.get_mut(slot) {
+                                *c += 1;
+                            }
+                            self.spf as i128
+                        };
+                        self.basis_frame = self.basis_frame.saturating_add(adv.max(0) as u64);
+                        self.basis_ts = Some(ts);
+                        // A new group: the previous one is complete, so the
+                        // frontier may advance.
+                        commit_now = true;
                         i128::from(self.basis_frame)
                     } else {
-                        if d > 0 {
-                            // This packet is the new leading edge.
-                            self.basis_ts = Some(ts);
-                            self.basis_frame = f.max(0) as u64;
-                        }
-                        f
+                        // An earlier group: this stream is behind the leading
+                        // edge. Place it back by the measured amount and let
+                        // `place` arbitrate — below the committed frontier it
+                        // is a late drop, which is the honest outcome.
+                        self.behind_groups += 1;
+                        i128::from(self.basis_frame) + d
                     }
                 }
             }
         } else {
             // No usable timestamp. Continue this slot's OWN sequence from
-            // where its last packet landed, which is what keeps the stream
-            // continuous through a timestamp gap. Placing it at the shared
-            // leading edge instead would stack consecutive packets of the
-            // same stream on one frame.
+            // where its last packet landed, which keeps the stream continuous
+            // through a timestamp gap. Placing it at the shared leading edge
+            // instead would stack consecutive packets of one stream on a
+            // single frame.
             self.untimed += 1;
+            commit_now = true;
             let f = self
                 .next_frame
                 .get(slot)
@@ -505,12 +536,23 @@ impl ListenerRx {
             avb_audioring::SampleFormat::Int32
         };
         rp.producer().place(slot, frame, self.spf, fmt, pdu.data);
-        // The commit watermark is the MINIMUM over active slots, so the ring
+        // Commit ONCE PER TIMESTAMP GROUP, not per packet.
+        //
+        // The commit watermark is the minimum over active slots, so the ring
         // only advances once every bound stream has contributed — which is
         // what makes a 64-channel frame whole rather than part-filled. A slot
-        // that falls more than `lag_frames` behind is passed and its span
-        // logged as a gap, so one stalled stream cannot wedge the other seven.
-        rp.producer().commit(false, None);
+        // more than `lag_frames` behind is passed and its span logged as a
+        // gap, so one stalled stream cannot wedge the other seven.
+        //
+        // Committing per packet called this eight times per 125 us interval
+        // and each call re-logged the current lag of every lagging slot, which
+        // inflated GAP_FRAMES_TOTAL to 189 746 058 in a 30 s run — the same
+        // lag counted over and over rather than 8 times the audio. Committing
+        // when the group closes is both accurate and a eighth of the work,
+        // and costs at most one interval of publishing latency.
+        if commit_now {
+            rp.producer().commit(false, None);
+        }
         self.frames_placed += self.spf as u64;
         if let Some(c) = self.per_slot_frames.get_mut(slot) {
             *c += self.spf as u64;
@@ -556,9 +598,16 @@ impl ListenerRx {
         } else {
             u32::from(pdu.hdr.bit_depth)
         };
+        // The ring is ALWAYS the device's full width, however many streams are
+        // bound. The CoreAudio device's channel count is fixed when the device
+        // is published and cannot follow a ring created later, so a ring of
+        // any other width is refused by the plug-in — silently, as no audio.
+        // Channels belonging to an unbound stream are never written and read
+        // as silence, which is honest: the device has those channels, this
+        // session is just not carrying them.
+        let total_ch = avb_audioring::DEVICE_CHANNELS as usize;
         let cfg = avb_audioring::RingConfig {
-            // TOTAL ring width: every bound stream's channels side by side.
-            channels: (slots.len() * ch) as u32,
+            channels: total_ch as u32,
             valid_bits: depth,
             nominal_rate_hz: rate,
             capacity_frames: consts.capacity_frames as u32,
@@ -576,8 +625,11 @@ impl ListenerRx {
                     bit_depth: depth,
                 })
                 .collect(),
-            channel_map: (0..slots.len())
-                .flat_map(|i| (0..ch).map(move |c| (i as u16, c as u16)))
+            // The full width, by notional slot: channel k belongs to slot
+            // k / ch at that slot's channel k % ch, whether or not the slot is
+            // bound in this session.
+            channel_map: (0..total_ch)
+                .map(|k| ((k / ch.max(1)) as u16, (k % ch.max(1)) as u16))
                 .collect(),
         };
         let prod_streams: Vec<(usize, usize, u32)> = (0..slots.len())
@@ -613,12 +665,11 @@ impl ListenerRx {
                     Level::Info,
                     "ring",
                     &format!(
-                        "shm ring {} bound: {} stream(s) x {ch} ch = {} channels @ {rate} Hz, spf={spf}, cap={}; reference stream 0x{:016x}",
+                        "shm ring {} bound: {} of {} stream slot(s) x {ch} ch, {total_ch}-channel ring @ {rate} Hz, spf={spf}, cap={}",
                         avb_audioring::SHM_NAME,
                         slots.len(),
-                        slots.len() * ch,
+                        avb_audioring::STREAMS_PER_DIRECTION,
                         consts.capacity_frames,
-                        slots.first().copied().unwrap_or(sid),
                     ),
                 );
                 for (i, id) in slots.iter().enumerate() {
@@ -629,6 +680,16 @@ impl ListenerRx {
                             "  slot {i}: stream 0x{id:016x} -> ring channels {}..{}",
                             i * ch + 1,
                             (i + 1) * ch
+                        ),
+                    );
+                }
+                if slots.len() < avb_audioring::STREAMS_PER_DIRECTION as usize {
+                    log.log(
+                        Level::Info,
+                        "ring",
+                        &format!(
+                            "  ring channels {}..{total_ch} belong to unbound streams and read as silence",
+                            slots.len() * ch + 1
                         ),
                     );
                 }

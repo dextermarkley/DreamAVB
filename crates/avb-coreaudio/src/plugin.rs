@@ -26,7 +26,14 @@ use crate::abi::*;
 
 // Device identity + format (overridden later from the daemon control API,
 // 1b-2). Never hardcode these downstream — read them from here.
-const DEVICE_CHANNELS: u32 = 8;
+//
+// The channel width comes from `avb_audioring`, which is the ONE place it is
+// defined: a HAL device's channel count is fixed when the device is published
+// and cannot follow a ring created later, so the plug-in and the daemon have
+// to agree on it without negotiating. The attach checks below refuse a ring of
+// any other width rather than reading past its end — correct, but silent, so
+// the constant must not be able to drift between the two crates.
+const DEVICE_CHANNELS: u32 = avb_audioring::DEVICE_CHANNELS;
 const DEVICE_RATE: f64 = 48_000.0;
 const DEVICE_BITS: u32 = 32;
 const DEVICE_UID: &str = "com.avbaudio.16r.input";
@@ -34,7 +41,7 @@ const DEVICE_MODEL_UID: &str = "com.avbaudio.16r.model";
 /// User-visible device name. NOT "… (Input)" any more: the device carries an
 /// input AND an output stream (Phase 1b-2), and the old name made it look
 /// input-only in System Settings → Sound → Output, where it is a valid output
-/// device offering 8 channels. The stale name actively misled a hardware test
+/// device offering 64 channels. The stale name actively misled a hardware test
 /// session into reading "(Input)" as a scope rather than a label.
 ///
 /// `DEVICE_UID` deliberately keeps its `.input` suffix: macOS persists the
@@ -1244,5 +1251,26 @@ mod tests {
         // A real rate survives the round trip exactly.
         store_rate(&slot, Some(47_994.123));
         assert_eq!(load_rate(&slot), Some(47_994.123));
+    }
+
+    /// The device's width and the daemon's ring width MUST be the same number.
+    ///
+    /// A HAL device's channel count is fixed when the device is published, so
+    /// the two ends cannot negotiate: if they disagree the attach below
+    /// refuses the ring and the result is silence, not an error the user sees.
+    /// Asserted against the shared constant AND against the literal 64, so
+    /// changing either one alone fails here rather than on a hardware run.
+    #[test]
+    fn the_device_width_matches_the_rings_the_daemon_creates() {
+        assert_eq!(DEVICE_CHANNELS, avb_audioring::DEVICE_CHANNELS);
+        assert_eq!(DEVICE_CHANNELS, 64);
+        assert_eq!(avb_audioring::CHANNELS_PER_STREAM, 8);
+        assert_eq!(avb_audioring::STREAMS_PER_DIRECTION, 8);
+        // The ASBD the device publishes must describe that same width, or
+        // CoreAudio reads past the end of every frame we hand it.
+        let a = device_asbd(DEVICE_RATE);
+        assert_eq!(a.mChannelsPerFrame, DEVICE_CHANNELS);
+        assert_eq!(a.mBytesPerFrame, DEVICE_CHANNELS * 4);
+        assert_eq!(a.mBytesPerPacket, DEVICE_CHANNELS * 4);
     }
 }
