@@ -423,6 +423,30 @@ impl std::fmt::Display for TalkerFormatError {
 
 impl std::error::Error for TalkerFormatError {}
 
+/// The first STREAM descriptor whose current format is AAF audio we can
+/// packetize, as a `unique_id` to bind over ACMP.
+///
+/// A Milan device's stream list is NOT all audio. On the PreSonus 16R index 0
+/// is `Return CRF` / `Send CRF` — a Clock Reference Format stream carrying the
+/// media clock — and the audio sinks are 1..=8 (`Return 1-8` .. `Return
+/// 57-64`). So a `unique_id` default of 0 binds the media-clock stream: the
+/// reservation and the ACMP connect both succeed, and not one audio sample
+/// goes anywhere. That is indistinguishable from a transmit fault, which is
+/// why the default has to be derived rather than assumed.
+///
+/// Returns `None` when the device exposes no AAF stream in this direction, so
+/// the caller refuses rather than falling back to index 0.
+pub fn first_audio_stream(streams: &[StreamDesc]) -> Option<u16> {
+    streams.iter().enumerate().find_map(|(i, s)| {
+        let aaf = s.current_format.aaf()?;
+        // `ut` formats are maxima, not exact values; nothing to transmit.
+        if aaf.ut || !s.current_format.decodable() {
+            return None;
+        }
+        u16::try_from(i).ok()
+    })
+}
+
 /// Our talker output format, taken from the 16R STREAM_INPUT we are about to
 /// bind (`listener_uid`). This is the ONLY place the talker's rate, channel
 /// count and samples-per-frame come from.
@@ -804,5 +828,77 @@ mod tests {
             talker_output_format(&[out_stream("In 1", sink, 0)], None, 0).unwrap(),
             sink
         );
+    }
+
+    // --- Stream selection: the real 16R puts CRF at index 0 ----------------
+
+    /// The 16R's actual sink list: `Return CRF` at 0, `Return 1-8`..`Return
+    /// 57-64` at 1..=8. Formats are the ones decoded off the hardware.
+    fn sixteen_r_sinks() -> Vec<StreamDesc> {
+        let crf = StreamFormat(0x0410_6001_0000_bb80);
+        let audio = StreamFormat(0x0205_0220_0200_6000);
+        let mut v = vec![out_stream("Return CRF", crf, 3)];
+        for n in 0..8 {
+            v.push(out_stream(
+                &format!("Return {}-{}", n * 8 + 1, n * 8 + 8),
+                audio,
+                3,
+            ));
+        }
+        v
+    }
+
+    /// A `unique_id` default of 0 bound the media-clock stream, so the
+    /// reservation succeeded and no audio moved. The first AUDIO stream is 1.
+    #[test]
+    fn first_audio_stream_skips_the_crf_media_clock_at_index_0() {
+        let sinks = sixteen_r_sinks();
+        assert!(!sinks[0].current_format.is_aaf(), "index 0 must be the CRF");
+        assert_eq!(first_audio_stream(&sinks), Some(1));
+        assert_ne!(first_audio_stream(&sinks), Some(0));
+    }
+
+    /// Derivation against the auto-selected sink yields the 16R's real
+    /// configured format, and against the CRF sink refuses outright.
+    #[test]
+    fn deriving_from_the_selected_sink_matches_the_hardware_format() {
+        let sinks = sixteen_r_sinks();
+        let uid = first_audio_stream(&sinks).expect("an audio sink");
+        assert_eq!(
+            talker_output_format(&sinks, Some(48_000), uid).unwrap().0,
+            0x0205_0220_0200_6000
+        );
+        assert_eq!(
+            talker_output_format(&sinks, Some(48_000), 0),
+            Err(TalkerFormatError::NotAaf {
+                listener_uid: 0,
+                subtype: sinks[0].current_format.subtype_name(),
+            })
+        );
+    }
+
+    /// A device with no audio stream in this direction must yield nothing, so
+    /// the caller refuses instead of falling back to index 0.
+    #[test]
+    fn a_device_with_only_crf_streams_selects_nothing() {
+        let crf = StreamFormat(0x0410_6001_0000_bb80);
+        assert_eq!(
+            first_audio_stream(&[out_stream("Return CRF", crf, 3)]),
+            None
+        );
+        assert_eq!(first_audio_stream(&[]), None);
+    }
+
+    /// An `ut` ("up to") stream is not selectable: its channel count and spf
+    /// are maxima, so there is no exact format to transmit.
+    #[test]
+    fn an_up_to_stream_is_not_selectable() {
+        let upto = aaf_spf(5, 32, 8, 6, true);
+        let exact = aaf_spf(5, 32, 8, 6, false);
+        let streams = vec![
+            out_stream("In upto", upto, 3),
+            out_stream("In exact", exact, 3),
+        ];
+        assert_eq!(first_audio_stream(&streams), Some(1));
     }
 }

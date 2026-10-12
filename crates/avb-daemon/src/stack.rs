@@ -2252,7 +2252,7 @@ pub fn play(
     opts: &GlobalOpts,
     seconds: u64,
     listener: Option<u64>,
-    listener_uid: u16,
+    listener_uid: Option<u16>,
     _allow_partial: bool,
     _start_timeout: u64,
     _summary_out: Option<PathBuf>,
@@ -2263,7 +2263,10 @@ pub fn play(
     log.log(
         Level::Info,
         "play",
-        &format!("play {seconds}s OUT to 16R (listener_uid={listener_uid})"),
+        &format!(
+            "play {seconds}s OUT to 16R (sink {})",
+            uid_label(listener_uid)
+        ),
     );
     talker_loop(
         opts,
@@ -2291,7 +2294,7 @@ pub fn duplex(
     opts: &GlobalOpts,
     seconds: u64,
     listener: Option<u64>,
-    listener_uid: u16,
+    listener_uid: Option<u16>,
     _start_timeout: u64,
     _summary_out: Option<PathBuf>,
 ) -> Result<(), Exit> {
@@ -2302,9 +2305,15 @@ pub fn duplex(
         Level::Info,
         "duplex",
         &if seconds == 0 {
-            format!("duplex IN+OUT with the 16R until SIGINT (listener_uid={listener_uid})")
+            format!(
+                "duplex IN+OUT with the 16R until SIGINT (sink {})",
+                uid_label(listener_uid)
+            )
         } else {
-            format!("duplex {seconds}s IN+OUT with the 16R (listener_uid={listener_uid})")
+            format!(
+                "duplex {seconds}s IN+OUT with the 16R (sink {})",
+                uid_label(listener_uid)
+            )
         },
     );
     talker_loop(opts, &log, &mut dext, seconds, listener, listener_uid, true)
@@ -2330,7 +2339,7 @@ fn talker_loop(
     dext: &mut RealDext,
     seconds: u64,
     listener: Option<u64>,
-    listener_uid: u16,
+    listener_uid: Option<u16>,
     duplex: bool,
 ) -> Result<(), Exit> {
     use avb_avtp::stream_format::AafFormat;
@@ -2370,11 +2379,30 @@ fn talker_loop(
         target: listener_id,
         target_mac: listener_mac,
     };
-    let stream_format = derive_talker_format(log, dext, peers, listener_uid, listener_timeout_ns)?;
+    let (stream_format, listener_uid) =
+        derive_talker_format(log, dext, peers, listener_uid, listener_timeout_ns)?;
     let fmt: AafFormat = stream_format.aaf().ok_or(Exit::DextFault)?;
     let hz = fmt.nsr_hz().ok_or(Exit::DextFault)? as u64;
     let spf = usize::from(fmt.spf);
     let channels = usize::from(fmt.channels);
+
+    // Which of the 16R's STREAM_OUTPUT sources we listen to, for duplex. Read
+    // from its AEM for the same reason as the sink: index 0 is `Send CRF`, its
+    // media-clock source, so a hardcoded 0 asked for a stream with no audio.
+    let inbound_uid = if duplex {
+        let (in_fmt, in_uid) = derive_inbound_source(log, dext, peers, None, listener_timeout_ns)?;
+        log.log(
+            Level::Info,
+            "duplex",
+            &format!(
+                "inbound from 16R STREAM_OUTPUT {in_uid}, format 0x{:016x}",
+                in_fmt.0
+            ),
+        );
+        in_uid
+    } else {
+        0
+    };
 
     // Create the OUTPUT ring (daemon = consumer, plug-in = producer). We create
     // it so the file exists with world perms before the plug-in attaches, the
@@ -2655,6 +2683,10 @@ fn talker_loop(
     // 16R never asks us anything is a different failure from one where it asks
     // and we answer NOT_IMPLEMENTED, and the summary must tell them apart.
     let mut aecp_answered: u64 = 0;
+    // ACMP commands we answered AS THE TALKER. Zero while the 16R is
+    // connecting means it never asked us to connect, which is a different
+    // fault from asking and being refused.
+    let mut acmp_talker_answered: u64 = 0;
     let mut aecp_refused: u64 = 0;
     // Ticks skipped because gPTP had no valid clock anchor (startup, or just
     // after a servo step). Counted, not silently papered over.
@@ -2729,6 +2761,62 @@ fn talker_loop(
                 gptp.handle_rx(now_mach(), &slot);
                 continue;
             }
+            // ---- ACMP: answer the listener binding our stream -------------
+            //
+            // Our CONNECT_RX_COMMAND tells the 16R to connect; the 16R then
+            // sends US a CONNECT_TX_COMMAND as the talker, and only after our
+            // CONNECT_TX_RESPONSE does it declare MSRP Listener Ready. This
+            // branch did not exist, so the 16R waited on a response that never
+            // came: `listener_ready` stayed false and every PDU we transmitted
+            // was discarded — which on the wire looks exactly like a transmit
+            // fault.
+            if p.hdr.ethertype == avb_avtp::common::ETHERTYPE_AVTP
+                && p.payload.first().copied() == Some(avb_avdecc::constants::subtype::ACMP)
+            {
+                let Some(acmp) = avb_avdecc::Acmpdu::decode(p.payload) else {
+                    continue;
+                };
+                if let Some(resp) = avb_avdecc::talker_response(
+                    &acmp,
+                    avb_avdecc::TalkerStream {
+                        our_id,
+                        our_unique_id: 0,
+                        stream_id: our_stream_id,
+                        stream_dest_mac: stream_dst,
+                        stream_vlan_id: DEFAULT_DOMAIN.vid,
+                        connection_count: 1,
+                    },
+                ) {
+                    let hdr = EthHeader {
+                        dst: avb_core::AVDECC_MULTICAST,
+                        src: our_mac,
+                        vlan: None,
+                        ethertype: avb_avtp::common::ETHERTYPE_AVTP,
+                    };
+                    if let Ok(f) = TxFrame::build(&hdr, &resp.encode(), false, 0) {
+                        let _ = dext.send(f.bytes(), false, 0);
+                    }
+                    acmp_talker_answered += 1;
+                    log.log(
+                        Level::Info,
+                        "acmp",
+                        &format!(
+                            "answered {} from the 16R: type 0x{:02x} -> 0x{:02x} status {}",
+                            if acmp.message_type
+                                == avb_avdecc::constants::acmp_msg::CONNECT_TX_COMMAND
+                            {
+                                "CONNECT_TX_COMMAND"
+                            } else {
+                                "talker command"
+                            },
+                            acmp.message_type,
+                            resp.message_type,
+                            resp.status
+                        ),
+                    );
+                }
+                continue;
+            }
             // ---- AECP: answer the 16R's AEM walk --------------------------
             //
             // This is what lets the 16R enumerate us. Byte 0 of an IEEE 1722
@@ -2754,6 +2842,43 @@ fn talker_loop(
                 aecp_answered += 1;
                 if resp.status != avb_avdecc::constants::aecp_status::SUCCESS {
                     aecp_refused += 1;
+                    // Name WHAT we refused, at warn level. A refusal here is
+                    // the 16R asking for part of our model we do not return,
+                    // and a Milan listener that cannot finish enumerating a
+                    // talker will not bind its stream — so this is the first
+                    // thing to read when `listener_ready` stays false. For a
+                    // READ_DESCRIPTOR the payload is
+                    // configuration_index(2) reserved(2) type(2) index(2).
+                    let what =
+                        if cmd.command_type == avb_avdecc::constants::aem_cmd::READ_DESCRIPTOR {
+                            let dt = cmd
+                                .payload
+                                .get(4..6)
+                                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                                .map(u16::from_be_bytes);
+                            let di = cmd
+                                .payload
+                                .get(6..8)
+                                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                                .map(u16::from_be_bytes);
+                            match (dt, di) {
+                                (Some(t), Some(i)) => {
+                                    format!("READ_DESCRIPTOR type=0x{t:04x} index={i}")
+                                }
+                                _ => "READ_DESCRIPTOR (unparseable payload)".to_string(),
+                            }
+                        } else {
+                            format!("command 0x{:04x}", cmd.command_type)
+                        };
+                    log.log(
+                        Level::Warn,
+                        "aem",
+                        &format!(
+                            "refused the 16R's {what} with status {} — it cannot finish \
+                             enumerating us",
+                            resp.status
+                        ),
+                    );
                 }
                 log.log(
                     Level::Debug,
@@ -2948,7 +3073,7 @@ fn talker_loop(
                     controller_entity_id: our_id,
                     talker_entity_id: listener_id,
                     listener_entity_id: our_id,
-                    talker_unique_id: 0,
+                    talker_unique_id: inbound_uid,
                     listener_unique_id: 0,
                     sequence_id: in_connect_seq,
                     ..Default::default()
@@ -3205,7 +3330,7 @@ fn talker_loop(
         Level::Info,
         dir,
         &format!(
-            "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns over {}s; 16R listener_ready={listener_ready}; AEM commands answered={aecp_answered} refused={aecp_refused}; gPTP servo={} offset {:.0} ns, {ts_unavailable} ticks with no clock anchor, {ticks_unlocked} unlocked",
+            "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns over {}s; 16R listener_ready={listener_ready}; AEM commands answered={aecp_answered} refused={aecp_refused}; ACMP talker commands answered={acmp_talker_answered}; gPTP servo={} offset {:.0} ns, {ts_unavailable} ticks with no clock anchor, {ticks_unlocked} unlocked",
             run_ns / 1_000_000_000,
             final_gptp.servo_state.name(),
             final_gptp.offset_ns.last.unwrap_or(f64::NAN),
@@ -3278,6 +3403,29 @@ fn talker_loop(
             "msrp",
             "16R never declared Listener Ready — it did not accept the stream, so no audio reached it",
         );
+        // Distinguish the two reasons, which need different fixes. A Milan
+        // listener only declares Ready after the TALKER answers its
+        // CONNECT_TX_COMMAND; if it never sent us one, the problem is upstream
+        // of the reservation (it was never told to connect, or it could not
+        // finish enumerating us).
+        if acmp_talker_answered == 0 {
+            log.log(
+                Level::Warn,
+                "acmp",
+                "the 16R never sent us a CONNECT_TX_COMMAND either, so it was never asked to \
+                 connect or could not enumerate us — not a reservation problem",
+            );
+        } else {
+            log.log(
+                Level::Warn,
+                "acmp",
+                &format!(
+                    "we answered {acmp_talker_answered} ACMP talker command(s), so the 16R did \
+                     ask to connect and then still withheld Listener Ready — check the TSpec and \
+                     the stream addressing against its own advertise"
+                ),
+            );
+        }
     }
     Ok(())
 }
@@ -3551,6 +3699,12 @@ fn read_descriptors(
 /// [`avb_avdecc::talker_output_format`] then picks the sink we are about to
 /// bind.
 ///
+/// `listener_uid` of `None` means "choose the sink", which is the default:
+/// index 0 on the 16R is `Return CRF`, its media-clock stream, so a fixed
+/// default of 0 reserved and connected a stream that carries no audio.
+/// Returns the format AND the sink actually chosen, so the ACMP connect binds
+/// the same sink the format came from.
+///
 /// Any failure is a refusal to transmit, never a fallback to a default. A
 /// format that does not match the sink makes the 16R discard every packet,
 /// which on the wire is indistinguishable from a transmit fault.
@@ -3558,9 +3712,9 @@ fn derive_talker_format(
     log: &Logger,
     dext: &mut RealDext,
     peers: AecpPeers,
-    listener_uid: u16,
+    listener_uid: Option<u16>,
     timeout_ns: u64,
-) -> Result<avb_avtp::stream_format::StreamFormat, Exit> {
+) -> Result<(avb_avtp::stream_format::StreamFormat, u16), Exit> {
     use avb_avdecc::aem::desc::{decode_audio_unit, decode_stream};
     use avb_avdecc::constants::desc as aem_desc;
 
@@ -3634,14 +3788,61 @@ fn derive_talker_format(
         ),
     );
 
-    match avb_avdecc::talker_output_format(&sinks, audio_unit_hz, listener_uid) {
+    // Choose the sink unless one was named. The 16R's index 0 is `Return CRF`
+    // — a Clock Reference Format stream — and its audio sinks are 1..=8, so a
+    // fixed default of 0 bound the media clock: reservation and ACMP both
+    // succeeded and no audio went anywhere.
+    let uid = match listener_uid {
+        Some(u) => u,
+        None => match avb_avdecc::first_audio_stream(&sinks) {
+            Some(u) => {
+                let name = sinks
+                    .get(usize::from(u))
+                    .map(|s| s.object_name.clone())
+                    .unwrap_or_default();
+                log.log(
+                    Level::Info,
+                    "aecp",
+                    &format!(
+                        "selected 16R STREAM_INPUT {u} ({name}) as our audio sink; \
+                         pass --listener-uid to override"
+                    ),
+                );
+                u
+            }
+            None => {
+                log.log(
+                    Level::Error,
+                    "aecp",
+                    &format!(
+                        "none of the 16R's {} STREAM_INPUT sinks is an AAF audio sink we can \
+                         packetize (they are: {}); nothing to play to",
+                        sinks.len(),
+                        sinks
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| format!(
+                                "{i}={} {}",
+                                s.object_name,
+                                s.current_format.subtype_name()
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                return Err(Exit::TalkerNotFound);
+            }
+        },
+    };
+
+    match avb_avdecc::talker_output_format(&sinks, audio_unit_hz, uid) {
         Ok(fmt) => {
             let a = fmt.aaf();
             log.log(
                 Level::Info,
                 "aecp",
                 &format!(
-                    "output format derived from 16R STREAM_INPUT {listener_uid}: 0x{:016x} ({})",
+                    "output format derived from 16R STREAM_INPUT {uid}: 0x{:016x} ({})",
                     fmt.0,
                     a.map(|a| format!(
                         "{} Hz, {} ch, {} spf, {}-bit",
@@ -3653,7 +3854,7 @@ fn derive_talker_format(
                     .unwrap_or_else(|| "not AAF".into())
                 ),
             );
-            Ok(fmt)
+            Ok((fmt, uid))
         }
         Err(e) => {
             log.log(
@@ -3664,6 +3865,155 @@ fn derive_talker_format(
             Err(Exit::TalkerNotFound)
         }
     }
+}
+
+/// How a `--listener-uid` choice reads in a log line: an explicit sink index,
+/// or that we will choose one from the 16R's AEM.
+fn uid_label(uid: Option<u16>) -> String {
+    match uid {
+        Some(u) => format!("{u} (explicit)"),
+        None => "auto from the 16R's AEM".to_string(),
+    }
+}
+
+/// Resolve which of the 16R's STREAM_OUTPUT sources our listener direction
+/// should bind, and its format, from the 16R's own AEM.
+///
+/// The mirror of [`derive_talker_format`] for the inbound direction. Index 0 is
+/// `Send CRF` — the 16R's media-clock source — so the inbound ACMP connect
+/// previously asked for a stream that carries no audio. Returns the source's
+/// `unique_id` and its current format.
+fn derive_inbound_source(
+    log: &Logger,
+    dext: &mut RealDext,
+    peers: AecpPeers,
+    talker_uid: Option<u16>,
+    timeout_ns: u64,
+) -> Result<(avb_avtp::stream_format::StreamFormat, u16), Exit> {
+    use avb_avdecc::aem::desc::decode_stream;
+    use avb_avdecc::constants::desc as aem_desc;
+
+    let base = read_descriptors(
+        log,
+        dext,
+        peers,
+        &[(aem_desc::CONFIGURATION, 0)],
+        timeout_ns,
+    )?;
+    let Some(config) = base.get(&(aem_desc::CONFIGURATION, 0)) else {
+        log.log(
+            Level::Error,
+            "aecp",
+            "the 16R did not return its CONFIGURATION descriptor, so its STREAM_OUTPUT count is unknown and the inbound source cannot be chosen",
+        );
+        return Err(Exit::TalkerNotFound);
+    };
+    let source_count = config_descriptor_counts(config)
+        .into_iter()
+        .find(|(dt, _)| *dt == aem_desc::STREAM_OUTPUT)
+        .map(|(_, n)| n)
+        .unwrap_or(0);
+    if source_count == 0 {
+        log.log(
+            Level::Error,
+            "aecp",
+            "the 16R's CONFIGURATION lists no STREAM_OUTPUT descriptors, so it has nothing to send us",
+        );
+        return Err(Exit::TalkerNotFound);
+    }
+
+    let want: Vec<(u16, u16)> = (0..source_count)
+        .map(|i| (aem_desc::STREAM_OUTPUT, i))
+        .collect();
+    let raw = read_descriptors(log, dext, peers, &want, timeout_ns)?;
+    let mut sources = Vec::with_capacity(usize::from(source_count));
+    for i in 0..source_count {
+        match raw
+            .get(&(aem_desc::STREAM_OUTPUT, i))
+            .and_then(|b| decode_stream(b))
+        {
+            Some(s) => sources.push(s),
+            None => break,
+        }
+    }
+    log.log(
+        Level::Info,
+        "aecp",
+        &format!(
+            "16R AEM: {} of {} STREAM_OUTPUT sources read",
+            sources.len(),
+            source_count
+        ),
+    );
+
+    let uid = match talker_uid {
+        Some(u) => u,
+        None => match avb_avdecc::first_audio_stream(&sources) {
+            Some(u) => u,
+            None => {
+                log.log(
+                    Level::Error,
+                    "aecp",
+                    &format!(
+                        "none of the 16R's {} STREAM_OUTPUT sources is an AAF audio source we can \
+                         depacketize (they are: {}); nothing to record from",
+                        sources.len(),
+                        sources
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| format!(
+                                "{i}={} {}",
+                                s.object_name,
+                                s.current_format.subtype_name()
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                return Err(Exit::TalkerNotFound);
+            }
+        },
+    };
+    let Some(src) = sources.get(usize::from(uid)) else {
+        log.log(
+            Level::Error,
+            "aecp",
+            &format!(
+                "the 16R has no STREAM_OUTPUT {uid} (it exposes {}); pass --talker-uid below that",
+                sources.len()
+            ),
+        );
+        return Err(Exit::TalkerNotFound);
+    };
+    let fmt = src.current_format;
+    let Some(a) = fmt.aaf().filter(|a| !a.ut) else {
+        log.log(
+            Level::Error,
+            "aecp",
+            &format!(
+                "16R STREAM_OUTPUT {uid} ({}) is configured for {}, not an exact AAF format; \
+                 this build only depacketizes AAF",
+                src.object_name,
+                fmt.subtype_name()
+            ),
+        );
+        return Err(Exit::TalkerNotFound);
+    };
+    log.log(
+        Level::Info,
+        "aecp",
+        &format!(
+            "selected 16R STREAM_OUTPUT {uid} ({}) as our audio source: 0x{:016x} ({} Hz, {} ch, \
+             {} spf, {}-bit); pass --talker-uid to override",
+            src.object_name,
+            fmt.0,
+            a.nsr_hz().unwrap_or(0),
+            a.channels,
+            a.spf,
+            a.bit_depth
+        ),
+    );
+    Ok((fmt, uid))
 }
 
 /// Resolve the 16R's entity id AND MAC — the LISTENER for the playback

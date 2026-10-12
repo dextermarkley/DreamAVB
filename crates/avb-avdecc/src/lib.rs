@@ -29,11 +29,12 @@ pub mod entity;
 pub mod milan;
 pub(crate) mod wire;
 
-pub use acmp::{Acmpdu, A5_RESOURCE_STATUSES};
+pub use acmp::{talker_response, Acmpdu, TalkerStream, A5_RESOURCE_STATUSES};
 pub use adp::{Adpdu, EntityTable};
 pub use aecp::{AecpEngine, AemPdu, MvuPdu};
 pub use controller::{BindOutcome, BindTarget, Binder};
 pub use derive::{
-    listener_model, talker_output_format, DeriveError, ListenerModel, TalkerFormatError,
+    first_audio_stream, listener_model, talker_output_format, DeriveError, ListenerModel,
+    TalkerFormatError,
 };
 pub use entity::{ListenerEntity, ListenerSm};

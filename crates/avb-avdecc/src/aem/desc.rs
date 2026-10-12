@@ -18,6 +18,36 @@ use crate::wire::{Rd, Wr};
 /// Fixed name-field length in an AEM descriptor (§7.2.1).
 pub const NAME_LEN: usize = 64;
 
+// ---- Hardware-anchored array offsets (§7.2) --------------------------------
+//
+// Every one of these is transcribed from a descriptor READ OFF A REAL PreSonus
+// StudioLive 16R (see the `hw_16r` tests at the bottom of this file), not
+// derived from our own encoder. They are absolute byte offsets from the first
+// byte of the descriptor, which is how §7.2 defines every `*_offset` field.
+
+/// `CONFIGURATION.descriptor_counts_offset` — the array follows the fixed part.
+const CONFIGURATION_COUNTS_OFFSET: u16 = 74;
+
+/// `AUDIO_UNIT.sampling_rates_offset`.
+const AUDIO_UNIT_RATES_OFFSET: u16 = 144;
+
+/// `STREAM_INPUT`/`STREAM_OUTPUT.formats_offset`.
+const STREAM_FORMATS_OFFSET: u16 = 132;
+
+/// Bytes of port/count pairs between `base_stream_output_port` and
+/// `current_sampling_rate` in an AUDIO_UNIT: 14 `(number_of_*, base_*)` pairs
+/// (external in/out, internal in/out, controls, signal selectors, mixers,
+/// matrices, splitters, combiners, demultiplexers, multiplexers, transcoders,
+/// control blocks). Omitting these read the rate from byte 80 instead of 136,
+/// which on the 16R is a run of zeros — so a healthy 48 kHz unit decoded as
+/// "0 Hz" and the rate cross-check refused every real stream.
+const AUDIO_UNIT_PORT_PAIRS_BYTES: usize = 56;
+
+/// Bytes of backup/backed-up talker fields between `number_of_formats` and
+/// `avb_interface_index` in a STREAM descriptor: three `(entity_id, unique_id)`
+/// backup pairs plus one backed-up pair, 10 bytes each.
+const STREAM_BACKUP_FIELDS_BYTES: usize = 40;
+
 fn read_name(r: &mut Rd) -> Option<String> {
     let b = r.take(NAME_LEN)?;
     let end = b.iter().position(|&c| c == 0).unwrap_or(NAME_LEN);
@@ -43,6 +73,88 @@ fn decode_sampling_rate(raw: u32) -> u32 {
 
 fn encode_sampling_rate(hz: u32) -> u32 {
     hz & 0x1FFF_FFFF
+}
+
+/// Read `count` big-endian `u64`s starting at `offset` bytes from the START of
+/// `pdu`, which is how §7.2 locates every variable-length descriptor array.
+///
+/// Descriptor offsets are absolute from the descriptor's first byte, NOT
+/// relative to the field that holds them, and the array does NOT always begin
+/// immediately after the fixed part. Reading these sequentially is the bug
+/// class that made the 16R's `formats` list decode as all-zeros while every
+/// round-trip unit test passed: our encoder wrote the array immediately after
+/// the count, so encode and decode agreed with each other and not with the
+/// hardware.
+fn read_u64s_at(pdu: &[u8], offset: usize, count: usize) -> Vec<u64> {
+    let mut out = Vec::new();
+    for i in 0..count {
+        let start = match offset.checked_add(i.saturating_mul(8)) {
+            Some(s) => s,
+            None => break,
+        };
+        let Some(end) = start.checked_add(8) else {
+            break;
+        };
+        let Some(bytes) = pdu.get(start..end) else {
+            break;
+        };
+        match <[u8; 8]>::try_from(bytes) {
+            Ok(a) => out.push(u64::from_be_bytes(a)),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// Same as [`read_u64s_at`] for the `u32` arrays (`sampling_rates`).
+fn read_u32s_at(pdu: &[u8], offset: usize, count: usize) -> Vec<u32> {
+    let mut out = Vec::new();
+    for i in 0..count {
+        let start = match offset.checked_add(i.saturating_mul(4)) {
+            Some(s) => s,
+            None => break,
+        };
+        let Some(end) = start.checked_add(4) else {
+            break;
+        };
+        let Some(bytes) = pdu.get(start..end) else {
+            break;
+        };
+        match <[u8; 4]>::try_from(bytes) {
+            Ok(a) => out.push(u32::from_be_bytes(a)),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// Same as [`read_u64s_at`] for the `(u16, u16)` pair arrays
+/// (`CONFIGURATION.descriptor_counts`).
+fn read_u16_pairs_at(pdu: &[u8], offset: usize, count: usize) -> Vec<(u16, u16)> {
+    let mut out = Vec::new();
+    for i in 0..count {
+        let start = match offset.checked_add(i.saturating_mul(4)) {
+            Some(s) => s,
+            None => break,
+        };
+        let Some(end) = start.checked_add(4) else {
+            break;
+        };
+        let Some(bytes) = pdu.get(start..end) else {
+            break;
+        };
+        let Ok(a) = <[u8; 4]>::try_from(bytes) else {
+            break;
+        };
+        let Some(hi) = a.get(..2).and_then(|s| <[u8; 2]>::try_from(s).ok()) else {
+            break;
+        };
+        let Some(lo) = a.get(2..).and_then(|s| <[u8; 2]>::try_from(s).ok()) else {
+            break;
+        };
+        out.push((u16::from_be_bytes(hi), u16::from_be_bytes(lo)));
+    }
+    out
 }
 
 // ---- ENTITY ----
@@ -121,8 +233,11 @@ pub fn encode_configuration(d: &ConfigurationDesc) -> Vec<u8> {
     w.u16(0); // localized_description
     let counts = d.descriptor_counts.len().min(MAX_DESCRIPTORS_PER_TYPE) as u16;
     w.u16(counts);
-    // descriptor_counts_offset = 2 (counts_count) + 2 (offset) from here = 4.
-    w.u16(4);
+    // descriptor_counts_offset is ABSOLUTE from the descriptor's first byte
+    // (§7.2.2). The array starts right after this field, at byte 74 — which is
+    // exactly what the 16R writes. Writing a relative 4 here made our own
+    // descriptors unreadable by any spec-conformant controller.
+    w.u16(CONFIGURATION_COUNTS_OFFSET);
     for &(ty, n) in d.descriptor_counts.iter().take(counts as usize) {
         w.u16(ty);
         w.u16(n);
@@ -136,13 +251,12 @@ pub fn decode_configuration(pdu: &[u8]) -> Option<ConfigurationDesc> {
     let object_name = read_name(&mut r)?;
     r.skip(2)?; // localized_description
     let counts_count = r.u16()?;
-    r.skip(2)?; // descriptor_counts_offset (we read inline)
-    let mut descriptor_counts = Vec::new();
-    for _ in 0..counts_count.min(MAX_DESCRIPTORS_PER_TYPE as u16) {
-        let ty = r.u16()?;
-        let n = r.u16()?;
-        descriptor_counts.push((ty, n));
-    }
+    let counts_offset = r.u16()?;
+    let descriptor_counts = read_u16_pairs_at(
+        pdu,
+        usize::from(counts_offset),
+        usize::from(counts_count).min(MAX_DESCRIPTORS_PER_TYPE),
+    );
     Some(ConfigurationDesc {
         object_name,
         descriptor_counts,
@@ -162,11 +276,18 @@ pub fn encode_audio_unit(d: &AudioUnitDesc) -> Vec<u8> {
     w.u16(0); // base_stream_input_port
     w.u16(d.number_of_stream_output_ports);
     w.u16(0); // base_stream_output_port
-              // ... other port counts omitted (0); then current/rates.
+              // The 14 remaining (number_of_*, base_*) port/count pairs. We
+              // expose none of these objects, so they are all zero — but they
+              // must be PRESENT, or current_sampling_rate lands 56 bytes early
+              // and no conformant controller can read our rate.
+    for _ in 0..AUDIO_UNIT_PORT_PAIRS_BYTES {
+        w.u8(0);
+    }
     w.u32(encode_sampling_rate(d.current_sampling_rate));
     let n = d.sampling_rates.len().min(MAX_SAMPLING_RATES) as u16;
+    // Offset BEFORE count, and absolute from the descriptor start (§7.2.4).
+    w.u16(AUDIO_UNIT_RATES_OFFSET);
     w.u16(n);
-    w.u16(0); // sampling_rates_offset placeholder
     for &hz in d.sampling_rates.iter().take(n as usize) {
         w.u32(encode_sampling_rate(hz));
     }
@@ -183,13 +304,20 @@ pub fn decode_audio_unit(pdu: &[u8]) -> Option<AudioUnitDesc> {
     r.skip(2)?; // base_stream_input_port
     let number_of_stream_output_ports = r.u16()?;
     r.skip(2)?; // base_stream_output_port
+    r.skip(AUDIO_UNIT_PORT_PAIRS_BYTES)?; // the 14 other port/count pairs
     let current_sampling_rate = decode_sampling_rate(r.u32()?);
+    let rates_offset = r.u16()?;
     let n = r.u16()?;
-    r.skip(2)?; // sampling_rates_offset
-    let mut sampling_rates = Vec::new();
-    for _ in 0..n.min(MAX_SAMPLING_RATES as u16) {
-        sampling_rates.push(decode_sampling_rate(r.u32()?));
-    }
+    // Read the array at its declared absolute offset rather than assuming it
+    // follows the fixed part.
+    let sampling_rates = read_u32s_at(
+        pdu,
+        usize::from(rates_offset),
+        usize::from(n).min(MAX_SAMPLING_RATES),
+    )
+    .into_iter()
+    .map(decode_sampling_rate)
+    .collect();
     Some(AudioUnitDesc {
         object_name,
         clock_domain_index,
@@ -215,11 +343,18 @@ pub fn encode_stream(d: &StreamDesc, is_input: bool) -> Vec<u8> {
     w.u16(d.clock_domain_index);
     w.u16(d.stream_flags);
     w.u64(d.current_format.0);
-    w.u16(0); // formats_offset placeholder
+    // formats_offset is ABSOLUTE from the descriptor start (§7.2.6); it was a
+    // zero placeholder that was never patched, pointing a controller at our
+    // descriptor_type field instead of the formats array.
+    w.u16(STREAM_FORMATS_OFFSET);
     let n = d.formats.len().min(MAX_FORMATS) as u16;
     w.u16(n);
-    w.u64(0); // backup_talker_entity_id_0
-    w.u16(0); // backup_talker_unique_id_0
+    // The three backup talker pairs and the backed-up pair. We support no
+    // backup talker, so all zero — but they must be present or the formats
+    // array lands 40 bytes early.
+    for _ in 0..STREAM_BACKUP_FIELDS_BYTES {
+        w.u8(0);
+    }
     w.u16(d.avb_interface_index);
     w.u32(d.buffer_length);
     for f in d.formats.iter().take(n as usize) {
@@ -236,15 +371,19 @@ pub fn decode_stream(pdu: &[u8]) -> Option<StreamDesc> {
     let clock_domain_index = r.u16()?;
     let stream_flags = r.u16()?;
     let current_format = StreamFormat(r.u64()?);
-    r.skip(2)?; // formats_offset
+    let formats_offset = r.u16()?;
     let n = r.u16()?;
-    r.skip(8 + 2)?; // backup_talker_entity_id_0 + backup_talker_unique_id_0
+    r.skip(STREAM_BACKUP_FIELDS_BYTES)?; // 3 backup talker pairs + backed-up
     let avb_interface_index = r.u16()?;
     let buffer_length = r.u32()?;
-    let mut formats = Vec::new();
-    for _ in 0..n.min(MAX_FORMATS as u16) {
-        formats.push(StreamFormat(r.u64()?));
-    }
+    let formats = read_u64s_at(
+        pdu,
+        usize::from(formats_offset),
+        usize::from(n).min(MAX_FORMATS),
+    )
+    .into_iter()
+    .map(StreamFormat)
+    .collect();
     Some(StreamDesc {
         object_name,
         clock_domain_index,
@@ -641,5 +780,180 @@ mod tests {
             ],
         };
         assert_eq!(decode_audio_map(&encode_audio_map(&m)), Some(m));
+    }
+}
+
+/// Decode tests pinned to descriptor bytes captured from a REAL PreSonus
+/// StudioLive 16R (entity `0x000a92fffe033ba9`, firmware as shipped, read over
+/// AECP by `avb-daemon aem-dump` on the I210).
+///
+/// These exist because every codec in this file was previously "tested" only
+/// by `decode(encode(x)) == x`. That is a tautology: our encoder and decoder
+/// shared the same wrong field offsets, so the round trip passed while the
+/// 16R's own descriptors decoded to garbage — `formats` as all-zeros, a
+/// healthy 48 kHz AUDIO_UNIT as "0 Hz". A hex string lifted off the wire
+/// cannot agree with a bug in our own layout.
+#[cfg(test)]
+#[allow(clippy::indexing_slicing)]
+mod hw_16r {
+    use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(s.len() / 2);
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let hi = (b[i] as char).to_digit(16).expect("hex");
+            let lo = (b[i + 1] as char).to_digit(16).expect("hex");
+            out.push((hi * 16 + lo) as u8);
+            i += 2;
+        }
+        out
+    }
+
+    /// CONFIGURATION 0 — "Configuration 0", 10 descriptor-count entries.
+    const CONFIG_0: &str = "00010000436f6e66696775726174696f6e203000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffff000a004a001a000100020001000500090006000900090001000a000b000c0001001a0001002400010026000100270001";
+
+    /// AUDIO_UNIT 0 — "Audio Unit 0", 48 kHz current, {44.1 k, 48 k}.
+    const AUDIO_UNIT_0: &str = "00020000417564696f20556e6974203000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffff0000000100000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bb80009000020000ac440000bb80";
+
+    /// STREAM_INPUT 0 — "Return CRF". The 16R's media-clock sink, NOT audio.
+    const STREAM_INPUT_0_CRF: &str = "0005000052657475726e20435246000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffff00000003041060010000bb8000840002000000000000000000000000000000000000000000000000000000000000000000000000000000000000002070b0041060010000bb80041093010000ac44";
+
+    /// STREAM_INPUT 1 — "Return 1-8", AAF 48 kHz INT32 8 ch 6 spf, 10 formats.
+    const STREAM_INPUT_1_AAF: &str = "0005000152657475726e20312d38000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffff0000000302050220020060000084000a000000000000000000000000000000000000000000000000000000000000000000000000000000000000002070b00204022000406000020402200080600002040220010060000204022001806000020402200200600002050220004060000205022000806000020502200100600002050220018060000205022002006000";
+
+    /// STREAM_OUTPUT 1 — "Send 1-8", the source our listener direction binds.
+    const STREAM_OUTPUT_1_AAF: &str = "0006000153656e6420312d380000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffff000000020205022002006000008400020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002040220020060000205022002006000";
+
+    #[test]
+    fn configuration_0_off_the_wire() {
+        let d = decode_configuration(&hex(CONFIG_0)).expect("decode");
+        assert_eq!(d.object_name, "Configuration 0");
+        // 9 STREAM_INPUTs and 9 STREAM_OUTPUTs: one CRF plus eight audio.
+        assert_eq!(
+            d.descriptor_counts
+                .iter()
+                .copied()
+                .find(|&(t, _)| t == crate::constants::desc::STREAM_INPUT),
+            Some((crate::constants::desc::STREAM_INPUT, 9))
+        );
+        assert_eq!(
+            d.descriptor_counts
+                .iter()
+                .copied()
+                .find(|&(t, _)| t == crate::constants::desc::STREAM_OUTPUT),
+            Some((crate::constants::desc::STREAM_OUTPUT, 9))
+        );
+        assert_eq!(d.descriptor_counts.len(), 10);
+    }
+
+    /// The bug that made `duplex` refuse to stream: the rate was read from
+    /// byte 80 (a run of zeros on this device) instead of byte 136, so the
+    /// AUDIO_UNIT-vs-stream rate cross-check compared 48000 against 0.
+    #[test]
+    fn audio_unit_0_current_rate_is_48k_not_zero() {
+        let d = decode_audio_unit(&hex(AUDIO_UNIT_0)).expect("decode");
+        assert_eq!(d.object_name, "Audio Unit 0");
+        assert_eq!(d.current_sampling_rate, 48_000);
+        assert_ne!(d.current_sampling_rate, 0);
+        assert_eq!(d.sampling_rates, vec![44_100, 48_000]);
+        assert_eq!(d.number_of_stream_input_ports, 1);
+        assert_eq!(d.number_of_stream_output_ports, 1);
+    }
+
+    /// STREAM_INPUT 0 is CRF, so a talker must not bind it. This is the sink
+    /// `--listener-uid`'s old default of 0 pointed at.
+    #[test]
+    fn stream_input_0_is_crf_media_clock() {
+        let d = decode_stream(&hex(STREAM_INPUT_0_CRF)).expect("decode");
+        assert_eq!(d.object_name, "Return CRF");
+        assert!(!d.current_format.is_aaf());
+        assert_eq!(d.current_format.0, 0x0410_6001_0000_bb80);
+        // Its two formats are both CRF, decoded from the real array at 132.
+        assert_eq!(d.formats.len(), 2);
+        assert!(d.formats.iter().all(|f| !f.is_aaf()));
+    }
+
+    /// The formats array lives at byte 132, not immediately after the count at
+    /// 86. Reading sequentially produced ten all-zero formats.
+    #[test]
+    fn stream_input_1_formats_are_real_not_zeros() {
+        let d = decode_stream(&hex(STREAM_INPUT_1_AAF)).expect("decode");
+        assert_eq!(d.object_name, "Return 1-8");
+        assert_eq!(d.current_format.0, 0x0205_0220_0200_6000);
+        assert_eq!(d.formats.len(), 10);
+        assert!(
+            d.formats.iter().all(|f| f.0 != 0),
+            "formats decoded as zeros: {:#018x?}",
+            d.formats.iter().map(|f| f.0).collect::<Vec<_>>()
+        );
+        // Five 44.1 kHz and five 48 kHz variants, 1/2/4/6/8 channels each.
+        assert_eq!(d.formats[0].0, 0x0204_0220_0040_6000);
+        assert_eq!(d.formats[9].0, 0x0205_0220_0200_6000);
+        assert!(d.formats.iter().any(|f| f.0 == d.current_format.0));
+        // avb_interface_index is at 126 and buffer_length at 128; the old
+        // layout read both out of the backup-talker zeros.
+        assert_eq!(d.avb_interface_index, 0);
+        assert_eq!(d.buffer_length, 2_126_000);
+    }
+
+    #[test]
+    fn stream_output_1_is_the_audio_source() {
+        let d = decode_stream(&hex(STREAM_OUTPUT_1_AAF)).expect("decode");
+        assert_eq!(d.object_name, "Send 1-8");
+        assert!(d.current_format.is_aaf());
+        assert_eq!(d.current_format.0, 0x0205_0220_0200_6000);
+        assert_eq!(d.formats.len(), 2);
+        assert_eq!(d.formats[0].0, 0x0204_0220_0200_6000);
+        assert_eq!(d.formats[1].0, 0x0205_0220_0200_6000);
+    }
+
+    /// Our own encoder must place its arrays where the 16R places them, so a
+    /// controller reading OUR descriptors uses the same offsets we just proved
+    /// against the hardware. Asserted as literals, not as our own constants.
+    #[test]
+    fn our_encoders_use_the_hardware_offsets() {
+        let s = encode_stream(
+            &StreamDesc {
+                object_name: "x".into(),
+                clock_domain_index: 0,
+                stream_flags: 3,
+                current_format: StreamFormat(0x0205_0220_0200_6000),
+                formats: vec![StreamFormat(0x0205_0220_0200_6000)],
+                avb_interface_index: 0,
+                buffer_length: 8,
+            },
+            true,
+        );
+        assert_eq!(u16::from_be_bytes([s[82], s[83]]), 132);
+        assert_eq!(u16::from_be_bytes([s[84], s[85]]), 1);
+        assert_eq!(
+            u64::from_be_bytes(s[132..140].try_into().expect("8 bytes")),
+            0x0205_0220_0200_6000
+        );
+
+        let a = encode_audio_unit(&AudioUnitDesc {
+            object_name: "x".into(),
+            clock_domain_index: 0,
+            number_of_stream_input_ports: 1,
+            number_of_stream_output_ports: 1,
+            current_sampling_rate: 48_000,
+            sampling_rates: vec![48_000],
+        });
+        assert_eq!(
+            u32::from_be_bytes(a[136..140].try_into().expect("4 bytes")),
+            48_000
+        );
+        assert_eq!(u16::from_be_bytes([a[140], a[141]]), 144);
+        assert_eq!(u16::from_be_bytes([a[142], a[143]]), 1);
+
+        let c = encode_configuration(&ConfigurationDesc {
+            object_name: "x".into(),
+            descriptor_counts: vec![(crate::constants::desc::STREAM_INPUT, 9)],
+        });
+        assert_eq!(u16::from_be_bytes([c[70], c[71]]), 1);
+        assert_eq!(u16::from_be_bytes([c[72], c[73]]), 74);
+        assert_eq!(u16::from_be_bytes([c[74], c[75]]), 5);
     }
 }

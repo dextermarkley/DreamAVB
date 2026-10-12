@@ -139,8 +139,11 @@ enum Command {
         #[arg(long)]
         listener: Option<String>,
         /// Which of the 16R's STREAM_INPUT sinks (listener_unique_id) to bind.
-        #[arg(long, default_value_t = 0)]
-        listener_uid: u16,
+        /// Omit to choose the first AAF audio sink from the 16R's own AEM —
+        /// its index 0 is `Return CRF`, the media-clock stream, which accepts
+        /// a reservation and carries no audio.
+        #[arg(long)]
+        listener_uid: Option<u16>,
         #[arg(long)]
         allow_partial: bool,
         #[arg(long, default_value_t = 30)]
@@ -164,9 +167,11 @@ enum Command {
         /// The 16R entity id. Auto-discovered when omitted.
         #[arg(long)]
         listener: Option<String>,
-        /// Which of the 16R's STREAM_INPUT sinks to send to.
-        #[arg(long, default_value_t = 0)]
-        listener_uid: u16,
+        /// Which of the 16R's STREAM_INPUT sinks to send to. Omit to choose
+        /// the first AAF audio sink from its AEM (index 0 is the CRF
+        /// media-clock stream, not audio).
+        #[arg(long)]
+        listener_uid: Option<u16>,
         #[arg(long, default_value_t = 30)]
         start_timeout: u64,
         #[arg(long)]
