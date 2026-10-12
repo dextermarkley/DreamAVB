@@ -124,6 +124,38 @@ define_class!(
             // believing the error.
             let ident = unsafe { request.identifier() }.to_string();
             let want = bundled_dext_version(&ident);
+            // GROUND TRUTH, before trusting sysextd's bookkeeping: the code
+            // hash of what the kernel has actually attached, against the hash
+            // of the bundle we just submitted.
+            //
+            // `systemextensionsctl list` is bookkeeping and can disagree with
+            // the kernel. Measured here: the list showed 284.19.2 `[activated
+            // enabled]` while the attached service's IOUserServerCDHash was
+            // 284.2.33's — the copy the list called `terminating for upgrade
+            // via delegate` was the one driving the hardware. Two upgrades in
+            // a row had reported success and changed nothing, and a version
+            // comparison against the list could not see it because the list
+            // named the new version.
+            let running = running_dext_cdhash();
+            let submitted = bundled_dext_path(&ident).and_then(|p| bundle_cdhash(&p));
+            if let (Some(run), Some(sub)) = (running.as_deref(), submitted.as_deref()) {
+                if run != sub {
+                    eprintln!(
+                        "request FAILED: the kernel is still running a different build of \
+                         {ident}"
+                    );
+                    eprintln!("  attached code hash:  {run}");
+                    eprintln!("  this bundle's:       {sub}");
+                    eprintln!("  the error was: {}", error.localizedDescription());
+                    eprintln!(
+                        "  `systemextensionsctl list` may well claim the new version is \
+                         activated and enabled — it reports sysextd's bookkeeping, not what \
+                         the kernel loaded. An older copy stuck in `terminating for upgrade \
+                         via delegate` blocks the replacement until a reboot clears it."
+                    );
+                    std::process::exit(2);
+                }
+            }
             match activated_enabled_version(&ident) {
                 // Active AND the version we asked for: the benign
                 // upgrade-reports-failure case.
@@ -176,6 +208,70 @@ define_class!(
     }
 );
 
+/// The code-directory hash of the dext the KERNEL has actually loaded and
+/// attached, read from the matched personality of the live `AVBI210Driver`
+/// service.
+///
+/// This is the only ground truth about what is running.
+/// `systemextensionsctl list` reports sysextd's BOOKKEEPING, which can
+/// disagree with the kernel: measured on this machine, the list showed
+/// 284.19.2 `[activated enabled]` and 284.2.33 `[terminating for upgrade via
+/// delegate]` while the attached service's `IOUserServerCDHash` matched
+/// 284.2.33 exactly — the version marked as terminating was the one actually
+/// driving the hardware, and two "successful upgrades" had changed nothing.
+///
+/// `ioreg -rn NAME` only, never with `-c`: the class filter discards the name
+/// match and returns nothing even when the dext is attached.
+fn running_dext_cdhash() -> Option<String> {
+    let out = Command::new("/usr/sbin/ioreg")
+        .args(["-rn", "AVBI210Driver", "-w0"])
+        .output()
+        .ok()?;
+    parse_running_cdhash(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The pure parser behind [`running_dext_cdhash`], split out so it can be
+/// tested against captured `ioreg` output.
+fn parse_running_cdhash(text: &str) -> Option<String> {
+    const KEY: &str = "\"IOUserServerCDHash\"=\"";
+    let after = text.split(KEY).nth(1)?;
+    let end = after.find('"')?;
+    let h = after.get(..end)?;
+    (!h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit())).then(|| h.to_ascii_lowercase())
+}
+
+/// The code-directory hash `codesign` reports for a bundle on disk.
+fn bundle_cdhash(path: &std::path::Path) -> Option<String> {
+    let out = Command::new("/usr/bin/codesign")
+        .arg("-dvvv")
+        .arg(path)
+        .output()
+        .ok()?;
+    // codesign writes its description to stderr.
+    parse_codesign_cdhash(&String::from_utf8_lossy(&out.stderr))
+        .or_else(|| parse_codesign_cdhash(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_codesign_cdhash(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("CDHash="))
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Path to the dext inside our own app bundle.
+fn bundled_dext_path(ident: &str) -> Option<std::path::PathBuf> {
+    Some(
+        NSBundle::mainBundle()
+            .bundlePath()
+            .to_string()
+            .parse::<std::path::PathBuf>()
+            .ok()?
+            .join("Contents/Library/SystemExtensions")
+            .join(format!("{ident}.dext")),
+    )
+}
+
 /// The version of `ident` that THIS bundle is asking to install, read from the
 /// extension's own `Info.plist` inside `Contents/Library/SystemExtensions/`.
 ///
@@ -188,23 +284,9 @@ define_class!(
 /// `None` means we could not read it, and the caller then falls back to the
 /// weaker "is it active at all" check rather than refusing a good upgrade.
 fn bundled_dext_version(ident: &str) -> Option<String> {
-    let plist = NSBundle::mainBundle()
-        .bundlePath()
-        .to_string()
-        .parse::<std::path::PathBuf>()
-        .ok()?
-        .join("Contents/Library/SystemExtensions")
-        .join(format!("{ident}.dext"))
-        .join("Info.plist");
+    let plist = bundled_dext_path(ident)?.join("Info.plist");
     let text = std::fs::read_to_string(&plist).ok()?;
-    // Minimal, dependency-free read of one string key from an XML plist:
-    // <key>CFBundleVersion</key> followed by the next <string>…</string>.
-    let after_key = text.split("<key>CFBundleVersion</key>").nth(1)?;
-    let open = after_key.find("<string>")? + "<string>".len();
-    let rest = after_key.get(open..)?;
-    let close = rest.find("</string>")?;
-    let v = rest.get(..close)?.trim();
-    (!v.is_empty()).then(|| v.to_string())
+    plist_string(&text, "CFBundleVersion")
 }
 
 /// The version of `ident` that `systemextensionsctl` reports as activated AND
@@ -364,6 +446,65 @@ enabled\tactive\tteamID\tbundleID (version)\tname\t[state]
         assert!(is_success(None, &active));
     }
 
+    /// Real `ioreg -rn AVBI210Driver -w0` fragment from the wedged upgrade:
+    /// the attached service's code hash is 284.2.33's while
+    /// `systemextensionsctl` called 284.19.2 activated and enabled.
+    const IOREG: &str = r#"
+  +-o AVBI210Driver  <class IOUserService, id 0x100000abc, registered, matched, active>
+  |   "IOMatchedPersonality" = {"IOClass"="IOUserService","CFBundleIdentifier"="com.avbaudio.installer.i210","IOUserServerCDHash"="452fe02c65a66272fa5966859d9cf86073c087be","IOUserClass"="AVBI210Driver"}
+  |   "IOUserServerName" = "com.avbaudio.installer.i210"
+"#;
+
+    /// The check that would have caught two "successful" upgrades that changed
+    /// nothing: compare the hash the KERNEL attached against the bundle's.
+    #[test]
+    fn the_attached_code_hash_is_read_from_ioreg() {
+        assert_eq!(
+            parse_running_cdhash(IOREG).as_deref(),
+            Some("452fe02c65a66272fa5966859d9cf86073c087be")
+        );
+        // Nothing attached, or a name that is not ours: no hash rather than a
+        // wrong one.
+        assert_eq!(parse_running_cdhash(""), None);
+        assert_eq!(parse_running_cdhash("no hash here"), None);
+        // A non-hex value is refused rather than compared.
+        assert_eq!(
+            parse_running_cdhash("\"IOUserServerCDHash\"=\"not-a-hash\""),
+            None
+        );
+    }
+
+    /// codesign writes `CDHash=` among many lines, on stderr.
+    #[test]
+    fn the_bundle_code_hash_is_read_from_codesign() {
+        let out = "Executable=/x/com.avbaudio.installer.i210\n\
+Identifier=com.avbaudio.installer.i210\n\
+CDHash=0872b5deb27a677e4644e44767c370cb2c942fe8\n\
+Signature=adhoc\n";
+        assert_eq!(
+            parse_codesign_cdhash(out).as_deref(),
+            Some("0872b5deb27a677e4644e44767c370cb2c942fe8")
+        );
+        assert_eq!(parse_codesign_cdhash("Identifier=x\n"), None);
+    }
+
+    /// The decision: a mismatch is a failed upgrade regardless of what
+    /// `systemextensionsctl` reports, because the list is bookkeeping and the
+    /// code hash is what the kernel loaded.
+    #[test]
+    fn a_mismatched_code_hash_fails_even_when_the_list_looks_healthy() {
+        let running = parse_running_cdhash(IOREG).expect("attached");
+        let submitted = "0872b5deb27a677e4644e44767c370cb2c942fe8";
+        assert_ne!(running, submitted);
+        // And the list, in the same moment, named the version we asked for.
+        assert_eq!(
+            parse_activated_enabled(LIST_STALLED, DEXT_I210).as_deref(),
+            Some("284.19.2")
+        );
+        // So a version-only check passes while the hash check correctly fails.
+        assert!(running != submitted, "hash check must reject this");
+    }
+
     /// An older copy stuck `terminating for upgrade via delegate` must not be
     /// read as active, or the stalled list would look like a clean one.
     #[test]
@@ -458,7 +599,74 @@ fn status() -> Result<()> {
             println!("{id}: not installed");
         }
     }
+    // What the KERNEL actually has attached, which is not the same question.
+    //
+    // The list above is sysextd's bookkeeping. Measured on this machine: it
+    // reported 284.19.2 `[activated enabled]` while the attached service was
+    // running 284.2.33 — the copy it called `terminating for upgrade via
+    // delegate`. Two upgrades reported success and changed nothing, and
+    // nothing in the list said so. Printing the attached code hash and naming
+    // the staged copy it belongs to makes the difference readable.
+    match running_dext_cdhash() {
+        Some(run) => {
+            let which = staged_version_for_cdhash(&run);
+            println!(
+                "attached in the kernel: code hash {run}{}",
+                match which {
+                    Some(v) => format!(" = staged version {v}"),
+                    None =>
+                        " (matches no staged copy — it may be a build installed and since replaced)"
+                            .to_string(),
+                }
+            );
+            if let Some(p) = bundled_dext_path(DEXT_I210) {
+                if let Some(sub) = bundle_cdhash(&p) {
+                    println!(
+                        "this bundle would install: code hash {sub}{}",
+                        if sub == run {
+                            " — ALREADY RUNNING"
+                        } else {
+                            " — NOT yet running; `activate` would replace it"
+                        }
+                    );
+                }
+            }
+        }
+        None => println!("attached in the kernel: nothing (AVBI210Driver is not matched)"),
+    }
     Ok(())
+}
+
+/// Which staged copy under `/Library/SystemExtensions` has this code hash, by
+/// its `CFBundleVersion`. Answers "what is actually running" in the terms a
+/// human reads the list in.
+fn staged_version_for_cdhash(cdhash: &str) -> Option<String> {
+    let root = std::path::Path::new("/Library/SystemExtensions");
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let dext = entry.path().join(format!("{DEXT_I210}.dext"));
+        if !dext.is_dir() {
+            continue;
+        }
+        if bundle_cdhash(&dext).as_deref() == Some(cdhash) {
+            let plist = dext.join("Info.plist");
+            if let Ok(text) = std::fs::read_to_string(&plist) {
+                if let Some(v) = plist_string(&text, "CFBundleVersion") {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// One string value from an XML plist, dependency-free.
+fn plist_string(text: &str, key: &str) -> Option<String> {
+    let after_key = text.split(&format!("<key>{key}</key>")).nth(1)?;
+    let open = after_key.find("<string>")? + "<string>".len();
+    let rest = after_key.get(open..)?;
+    let close = rest.find("</string>")?;
+    let v = rest.get(..close)?.trim();
+    (!v.is_empty()).then(|| v.to_string())
 }
 
 fn usage() {
