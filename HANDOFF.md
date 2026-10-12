@@ -140,39 +140,67 @@ streams (`--all-inbound-streams`) and eight outbound talkers, all eight
 `Listener Ready` in both directions, with the 8-stream AEM (8 `STREAM_OUTPUT`s,
 64 `AUDIO_CLUSTER`s) the 16R needs in order to bind them.
 
-**The one thing NOT yet sustained is the outbound frame rate, and it needs a
-REBOOT, not code.** Eight class-A streams need 64000 frames/s. A single
-`SendFrame` user-client call measures ~27 us, so the per-frame path saturates
-at ~37000/s — measured, with `0 rate-limited`, so the token bucket is no
-longer the constraint:
+**The outbound frame rate is now SUSTAINED at the full width, and that is
+VERIFIED on hardware.** Eight class-A streams need 64000 frames/s. A single
+`SendFrame` user-client call measures ~27 us, so the per-frame path saturated
+at ~37000/s with `0 rate-limited` — the token bucket was never the constraint,
+the per-CALL cost was. ABI **v4** `sel::SEND_FRAMES` (selector 15) queues up to
+8 frames per call behind one doorbell. Measured on the live I210 with
+`284.21.58` attached:
 
 ```
-TX over the 20.0s armed window: 37030 frames/s attempted, 37030/s reached the
-wire via one call PER FRAME (dext predates ABI v4; it cannot sustain 8 streams)
+                        per-frame      batched
+frames/s on the wire       37063         63008
+intervals missed           49272          1353   (23% -> 0.6%)
+rate-limited                   0             0
+outbound streams     8 of 8 accepted   8 of 8 accepted
 ```
 
-ABI **v4** adds `sel::SEND_FRAMES` (selector 15), which queues up to 8 frames
-per call behind one doorbell; the C++ host test
-`batched full-width talker unthrottled (64000 frames/s)` covers it. The daemon
-picks the path from the ABI the ATTACHED dext reports (never from our own
-compiled constant) and says which one it used, so a silent fallback cannot look
-like a batched run.
+63008 of 63992 nominal is 1.5% short, which is residual pacing jitter in a
+userspace loop, not a throughput ceiling. The C++ host test
+`batched full-width talker unthrottled (64000 frames/s)` covers the dext side.
+The daemon picks the path from the ABI the ATTACHED dext reports (never from
+our own compiled constant) and names the path it used, so a silent fallback
+cannot look like a batched run.
 
-**Why a reboot: `systemextensionsctl` cannot be trusted here.** A PCI-matched
-dext does not terminate while it owns its device, so an `activate` stages the
-new build, marks it `activated enabled`, and the kernel keeps running the OLD
-one. The list has reported a version as active that was never loaded three
-times now. `avb-installer status` reports the GROUND TRUTH by code-signing
-hash and is the only instrument to trust:
+### Replacing the dext: TWO independent traps, both now understood
+
+Getting `284.21.58` to actually load cost most an afternoon because two
+separate things were in the way. Check both.
+
+**1. The incumbent owns the PCI device, so the upgrade defers.** `activate`
+stages the new build and marks it `activated enabled` while the kernel keeps
+running the OLD one. Un-match it by removing the device: **unplug and replug
+the Thunderbolt adapter**, which takes seconds and is confirmed working here.
+Do NOT reboot for this — see the research note below for why no reboot-free
+API exists.
+
+**2. Adhoc and signed dexts are SEPARATE records that never replace each
+other.** macOS keys a system extension on (teamID, bundleID). An adhoc-signed
+dext shows teamID `-`, the Apple-Development one shows `8NG8NMGYVF`, and both
+can sit `activated enabled` at once with the adhoc one winning the match:
 
 ```
-attached in the kernel: code hash efbe79aa... = staged version 284.19.2
-this bundle would install: code hash 91a1acd2... — NOT yet running
+-            284.21.16  [activated enabled]   <- attached, shadowing
+8NG8NMGYVF   284.21.58  [activated enabled]   <- the build we wanted
 ```
 
-After a reboot, re-run `avb-installer activate` (no sudo needed), confirm with
-`avb-installer status` that the hashes MATCH, then a duplex run should report
-`via ONE CALL PER INTERVAL` and ~64000 frames/s.
+`package.sh --adhoc` runs in the gate, so activating from `build/` afterwards
+creates that shadow line. The tell is in activate's own output: `replacing
+installed extension version 282.7.31 with 284.21.58` — it replaced the other
+SIGNED record and left the adhoc one running. Clear it with
+`systemextensionsctl uninstall - com.avbaudio.installer.i210` (prompts for auth
+even as root), then replug. **Always repackage SIGNED before activating.**
+
+**Trust only `avb-installer status`.** It compares the code-signing hash the
+kernel reports for the attached service against the staged copies — the one
+instrument that was never wrong, where the version list named a version as
+active that had never loaded three separate times:
+
+```
+attached in the kernel: code hash 91a1acd2... = staged version 284.21.58
+this bundle would install: code hash 91a1acd2... — ALREADY RUNNING
+```
 
 **Prefer a Thunderbolt REPLUG over a reboot.** Researched 2026-10-12: there is
 no documented reboot-free way to replace an always-matched dext, and the
