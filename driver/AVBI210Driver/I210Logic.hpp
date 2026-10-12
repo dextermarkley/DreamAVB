@@ -610,6 +610,77 @@ constexpr void statsAccumulate(AvbCounters* c, uint32_t* rqdpcLast, const HwStat
     *rqdpcLast = r.rqdpc0;
 }
 
+// ---------------------------------------------------------------------------
+// kAvbSelSendFrames batch parsing (ABI v4). Pure and host-tested: this walks
+// client-supplied bytes, so every bound is checked here BEFORE the driver
+// touches the TX ring, and the whole batch is refused rather than partly
+// queued. Layout is documented on AvbTxBatchHeader in AVBShared.h.
+
+struct TxBatchFrame {
+    uint32_t offset;  // into the structure input
+    uint32_t len;
+};
+
+struct TxBatchPlan {
+    bool valid;
+    uint32_t count;
+    TxBatchFrame f[AVB_TX_BATCH_MAX];
+};
+
+constexpr uint32_t roundUp4(uint32_t n) { return (n + 3u) & ~3u; }
+
+// Parses and validates a whole batch. `valid` is false for any malformed
+// input: short buffer, bad count, a declared total that disagrees with the
+// real length, a frame length outside 14..AVB_FRAME_MAX_LEN, a non-zero
+// reserved field, an entry running past the end, or trailing bytes after the
+// last frame. Nothing is trusted from the header except after checking.
+constexpr TxBatchPlan parseTxBatch(const uint8_t* in, uint32_t inLen) {
+    TxBatchPlan p{};
+    if (in == nullptr || inLen < 8u || inLen > AVB_TX_BATCH_BYTES_MAX) {
+        return p;
+    }
+    const uint32_t count = le32At(in, 0);
+    const uint32_t total = le32At(in, 4);
+    if (count == 0u || count > AVB_TX_BATCH_MAX || total != inLen) {
+        return p;
+    }
+    uint32_t at = 8u;
+    for (uint32_t i = 0; i < count; i++) {
+        if (at + 4u > inLen) {
+            return p;
+        }
+        const uint32_t hdr = le32At(in, at);
+        const uint32_t len = hdr & 0xFFFFu;
+        const uint32_t reserved = hdr >> 16;
+        if (reserved != 0u || len < 14u || len > AVB_FRAME_MAX_LEN) {
+            return p;
+        }
+        at += 4u;
+        if (len > inLen - at) {  // no overflow: at <= inLen here
+            return p;
+        }
+        p.f[i].offset = at;
+        p.f[i].len = len;
+        const uint32_t padded = roundUp4(len);
+        if (padded > inLen - at) {
+            return p;
+        }
+        at += padded;
+    }
+    if (at != inLen) {  // trailing slop: the client and we disagree on layout
+        return p;
+    }
+    p.valid = true;
+    p.count = count;
+    return p;
+}
+
+// Bytes a batch of `count` frames of `len` each occupies. Client-side helper,
+// kept here so both sides size the buffer from one expression.
+constexpr uint32_t txBatchBytes(uint32_t count, uint32_t len) {
+    return 8u + count * (4u + roundUp4(len));
+}
+
 }  // namespace i210logic
 
 #endif  // I210_LOGIC_HPP

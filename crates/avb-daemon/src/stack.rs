@@ -65,13 +65,14 @@ fn bring_up(opts: &GlobalOpts, log: &Logger) -> Result<RealDext, Exit> {
         Ok(i) => i,
         Err(_) => return Err(Exit::DextFault),
     };
-    if info.abi_version != avb_dext::abi::ABI_VERSION {
+    if !avb_dext::abi::abi_supported(info.abi_version) {
         log.log(
             Level::Error,
             "dext",
             &format!(
-                "dext ABI v{} != avb-daemon ABI v{}; rebuild and reactivate (scripts/package.sh, avb-installer activate)",
+                "dext ABI v{} outside the range v{}..=v{} this daemon drives; rebuild and reactivate (scripts/package.sh, avb-installer activate)",
                 info.abi_version,
+                avb_dext::abi::ABI_VERSION_MIN,
                 avb_dext::abi::ABI_VERSION
             ),
         );
@@ -2835,6 +2836,12 @@ fn talker_loop(
     let stream_frame_bytes = channels * 4;
     let mut stream_scratch = vec![0u8; spf * stream_frame_bytes];
     let mut pdu_scratch = vec![0u8; out_streams.first().map_or(0, |o| o.talker.pdu_len())];
+    // One staged frame per outbound stream, so a whole observation interval
+    // can go to the dext in ONE user-client call. Allocated once: the
+    // per-packet path must not allocate (there is a test that arms an
+    // allocation counter over it), and at 8000 intervals/s an allocation per
+    // interval would be 8000 trips through the allocator per second.
+    let mut tx_staged: Vec<TxFrame> = vec![TxFrame::EMPTY; out_streams.len()];
 
     let run_ns = seconds.saturating_mul(1_000_000_000);
     let start = now_mach();
@@ -3535,19 +3542,13 @@ fn talker_loop(
         };
         let avtp_ts = (gptp_now.wrapping_add(presentation_offset_ns) & 0xFFFF_FFFF) as u32;
 
-        // Transmit ONE PDU PER STREAM for this observation interval.
-        //
-        // Every stream carries the same sample instant, so they all take the
-        // SAME presentation timestamp — which is exactly what the 16R does in
-        // the other direction (all eight of its streams stamp identically for
-        // a given instant, read off the wire). One ring read feeds all eight:
-        // each takes its own contiguous block of channels out of the
-        // 64-channel frame.
-        //
-        // Eight streams at 8000 frames/s each is 64 000 frames/s, over three
-        // times the dext's old 20 000/s SAF-6 ceiling — which is why that
-        // ceiling had to be raised first, and why `rate-limited` in the
-        // summary is the number to read if this looks gapped.
+        // Eight streams at 8000 frames/s each is 64 000 frames/s. That is
+        // unreachable one user-client call at a time -- a SendFrame round
+        // trip measures ~28 us, so the loop managed 35 380 frames/s with the
+        // token bucket granting every one of them (0 rate-limited) and 30% of
+        // intervals missed. So the interval is STAGED here and handed to the
+        // dext in a single `send_batch` call below.
+        let mut tx_staged_len = 0usize;
         for i in 0..out_streams.len() {
             let (uid, dst) = match out_streams.get(i) {
                 Some(o) => (o.uid, stream_dest_mac(o.stream_id)),
@@ -3610,21 +3611,9 @@ fn talker_loop(
                     if let Ok(f) =
                         TxFrame::build(&hdr, pdu_scratch.get(..n).unwrap_or(&[]), false, 0)
                     {
-                        // Count what the dext ACCEPTED, not what we attempted.
-                        // The dext enforces its own TX ceiling (SAF-6) and
-                        // returns an error for a frame it drops; ignoring that
-                        // made the summary report 441 232 PDUs "sent" in a run
-                        // where only 58 820 reached the wire, which hid the
-                        // real fault.
-                        match dext.send(f.bytes(), false, 0) {
-                            SendResult::Ok => tx_pdus += 1,
-                            // The token bucket was empty: never reached the
-                            // wire.
-                            SendResult::NoResources => tx_rate_limited += 1,
-                            other => {
-                                tx_rejected += 1;
-                                last_send_err = Some(other);
-                            }
+                        if let Some(slot) = tx_staged.get_mut(tx_staged_len) {
+                            *slot = f;
+                            tx_staged_len += 1;
                         }
                     }
                 }
@@ -3634,6 +3623,40 @@ fn talker_loop(
                         "play",
                         &format!("packetize error on stream {uid}: {e:?}"),
                     );
+                }
+            }
+        }
+
+        // One call for the whole interval.
+        //
+        // Count what the dext ACCEPTED, not what we attempted. The dext
+        // enforces its own TX ceiling (SAF-6) and queues in order until a
+        // frame is refused, so a short return is the prefix that reached the
+        // wire. Ignoring that once made the summary report 441 232 PDUs
+        // "sent" in a run where only 58 820 arrived, which hid the real
+        // fault.
+        if tx_staged_len > 0 {
+            let mut batch: [&[u8]; avb_dext::abi::tx_batch::MAX] =
+                [&[]; avb_dext::abi::tx_batch::MAX];
+            let n = tx_staged_len.min(batch.len());
+            for (slot, f) in batch.iter_mut().zip(tx_staged.iter()).take(n) {
+                *slot = f.bytes();
+            }
+            let r = dext.send_batch(batch.get(..n).unwrap_or(&[]));
+            tx_pdus += r.accepted as u64;
+            let refused = n.saturating_sub(r.accepted);
+            if refused > 0 {
+                match r.stopped_by {
+                    // Back-pressure: the dext's ceiling or a full TX ring.
+                    // Both mean the frames never reached the wire, and the
+                    // dext's own counters split the two.
+                    None | Some(SendResult::NoResources) | Some(SendResult::Busy) => {
+                        tx_rate_limited += refused as u64;
+                    }
+                    Some(other) => {
+                        tx_rejected += refused as u64;
+                        last_send_err = Some(other);
+                    }
                 }
             }
         }
@@ -3808,9 +3831,19 @@ fn talker_loop(
                 Level::Info,
                 dir,
                 &format!(
-                    "TX over the {window_s:.1}s armed window: {:.0} frames/s attempted, {:.0}/s reached the wire{}",
+                    "TX over the {window_s:.1}s armed window: {:.0} frames/s attempted, {:.0}/s reached the wire via {}{}",
                     attempts as f64 / window_s,
                     tx_pdus as f64 / window_s,
+                    // Which path, because the two have very different
+                    // ceilings and a v3 dext falls back silently otherwise.
+                    // A run that reports the per-frame path CANNOT reach the
+                    // full width, so this is the first line to read when the
+                    // rate is short.
+                    if dext.batched_send() {
+                        "one batched call per interval"
+                    } else {
+                        "one call PER FRAME (dext predates ABI v4; it cannot sustain 8 streams)"
+                    },
                     if tx_rate_limited > 0 {
                         format!(
                             " — the dext granted about {:.0} frames/s, which is its compiled-in SAF-6 ceiling whatever the source now says",

@@ -19,7 +19,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define AVB_ABI_VERSION 3u
+// v4 added kAvbSelSendFrames. A v4 client MUST still work against a v3 dext:
+// the batched selector is an optimisation, not a new capability, so the client
+// probes AvbInfo.abi_version and falls back to per-frame SendFrame. Without
+// that fallback an upgraded client would refuse the running dext in the window
+// between `avb-installer activate` and the reboot that actually loads it --
+// a PCI-matched dext does not terminate while it owns its device.
+#define AVB_ABI_VERSION 4u
+#define AVB_ABI_VERSION_SEND_FRAMES 4u  // first version with kAvbSelSendFrames
 
 // AvbInfo.nic_kind
 #define AVB_NIC_BCM57762 1u
@@ -42,7 +49,8 @@ enum AvbSelector : uint32_t {
     kAvbSelSetStreamFilter  = 12, // in: struct AvbStreamFilter out: -
     kAvbSelRingAttach       = 13, // in: flags (must be 0)     out: generation, rx_mem_size, consumer_mem_size
     kAvbSelRingDetach       = 14, // in: -                     out: -
-    kAvbSelCount            = 15,
+    kAvbSelSendFrames       = 15, // in: struct AvbTxBatch     out: accepted, mach_at_doorbell
+    kAvbSelCount            = 16,
     kAvbSelBaseCount        = 10, // implemented by every NIC dext (BCM: only these)
     // 32..47 reserved: talker TX ring / Qav (not built in Phase 1a)
 };
@@ -208,6 +216,49 @@ struct AvbRxBatch {
 #define AVB_TX_RATE_PER_SEC     80000u      // dext token bucket (SAF-6)
 #define AVB_TX_BURST            64u
 
+// kAvbSelSendFrames (ABI v4): one user->dext call carrying a whole class-A
+// interval's worth of frames.
+//
+// It exists because the per-CALL cost dominates, not the per-frame work. A
+// single SendFrame round trip measures ~28 us on this host, so eight streams
+// at 8000 frames/s each -- 64 000 calls/s -- is unreachable one frame at a
+// time: the eight-stream talker attempted only 35 380 frames/s with the token
+// bucket granting every one of them (0 rate-limited), missing 30% of its
+// intervals. Batching also collapses eight TDT doorbells per interval, each an
+// MMIO write plus a read-back flush, into one.
+//
+// Structure input layout -- little-endian, every field 4-byte aligned:
+//
+//   struct AvbTxBatchHeader            8 B
+//   then `count` times:
+//     struct AvbTxBatchEntry           4 B
+//     uint8_t bytes[len]               zero-padded up to a 4-byte boundary
+//
+// The dext walks and bounds-checks the whole batch BEFORE touching the TX
+// ring, and refuses it whole with kIOReturnBadArgument -- queueing nothing --
+// if it does not parse exactly, trailing slop included. Frames are then
+// queued in order until one is refused (bucket empty or ring full); the call
+// reports how many were accepted, so a partial batch is the client's to
+// re-pace rather than an error.
+//
+// want_ts is deliberately unavailable here: the device latches one TX
+// timestamp at a time, so gPTP's timestamped frames keep using SendFrame.
+#define AVB_TX_BATCH_MAX 16u    // >= AVB_TX_MAX_CLASS_A_STREAMS, with headroom
+
+struct AvbTxBatchEntry {        // 4 B, then len bytes padded to 4
+    uint16_t len;               //   0 14..AVB_FRAME_MAX_LEN
+    uint16_t reserved;          //   2 must be 0
+};
+
+struct AvbTxBatchHeader {       // 8 B
+    uint32_t count;             //   0 1..AVB_TX_BATCH_MAX
+    uint32_t total_bytes;       //   4 whole structure-input length, re-checked
+};
+
+// Worst-case structure input: every entry a maximum-length frame.
+#define AVB_TX_BATCH_BYTES_MAX \
+    (8u + AVB_TX_BATCH_MAX * (4u + ((AVB_FRAME_MAX_LEN + 3u) & ~3u)))
+
 // AvbRxSlot.cls
 enum AvbRxClass : uint8_t {
     kAvbRxNone = 0, kAvbRxGptp = 1, kAvbRxMsrp = 2, kAvbRxMvrp = 3,
@@ -272,6 +323,9 @@ enum AvbCounterIndex : uint32_t {
     kAvbCtrHarvestLateTicks = 31,   // tick-to-tick gap > 2 ms
     kAvbCtrLegacySwOverrun = 32,    // Phase 0 software ring (PollRx mode)
     kAvbCtrRxOversize = 33,         // payload after TS header > AVB_RX_SLOT_DATA_MAX: discarded (expected 0; confirms AS-6)
+    kAvbCtrTxBatches = 34,          // kAvbSelSendFrames calls that queued >= 1 frame
+    kAvbCtrTxBatchPartial = 35,     // of those, calls where a later frame was refused
+    kAvbCtrTxBatchRejected = 36,    // calls refused whole: malformed, or want_ts requested
     kAvbCtrCount = 64,
 };
 struct AvbCounters { uint64_t c[kAvbCtrCount]; };   // 512 B
@@ -337,6 +391,7 @@ static_assert(AVB_RX_MEM_SIZE == 17842176u, "rx mem size");
 static_assert((AVB_RX_CTL_SLOTS & (AVB_RX_CTL_SLOTS - 1)) == 0 &&
               (AVB_RX_AUDIO_SLOTS & (AVB_RX_AUDIO_SLOTS - 1)) == 0, "pow2");
 static_assert(kAvbCtrRxOversize < kAvbCtrCount, "counter space");
+static_assert(kAvbCtrTxBatchRejected < kAvbCtrCount, "batch counter space");
 static_assert(kAvbCtrRxClassBase + AVB_RX_CLASS_COUNT == kAvbCtrRxDropOther, "class counters 1..7");
 // (uint32_t cast: C++20 deprecates arithmetic between two enumeration types.)
 static_assert(uint32_t(kAvbCtrRxClassBase) + kAvbRxGptp - 1 == 1 &&
@@ -350,6 +405,15 @@ static_assert(sizeof(AvbClockSample) == 24, "AvbClockSample ABI size");
 static_assert(sizeof(AvbRxEntry) == 152, "AvbRxEntry ABI size");
 static_assert(sizeof(AvbRxBatch) == 3656, "AvbRxBatch ABI size");
 static_assert(sizeof(AvbRxBatch) <= 4096, "AvbRxBatch must travel inline");
+static_assert(sizeof(AvbTxBatchHeader) == 8, "AvbTxBatchHeader ABI size");
+static_assert(sizeof(AvbTxBatchEntry) == 4, "AvbTxBatchEntry ABI size");
+// One call must be able to carry a full interval of every class-A stream, or
+// the talker is back to several calls per 125 us and the batching buys nothing.
+static_assert(AVB_TX_BATCH_MAX >= AVB_TX_MAX_CLASS_A_STREAMS,
+              "a batch must hold one frame per class-A stream");
+// A full batch must stay inside the token burst, so a correctly-paced talker
+// is never throttled mid-interval by the bucket's burst depth.
+static_assert(AVB_TX_BATCH_MAX <= AVB_TX_BURST, "batch must fit the token burst");
 static_assert(AVB_READ_CLOCK_MAX_SAMPLES * sizeof(AvbClockSample) <= 4096,
               "ReadClock output must travel inline");
 #endif

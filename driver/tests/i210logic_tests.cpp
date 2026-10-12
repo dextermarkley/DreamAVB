@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Host-side unit tests for I210Logic.hpp and the AVBShared.h ABI (v3).
+// Host-side unit tests for I210Logic.hpp and the AVBShared.h ABI (v4).
 // Plain assert-style runner: prints one line per check group, exits non-zero
 // on the first failure.
 
@@ -26,7 +26,7 @@ static int gChecks = 0;
     } while (0)
 
 // ABI sizes and offsets (mirrored by the Rust abi.rs offset_of!/size_of tests).
-static_assert(AVB_ABI_VERSION == 3);
+static_assert(AVB_ABI_VERSION == 4);
 static_assert(sizeof(AvbInfo) == 60);
 static_assert(sizeof(AvbClockSample) == 24);
 static_assert(sizeof(AvbRxEntry) == 152);
@@ -45,7 +45,8 @@ static_assert(AVB_REG_READ_LIMIT == 0x20000);
 // ABI v3 literals (design §3.1). The Rust mirror asserts the same values.
 static_assert(kAvbSelStepClock == 10 && kAvbSelGetCounters == 11 && kAvbSelSetStreamFilter == 12 &&
               kAvbSelRingAttach == 13 && kAvbSelRingDetach == 14);
-static_assert(kAvbSelCount == 15 && kAvbSelBaseCount == 10);
+static_assert(kAvbSelCount == 16 && kAvbSelBaseCount == 10);
+static_assert(kAvbSelSendFrames == 15);
 static_assert(kAvbMemRx == 1 && kAvbMemConsumer == 2);
 static_assert(AVB_FLAG_RINGS_ATTACHED == 0x20 && AVB_FLAG_OWNED == 0x40);
 static_assert(AVB_SHM_MAGIC == 0x33425641u);
@@ -763,6 +764,183 @@ static void testProducerRunning() {
     std::printf("pass: producerRunning truth table\n");
 }
 
+// ---------------------------------------------------------------------------
+// kAvbSelSendFrames batch parsing. Every one of these shapes comes from a
+// client buffer, so each must be refused WHOLE rather than partly queued.
+
+namespace {
+
+// Builds a batch into `buf`, returning its length. `declaredCount` and
+// `declaredTotal` default to the truth and are overridable so a test can lie
+// in exactly one field.
+uint32_t buildBatch(uint8_t* buf, const uint32_t* lens, uint32_t count,
+                    uint32_t declaredCount, uint32_t declaredTotal,
+                    uint32_t reservedOf0 = 0) {
+    uint32_t at = 8;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t res = (i == 0) ? reservedOf0 : 0u;
+        buf[at + 0] = static_cast<uint8_t>(lens[i] & 0xFF);
+        buf[at + 1] = static_cast<uint8_t>((lens[i] >> 8) & 0xFF);
+        buf[at + 2] = static_cast<uint8_t>(res & 0xFF);
+        buf[at + 3] = static_cast<uint8_t>((res >> 8) & 0xFF);
+        at += 4;
+        for (uint32_t b = 0; b < roundUp4(lens[i]); b++) {
+            buf[at + b] = (b < lens[i]) ? static_cast<uint8_t>(0x40 + i) : 0u;
+        }
+        at += roundUp4(lens[i]);
+    }
+    const uint32_t total = (declaredTotal == 0xFFFFFFFFu) ? at : declaredTotal;
+    buf[0] = static_cast<uint8_t>(declaredCount & 0xFF);
+    buf[1] = static_cast<uint8_t>((declaredCount >> 8) & 0xFF);
+    buf[2] = static_cast<uint8_t>((declaredCount >> 16) & 0xFF);
+    buf[3] = static_cast<uint8_t>((declaredCount >> 24) & 0xFF);
+    buf[4] = static_cast<uint8_t>(total & 0xFF);
+    buf[5] = static_cast<uint8_t>((total >> 8) & 0xFF);
+    buf[6] = static_cast<uint8_t>((total >> 16) & 0xFF);
+    buf[7] = static_cast<uint8_t>((total >> 24) & 0xFF);
+    return at;
+}
+
+}  // namespace
+
+static void testTxBatchParse() {
+    static uint8_t buf[AVB_TX_BATCH_BYTES_MAX + 64];
+    // The real shape: eight 48 kHz / 8 ch / 6 spf / 32-bit AAF frames, one
+    // class-A interval across the 16R's eight streams. 234 is not a multiple
+    // of 4, so this also exercises the padding.
+    uint32_t lens[AVB_TX_BATCH_MAX];
+    for (uint32_t i = 0; i < 8; i++) {
+        lens[i] = 234;
+    }
+    std::memset(buf, 0, sizeof(buf));
+    uint32_t n = buildBatch(buf, lens, 8, 8, 0xFFFFFFFFu);
+    CHECK(n == txBatchBytes(8, 234));
+    TxBatchPlan p = parseTxBatch(buf, n);
+    CHECK(p.valid);
+    CHECK(p.count == 8);
+    for (uint32_t i = 0; i < 8; i++) {
+        CHECK(p.f[i].len == 234);
+        // Each frame begins just past its 4-byte entry header, and the
+        // previous frame's padding is skipped.
+        CHECK(p.f[i].offset == 8 + i * (4 + 236) + 4);
+        CHECK(buf[p.f[i].offset] == 0x40 + i);
+    }
+
+    // A single minimum-length frame.
+    uint32_t one[1] = {14};
+    std::memset(buf, 0, sizeof(buf));
+    n = buildBatch(buf, one, 1, 1, 0xFFFFFFFFu);
+    p = parseTxBatch(buf, n);
+    CHECK(p.valid && p.count == 1 && p.f[0].len == 14 && p.f[0].offset == 12);
+
+    // A full batch of maximum-length frames is exactly the declared worst case.
+    for (uint32_t i = 0; i < AVB_TX_BATCH_MAX; i++) {
+        lens[i] = AVB_FRAME_MAX_LEN;
+    }
+    std::memset(buf, 0, sizeof(buf));
+    n = buildBatch(buf, lens, AVB_TX_BATCH_MAX, AVB_TX_BATCH_MAX, 0xFFFFFFFFu);
+    CHECK(n == AVB_TX_BATCH_BYTES_MAX);
+    p = parseTxBatch(buf, n);
+    CHECK(p.valid && p.count == AVB_TX_BATCH_MAX);
+
+    // --- every malformed shape is refused whole ---
+    for (uint32_t i = 0; i < 8; i++) {
+        lens[i] = 234;
+    }
+
+    CHECK(!parseTxBatch(nullptr, 100).valid);          // no buffer
+    CHECK(!parseTxBatch(buf, 0).valid);                // empty
+    CHECK(!parseTxBatch(buf, 7).valid);                // shorter than the header
+
+    std::memset(buf, 0, sizeof(buf));
+    n = buildBatch(buf, lens, 8, 0, 0xFFFFFFFFu);
+    CHECK(!parseTxBatch(buf, n).valid);                // count 0
+
+    std::memset(buf, 0, sizeof(buf));
+    n = buildBatch(buf, lens, 8, AVB_TX_BATCH_MAX + 1, 0xFFFFFFFFu);
+    CHECK(!parseTxBatch(buf, n).valid);                // count over the max
+
+    std::memset(buf, 0, sizeof(buf));
+    n = buildBatch(buf, lens, 8, 8, 0xFFFFFFFFu);
+    CHECK(!parseTxBatch(buf, n - 4).valid);            // declared total > real length
+    CHECK(!parseTxBatch(buf, n + 4).valid);            // declared total < real length
+
+    std::memset(buf, 0, sizeof(buf));
+    n = buildBatch(buf, lens, 8, 8, 0xFFFFFFFFu, 1);
+    CHECK(!parseTxBatch(buf, n).valid);                // reserved field set
+
+    uint32_t bad[2] = {13, 234};
+    std::memset(buf, 0, sizeof(buf));
+    n = buildBatch(buf, bad, 2, 2, 0xFFFFFFFFu);
+    CHECK(!parseTxBatch(buf, n).valid);                // frame shorter than an Ethernet header
+
+    bad[0] = AVB_FRAME_MAX_LEN + 1;
+    std::memset(buf, 0, sizeof(buf));
+    n = buildBatch(buf, bad, 2, 2, 0xFFFFFFFFu);
+    CHECK(!parseTxBatch(buf, n).valid);                // frame longer than the MTU
+
+    // A count that claims more entries than the bytes hold: the walk must run
+    // out of buffer rather than read past it.
+    std::memset(buf, 0, sizeof(buf));
+    n = buildBatch(buf, lens, 2, 2, 0xFFFFFFFFu);
+    buf[0] = 8;                                        // claim 8, 2 present
+    buf[4] = static_cast<uint8_t>(n & 0xFF);
+    CHECK(!parseTxBatch(buf, n).valid);
+
+    // Trailing slop after the last frame: we and the client disagree on the
+    // layout, so nothing is trusted.
+    std::memset(buf, 0, sizeof(buf));
+    n = buildBatch(buf, lens, 2, 2, 0xFFFFFFFFu);
+    const uint32_t padded = n + 4;
+    buf[4] = static_cast<uint8_t>(padded & 0xFF);
+    buf[5] = static_cast<uint8_t>((padded >> 8) & 0xFF);
+    CHECK(!parseTxBatch(buf, padded).valid);
+
+    // Longer than the worst case the ABI allows.
+    std::memset(buf, 0, sizeof(buf));
+    CHECK(!parseTxBatch(buf, AVB_TX_BATCH_BYTES_MAX + 1).valid);
+
+    std::printf("pass: TX batch parse (%u-frame interval, 12 malformed shapes refused)\n",
+                8u);
+}
+
+// A batch-paced eight-stream talker must never be throttled: 8000 batches of
+// eight frames in one second is 64 000 frames, under the 80 000/s ceiling.
+// This is the whole reason the ceiling was raised, so it is asserted, not
+// assumed.
+static void testTxBatchRate() {
+    TokenBucket b{};
+    uint64_t denied = 0;
+    uint64_t sent = 0;
+    for (uint32_t interval = 0; interval < 8000; interval++) {
+        const uint64_t now = uint64_t(interval) * 125000ull;  // 125 us class A
+        for (uint32_t s = 0; s < AVB_TX_MAX_CLASS_A_STREAMS; s++) {
+            if (tokenBucketTake(&b, now)) {
+                sent++;
+            } else {
+                denied++;
+            }
+        }
+    }
+    CHECK(sent == 8000ull * AVB_TX_MAX_CLASS_A_STREAMS);
+    CHECK(denied == 0);
+
+    // The same traffic plus a control frame per interval still fits.
+    TokenBucket c{};
+    denied = 0;
+    for (uint32_t interval = 0; interval < 8000; interval++) {
+        const uint64_t now = uint64_t(interval) * 125000ull;
+        for (uint32_t s = 0; s < AVB_TX_MAX_CLASS_A_STREAMS + 1; s++) {
+            if (!tokenBucketTake(&c, now)) {
+                denied++;
+            }
+        }
+    }
+    CHECK(denied == 0);
+    std::printf("pass: batched full-width talker unthrottled (%llu frames/s)\n",
+                static_cast<unsigned long long>(sent));
+}
+
 int main() {
     testIdentity();
     testTiminca();
@@ -786,6 +964,8 @@ int main() {
     testStreamFilterValid();
     testAvdeccDest();
     testProducerRunning();
+    testTxBatchParse();
+    testTxBatchRate();
     std::printf("all i210 tests passed (%d checks)\n", gChecks);
     return 0;
 }

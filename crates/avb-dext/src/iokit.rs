@@ -309,10 +309,11 @@ impl Device {
                 size_of::<AvbInfo>()
             );
         }
-        if info.abi_version != abi::ABI_VERSION {
+        if !abi::abi_supported(info.abi_version) {
             bail!(
-                "dext ABI version {} != probe ABI version {}",
+                "dext ABI version {} outside the supported range {}..={}",
                 info.abi_version,
+                abi::ABI_VERSION_MIN,
                 abi::ABI_VERSION
             );
         }
@@ -413,6 +414,31 @@ impl Device {
             "SendFrame",
         )?;
         Ok((out[0], out[1]))
+    }
+
+    /// Queue up to [`abi::tx_batch::MAX`] frames (no FCS, no timestamps) in
+    /// ONE user-client call. Returns (accepted, mach_at_doorbell).
+    ///
+    /// `accepted < frames.len()` is normal back-pressure, not an error: the
+    /// dext queues in order and stops at the first frame the token bucket or
+    /// the TX ring refuses. The caller re-paces the remainder.
+    ///
+    /// Requires an ABI >= [`abi::ABI_VERSION_SEND_FRAMES`] dext; check with
+    /// [`abi::abi_has_send_frames`] before calling, since a v3 dext has no
+    /// such selector and fails the call.
+    pub fn send_frames(&self, frames: &[&[u8]]) -> Result<(u32, u64)> {
+        let mut buf = [0u8; abi::tx_batch::BYTES_MAX];
+        let n = abi::tx_batch::encode(&mut buf, frames)?;
+        let mut out = [0u64; 2];
+        self.call(
+            sel::SEND_FRAMES,
+            &[],
+            &buf[..n],
+            &mut out,
+            None,
+            "SendFrames",
+        )?;
+        Ok((out[0] as u32, out[1]))
     }
 
     /// Returns (status, hw_ts, mach_latched).

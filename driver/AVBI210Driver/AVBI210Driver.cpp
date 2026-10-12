@@ -1113,6 +1113,34 @@ static kern_return_t initDatapath(IV * v, uint64_t initFlags)
     return kIOReturnSuccess;
 }
 
+// Stage one frame into its bounce buffer and TX descriptor and advance the
+// producer index. Does NOT ring the doorbell -- the caller does that once,
+// which is the whole point of the batched path. The caller has already run
+// checkTx(), taken a token and confirmed ring space.
+//
+// Both send paths go through here on purpose: a second copy of the
+// bounce-slot/descriptor layout is how a wire path ends up tested in one
+// direction and wrong in the other.
+static void stageFrame(IV * v, const uint8_t * frame, uint32_t len, bool wantTs)
+{
+    // In-flight <= kTxSlots and kTxRingSize is a multiple of kTxSlots, so the
+    // bounce slot of descriptor i is free once the descriptors before it are.
+    const uint32_t slot = v->txProd % kTxSlots;
+    uint8_t * buf = v->txBufs.va + uint64_t(slot) * kTxBufSize;
+    memcpy(buf, frame, len);
+    uint32_t padded = len;
+    if (padded < AVB_FRAME_MIN_LEN) {
+        memset(buf + len, 0, AVB_FRAME_MIN_LEN - len);
+        padded = AVB_FRAME_MIN_LEN;
+    }
+    auto * ring = reinterpret_cast<volatile AdvTxDesc *>(v->txRing.va);
+    const AdvTxDesc d = makeAdvTxDesc(v->txBufs.iova + uint64_t(slot) * kTxBufSize, padded, wantTs);
+    ring[v->txProd].addr = d.addr;
+    ring[v->txProd].cmdTypeLen = d.cmdTypeLen;
+    ring[v->txProd].olinfo = d.olinfo;
+    v->txProd = ringNext(v->txProd, kTxRingSize);
+}
+
 static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool wantTs,
                                uint64_t * seqOut, uint64_t * machOut)
 {
@@ -1135,16 +1163,6 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
         v->ctr.c[kAvbCtrTxRateLimited]++;
         return kIOReturnNoResources;
     }
-    // In-flight <= kTxSlots and kTxRingSize is a multiple of kTxSlots, so the
-    // bounce slot of descriptor i is free once the descriptors before it are.
-    const uint32_t slot = v->txProd % kTxSlots;
-    uint8_t * buf = v->txBufs.va + uint64_t(slot) * kTxBufSize;
-    memcpy(buf, frame, len);
-    uint32_t padded = len;
-    if (padded < AVB_FRAME_MIN_LEN) {
-        memset(buf + len, 0, AVB_FRAME_MIN_LEN - len);
-        padded = AVB_FRAME_MIN_LEN;
-    }
 
     if (wantTs) {
         // Release a stale latch so this frame's timestamp can be captured.
@@ -1160,12 +1178,7 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
         }
     }
 
-    auto * ring = reinterpret_cast<volatile AdvTxDesc *>(v->txRing.va);
-    const AdvTxDesc d = makeAdvTxDesc(v->txBufs.iova + uint64_t(slot) * kTxBufSize, padded, wantTs);
-    ring[v->txProd].addr = d.addr;
-    ring[v->txProd].cmdTypeLen = d.cmdTypeLen;
-    ring[v->txProd].olinfo = d.olinfo;
-    v->txProd = ringNext(v->txProd, kTxRingSize);
+    stageFrame(v, frame, len, wantTs);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     OSSynchronizeIO();
 
@@ -1184,6 +1197,64 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
         v->tsMach = 0;
     }
     *seqOut = seq;
+    *machOut = mach;
+    return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
+}
+
+// kAvbSelSendFrames: queue up to AVB_TX_BATCH_MAX frames with ONE doorbell.
+// Frames are queued in order until one is refused (token bucket empty or the
+// ring full); `acceptedOut` says how many went in, so the client re-paces the
+// remainder instead of treating a partial interval as a failure.
+static kern_return_t sendFrames(IV * v, const uint8_t * in, uint32_t inLen,
+                                uint64_t * acceptedOut, uint64_t * machOut)
+{
+    *acceptedOut = 0;
+    *machOut = 0;
+    if (!ok(v) || v->stage != kAvbStageDatapath) {
+        return kIOReturnNotReady;
+    }
+    const TxBatchPlan plan = parseTxBatch(in, inLen);
+    if (!plan.valid) {
+        v->ctr.c[kAvbCtrTxBatchRejected]++;
+        return kIOReturnBadArgument;
+    }
+    checkTx(v);
+    // One clock reading for the whole batch: taking N tokens at a single
+    // instant is exactly the burst the bucket exists to allow.
+    const uint64_t now = hostNowNs(v);
+    uint32_t accepted = 0;
+    bool refused = false;
+    for (uint32_t i = 0; i < plan.count; i++) {
+        if (ringDistance(v->txCons, v->txProd, kTxRingSize) >= kTxSlots) {
+            refused = true;
+            break;
+        }
+        if (!tokenBucketTake(&v->txBucket, now)) {
+            v->ctr.c[kAvbCtrTxRateLimited]++;
+            refused = true;
+            break;
+        }
+        stageFrame(v, in + plan.f[i].offset, plan.f[i].len, false);
+        accepted++;
+    }
+    if (accepted == 0) {
+        // Nothing queued: no doorbell, and not an error -- the client sees
+        // accepted == 0 and backs off.
+        return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    OSSynchronizeIO();
+
+    const uint64_t mach = mach_absolute_time();
+    wrFlush(v, i210::kTdt0, v->txProd);
+
+    v->txSeq += accepted;
+    v->ctr.c[kAvbCtrTxFrames] += accepted;
+    v->ctr.c[kAvbCtrTxBatches]++;
+    if (refused) {
+        v->ctr.c[kAvbCtrTxBatchPartial]++;
+    }
+    *acceptedOut = accepted;
     *machOut = mach;
     return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
 }
@@ -1581,7 +1652,7 @@ static kern_return_t setStructOut(IOUserClientMethodArguments * a, const void * 
     return a->structureOutput != nullptr ? kIOReturnSuccess : kIOReturnNoMemory;
 }
 
-// Selectors 2, 3, 4, 5, 6, 7, 9, 10: refused to non-owners while an owner
+// Selectors 2, 3, 4, 5, 6, 7, 9, 10, 15: refused to non-owners while an owner
 // exists; with no owner anyone may call them (Phase 0b semantics).
 static bool isOwnerOnly(uint64_t selector)
 {
@@ -1591,6 +1662,7 @@ static bool isOwnerOnly(uint64_t selector)
     case kAvbSelInitDatapath:
     case kAvbSelPollRx:
     case kAvbSelSendFrame:
+    case kAvbSelSendFrames:
     case kAvbSelGetTxTimestamp:
     case kAvbSelShutdownDatapath:
     case kAvbSelStepClock:
@@ -1724,6 +1796,24 @@ AVBI210Driver::HandleUserMethod(AVBI210UserClient * client, uint64_t selector, I
         const kern_return_t ret =
             sendFrame(v, bytes, static_cast<uint32_t>(len), a->scalarInput[0] != 0, &seq, &mach);
         a->scalarOutput[0] = seq;
+        a->scalarOutput[1] = mach;
+        return ret;
+    }
+
+    case kAvbSelSendFrames: {
+        if (a->structureInput == nullptr) {
+            return kIOReturnBadArgument;
+        }
+        const auto * bytes = static_cast<const uint8_t *>(a->structureInput->getBytesNoCopy());
+        const size_t len = a->structureInput->getLength();
+        if (bytes == nullptr || len > AVB_TX_BATCH_BYTES_MAX) {
+            v->ctr.c[kAvbCtrTxBatchRejected]++;
+            return kIOReturnBadArgument;
+        }
+        uint64_t accepted = 0;
+        uint64_t mach = 0;
+        const kern_return_t ret = sendFrames(v, bytes, static_cast<uint32_t>(len), &accepted, &mach);
+        a->scalarOutput[0] = accepted;
         a->scalarOutput[1] = mach;
         return ret;
     }

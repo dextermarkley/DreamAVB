@@ -118,6 +118,7 @@ const IOUserClientMethodDispatch kDispatch[kAvbSelCount] = {
     /* 12 SetStreamFilter */ {dispatchToDriver, 0, 0, kVar, 0, 0},
     /* 13 RingAttach      */ {dispatchToDriver, 0, 1, 0, 3, 0},
     /* 14 RingDetach      */ {dispatchToDriver, 0, 0, 0, 0, 0},
+    /* 15 SendFrames      */ {dispatchToDriver, 0, 0, kVar, 2, 0},
 };
 static_assert(sizeof(kDispatch) / sizeof(kDispatch[0]) == kAvbSelCount, "I210 dispatch covers every selector");
 

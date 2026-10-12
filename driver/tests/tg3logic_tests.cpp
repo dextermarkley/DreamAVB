@@ -29,7 +29,7 @@ static int gChecks = 0;
 static_assert(sizeof(AvbInfo) == 60);
 static_assert(offsetof(AvbInfo, nic_kind) == 52);
 static_assert(offsetof(AvbInfo, clock_ctl) == 56);
-static_assert(AVB_ABI_VERSION == 3);
+static_assert(AVB_ABI_VERSION == 4);
 static_assert(kAvbSelBaseCount == 10);  // the BCM dext implements selectors 0..9 only
 static_assert(sizeof(AvbClockSample) == 24);
 static_assert(sizeof(AvbRxEntry) == 152);

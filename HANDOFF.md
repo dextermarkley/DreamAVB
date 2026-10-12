@@ -135,17 +135,50 @@ each. The verified 30 s / 60 s runs are under "Verified on hardware at
 four are described in `54c5d92`'s commit message and summarised under
 "Hard-won lessons".
 
-The dext for (5) is INSTALLED and attached: `284.2.33` is `activated enabled`
-and driving the I210 (`avb-probe info` reads the device through it). Do not
-re-activate for the TX ceiling. Note that `package.sh` derives its version
-from the wall clock, so a repackage bumps the PACKAGE version while the
-installed one stays `284.2.33` — a version-number artifact, not a content
-difference.
+**64 channels each way are bound and accepted by the 16R.** Eight inbound
+streams (`--all-inbound-streams`) and eight outbound talkers, all eight
+`Listener Ready` in both directions, with the 8-stream AEM (8 `STREAM_OUTPUT`s,
+64 `AUDIO_CLUSTER`s) the 16R needs in order to bind them.
 
-The HAL plug-in IS installed (`/Library/Audio/Plug-Ins/HAL/AVBAudio.driver`,
-installed 2026-10-12 09:10) and is producing into the output ring: a duplex run
-reports `0 underruns` and a non-zero outbound peak, which is only possible with
-a live producer. The earlier note that it was missing is stale.
+**The one thing NOT yet sustained is the outbound frame rate, and it needs a
+REBOOT, not code.** Eight class-A streams need 64000 frames/s. A single
+`SendFrame` user-client call measures ~27 us, so the per-frame path saturates
+at ~37000/s — measured, with `0 rate-limited`, so the token bucket is no
+longer the constraint:
+
+```
+TX over the 20.0s armed window: 37030 frames/s attempted, 37030/s reached the
+wire via one call PER FRAME (dext predates ABI v4; it cannot sustain 8 streams)
+```
+
+ABI **v4** adds `sel::SEND_FRAMES` (selector 15), which queues up to 8 frames
+per call behind one doorbell; the C++ host test
+`batched full-width talker unthrottled (64000 frames/s)` covers it. The daemon
+picks the path from the ABI the ATTACHED dext reports (never from our own
+compiled constant) and says which one it used, so a silent fallback cannot look
+like a batched run.
+
+**Why a reboot: `systemextensionsctl` cannot be trusted here.** A PCI-matched
+dext does not terminate while it owns its device, so an `activate` stages the
+new build, marks it `activated enabled`, and the kernel keeps running the OLD
+one. The list has reported a version as active that was never loaded three
+times now. `avb-installer status` reports the GROUND TRUTH by code-signing
+hash and is the only instrument to trust:
+
+```
+attached in the kernel: code hash efbe79aa... = staged version 284.19.2
+this bundle would install: code hash 91a1acd2... — NOT yet running
+```
+
+After a reboot, re-run `avb-installer activate` (no sudo needed), confirm with
+`avb-installer status` that the hashes MATCH, then a duplex run should report
+`via ONE CALL PER INTERVAL` and ~64000 frames/s.
+
+The HAL plug-in IS installed (`/Library/Audio/Plug-Ins/HAL/AVBAudio.driver`)
+and is at **64 channels** in and out; `avb_audioring::DEVICE_CHANNELS` is the
+single source of that width because the plug-in refuses a ring that disagrees.
+A duplex run with nothing playing shows `outbound peak 0` and output-ring
+underruns — that is no audio source, not a broken path.
 
 To re-verify the whole chain, nothing needs to be run by hand — use the
 companion app's **Audio** toggle. For a bounded CLI run instead:
