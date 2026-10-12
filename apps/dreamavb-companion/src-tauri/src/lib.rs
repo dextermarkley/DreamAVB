@@ -653,22 +653,22 @@ fn published_effective_clock() -> Option<EffectiveClock> {
 /// Build the UI snapshot: the user's selection from disk, and what is actually
 /// in force from the daemon.
 fn clock_source_info(cfg: Config, warnings: Vec<String>) -> ClockSourceInfo {
-    let (effective_label, effective_reason, network_disciplined) =
-        match published_effective_clock() {
-            Some(e) => (
-                e.label().to_string(),
-                e.reason().to_string(),
-                e.is_network_disciplined(),
-            ),
-            // No daemon, so nothing is sourcing audio at all. Saying "Mac
-            // internal" here would claim a clock is in use when no stream
-            // exists; say plainly that it is not running.
-            None => (
-                "—".to_string(),
-                "no daemon running; this takes effect when a stream starts".to_string(),
-                false,
-            ),
-        };
+    let (effective_label, effective_reason, network_disciplined) = match published_effective_clock()
+    {
+        Some(e) => (
+            e.label().to_string(),
+            e.reason().to_string(),
+            e.is_network_disciplined(),
+        ),
+        // No daemon, so nothing is sourcing audio at all. Saying "Mac
+        // internal" here would claim a clock is in use when no stream
+        // exists; say plainly that it is not running.
+        None => (
+            "—".to_string(),
+            "no daemon running; this takes effect when a stream starts".to_string(),
+            false,
+        ),
+    };
     ClockSourceInfo {
         selected: cfg.clock_source.as_str().to_string(),
         options: clock_options(),
@@ -708,16 +708,78 @@ async fn set_clock_source(value: String) -> Result<ClockSourceInfo, String> {
     Ok(clock_source_info(loaded, warnings))
 }
 
-/// Toggle the main popover window near the tray.
-fn toggle_window(app: &tauri::AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        if w.is_visible().unwrap_or(false) {
-            let _ = w.hide();
-        } else {
-            let _ = w.show();
-            let _ = w.set_focus();
-        }
+/// Has the popover actually taken focus since it was last shown?
+///
+/// Clicking a menu-bar status item does NOT give the popover key focus on
+/// macOS — the status item keeps it — so `WindowEvent::Focused(false)` can
+/// arrive immediately after `show()`. The hide-on-blur handler then closes the
+/// window in the same breath as opening it, which looks exactly like a tray
+/// icon that does nothing. So a blur is only honoured once the window has
+/// genuinely been focused.
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static POPOVER_FOCUSED: AtomicBool = AtomicBool::new(false);
+
+/// Show the popover under the tray icon, or hide it if it is already up.
+///
+/// `icon_rect` is the status item's screen rectangle from the click event.
+/// Without it the window keeps whatever position the OS last gave it, which is
+/// why this used to open nowhere near the menu bar — the function was
+/// documented as positioning "near the tray" but never set a position at all.
+fn toggle_window(app: &tauri::AppHandle, icon_rect: Option<tauri::Rect>) {
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
+    if w.is_visible().unwrap_or(false) {
+        let _ = w.hide();
+        return;
     }
+    if let Some(rect) = icon_rect {
+        position_under(&w, rect);
+    }
+    POPOVER_FOCUSED.store(false, Ordering::SeqCst);
+    let _ = w.show();
+    // An Accessory app has no Dock icon and is not "active", so the window
+    // will not come forward on its own: ask for the app AND the window.
+    #[cfg(target_os = "macos")]
+    let _ = w.set_focus();
+    let _ = w.set_always_on_top(true);
+}
+
+/// Place the popover centred under the status item, clamped onto the screen.
+fn position_under(w: &tauri::WebviewWindow, rect: tauri::Rect) {
+    use tauri::{PhysicalPosition, Position, Size};
+
+    let scale = w.scale_factor().unwrap_or(1.0);
+    let icon = match (rect.position, rect.size) {
+        (Position::Physical(p), Size::Physical(s)) => (p.x as f64, p.y as f64, s.width as f64),
+        (Position::Logical(p), Size::Logical(s)) => (p.x * scale, p.y * scale, s.width * scale),
+        // Mixed units: fall back to the position alone, width unknown.
+        (Position::Physical(p), _) => (p.x as f64, p.y as f64, 0.0),
+        (Position::Logical(p), _) => (p.x * scale, p.y * scale, 0.0),
+    };
+    let (icon_x, icon_y, icon_w) = icon;
+    let win_w = w
+        .outer_size()
+        .map(|s| s.width as f64)
+        .unwrap_or(360.0 * scale);
+    // Centre on the icon, then nudge inside the screen's right edge so the
+    // popover is never half off-screen for an icon near the corner.
+    let mut x = icon_x + icon_w / 2.0 - win_w / 2.0;
+    if let Ok(Some(mon)) = w.current_monitor() {
+        let m = mon.position();
+        let size = mon.size();
+        let left = f64::from(m.x);
+        let right = left + f64::from(size.width);
+        let margin = 8.0 * scale;
+        x = x.max(left + margin).min(right - win_w - margin);
+    }
+    // Just below the menu bar, which is where the icon's rect ends.
+    let y = icon_y + 4.0 * scale;
+    let _ = w.set_position(Position::Physical(PhysicalPosition {
+        x: x.round() as i32,
+        y: y.round() as i32,
+    }));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -739,8 +801,13 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // "Open" as well as the icon click: a left-click toggle depends on
+            // the tray event arriving as Left+Up, and if anything about that
+            // differs the app looks dead with no other way in. A menu item is
+            // a deterministic path — right-click the icon and pick it.
+            let open = MenuItem::with_id(app, "open", "Open DreamAVB", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit DreamAVB", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&quit])?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
 
             // No unwrap on the icon (review L9): a missing bundle icon used to
             // panic during setup and take the whole app down at launch. A tray
@@ -752,31 +819,44 @@ pub fn run() {
                 tray = tray.icon(icon.clone());
             }
             let _tray = tray
-                .on_menu_event(|app, event| {
-                    if event.id.as_ref() == "quit" {
-                        app.exit(0);
-                    }
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => app.exit(0),
+                    // No icon rect from a menu item, so the popover keeps its
+                    // last position rather than moving.
+                    "open" => toggle_window(app, None),
+                    _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
+                        rect,
                         ..
                     } = event
                     {
-                        toggle_window(tray.app_handle());
+                        toggle_window(tray.app_handle(), Some(rect));
                     }
                 })
                 .build(app)?;
 
             // Menu-bar popover behaviour: close when it loses focus, the way
-            // every other menu-bar app behaves (review L11).
+            // every other menu-bar app behaves (review L11) — but ONLY once it
+            // has actually been focused. Clicking a status item does not give
+            // the popover key focus on macOS, so a blur can arrive straight
+            // after `show()`; hiding on that closed the window in the same
+            // breath as opening it, which looked like a dead tray icon.
             if let Some(w) = app.get_webview_window("main") {
                 let hide = w.clone();
-                w.on_window_event(move |ev| {
-                    if let tauri::WindowEvent::Focused(false) = ev {
+                w.on_window_event(move |ev| match ev {
+                    tauri::WindowEvent::Focused(true) => {
+                        POPOVER_FOCUSED.store(true, Ordering::SeqCst);
+                    }
+                    tauri::WindowEvent::Focused(false)
+                        if POPOVER_FOCUSED.load(Ordering::SeqCst) =>
+                    {
                         let _ = hide.hide();
                     }
+                    _ => {}
                 });
             }
             Ok(())
