@@ -350,6 +350,132 @@ pub fn clock_source_location(model: &ListenerModel) -> (u16, u16) {
 /// The clock-source type for CLOCK_SOURCE 1 (INPUT_STREAM, §9.3).
 pub const REFERENCE_CLOCK_SOURCE_TYPE: u16 = clock_source::INPUT_STREAM;
 
+// --- Talker direction: our output format, derived from the 16R's AEM --------
+//
+// The mirror of `listener_model`. For the listener direction we read the 16R's
+// STREAM_OUTPUTs (what it sends); for the talker direction we must read its
+// STREAM_INPUTs (what it is configured to RECEIVE) and match one exactly.
+//
+// AGENTS.md: sample rates, channel counts and stream counts are never
+// hardcoded. [`talker_output_format`] is the only thing allowed to choose our
+// output format, so the rate/channel/spf our packetizer uses cannot disagree
+// with the sink we are sending to.
+
+/// Why our talker output format could not be derived from the 16R's AEM.
+///
+/// Every variant is a refusal to transmit. A format we guess wrong is worse
+/// than not streaming: the 16R silently discards mismatched packets, which
+/// looks exactly like a transmit fault.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TalkerFormatError {
+    /// The 16R has no STREAM_INPUT at `listener_uid` (we read the descriptor
+    /// count from its CONFIGURATION, so this means the sink does not exist).
+    NoSuchStreamInput { listener_uid: u16, available: usize },
+    /// The sink's current format is not AAF (e.g. CRF or IEC 61883-6). We only
+    /// packetize AAF, and converting is not a thing a talker may decide to do.
+    NotAaf { listener_uid: u16, subtype: String },
+    /// AAF, but outside what this build can packetize (depth/nsr/channels/spf).
+    Undecodable { listener_uid: u16, raw: u64 },
+    /// The `ut` ("up to") bit is set, so channels/spf are MAXIMA rather than
+    /// exact values. A talker has to emit an exact channel count and an exact
+    /// samples-per-frame, so there is nothing here to derive from.
+    UpToFormat { listener_uid: u16 },
+    /// The 16R's AUDIO_UNIT runs at a different rate than the sink's format
+    /// claims. Trusting either one alone would be a guess, so we refuse.
+    RateMismatch { audio_unit_hz: u32, stream_hz: u32 },
+}
+
+impl std::fmt::Display for TalkerFormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TalkerFormatError::NoSuchStreamInput {
+                listener_uid,
+                available,
+            } => write!(
+                f,
+                "the 16R has no STREAM_INPUT {listener_uid} (it exposes {available}); pass --listener-uid below {available}"
+            ),
+            TalkerFormatError::NotAaf {
+                listener_uid,
+                subtype,
+            } => write!(
+                f,
+                "16R STREAM_INPUT {listener_uid} is configured for {subtype}, not AAF; this build only packetizes AAF"
+            ),
+            TalkerFormatError::Undecodable { listener_uid, raw } => write!(
+                f,
+                "16R STREAM_INPUT {listener_uid} current format 0x{raw:016x} is AAF but outside this build's supported depth/rate/channels/spf"
+            ),
+            TalkerFormatError::UpToFormat { listener_uid } => write!(
+                f,
+                "16R STREAM_INPUT {listener_uid} advertises an 'up to' format, so its channel count and samples-per-frame are maxima, not exact values to transmit"
+            ),
+            TalkerFormatError::RateMismatch {
+                audio_unit_hz,
+                stream_hz,
+            } => write!(
+                f,
+                "16R AUDIO_UNIT runs at {audio_unit_hz} Hz but its STREAM_INPUT format says {stream_hz} Hz"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TalkerFormatError {}
+
+/// Our talker output format, taken from the 16R STREAM_INPUT we are about to
+/// bind (`listener_uid`). This is the ONLY place the talker's rate, channel
+/// count and samples-per-frame come from.
+///
+/// `audio_unit_hz` is the 16R's AUDIO_UNIT current sampling rate when we read
+/// that descriptor; `None` skips the cross-check rather than inventing a rate.
+///
+/// We use `current_format` (what the sink is configured for right now), not
+/// the `formats` list of everything it could accept: picking from the list
+/// would mean choosing a configuration the 16R is not actually in.
+pub fn talker_output_format(
+    inputs: &[StreamDesc],
+    audio_unit_hz: Option<u32>,
+    listener_uid: u16,
+) -> Result<StreamFormat, TalkerFormatError> {
+    let sink =
+        inputs
+            .get(usize::from(listener_uid))
+            .ok_or(TalkerFormatError::NoSuchStreamInput {
+                listener_uid,
+                available: inputs.len(),
+            })?;
+    let fmt = sink.current_format;
+
+    let aaf = fmt.aaf().ok_or_else(|| TalkerFormatError::NotAaf {
+        listener_uid,
+        subtype: fmt.subtype_name(),
+    })?;
+    // `ut` makes channels/spf upper bounds, so there is no exact format to
+    // derive. Checked BEFORE `decodable()`, which also folds in `!ut`: both
+    // would refuse, but only this one tells the user why.
+    if aaf.ut {
+        return Err(TalkerFormatError::UpToFormat { listener_uid });
+    }
+    if !fmt.decodable() {
+        return Err(TalkerFormatError::Undecodable {
+            listener_uid,
+            raw: fmt.0,
+        });
+    }
+    // Both descriptors describe the same hardware, so a disagreement means we
+    // do not understand its configuration; refuse rather than pick a side.
+    if let (Some(au_hz), Some(stream_hz)) = (audio_unit_hz, aaf.nsr_hz()) {
+        if au_hz != stream_hz {
+            return Err(TalkerFormatError::RateMismatch {
+                audio_unit_hz: au_hz,
+                stream_hz,
+            });
+        }
+    }
+    Ok(fmt)
+}
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {
@@ -556,5 +682,127 @@ mod tests {
         assert_eq!(fnv1a32(b""), 0x811c_9dc5);
         // "a" -> 0xe40c292c (reference FNV-1a 32).
         assert_eq!(fnv1a32(b"a"), 0xe40c_292c);
+    }
+
+    // --- talker_output_format ---------------------------------------------
+    //
+    // The format the talker packetizes with must come from the 16R, not from a
+    // constant. The daemon previously hardcoded the Milan base format
+    // (0x0205_0220_0200_6000), which happens to match this 16R and would
+    // silently mismatch a differently-configured one.
+
+    /// The format the daemon used to hardcode. Named here ONLY so a test can
+    /// assert the derivation does not return it for a sink configured
+    /// otherwise.
+    const OLD_HARDCODED: u64 = 0x0205_0220_0200_6000;
+
+    fn aaf_spf(nsr: u8, depth: u8, ch: u16, spf: u16, ut: bool) -> StreamFormat {
+        StreamFormat::from_aaf(avb_avtp::stream_format::AafFormat {
+            ut,
+            nsr,
+            format: avb_avtp::aaf::format::INT_32BIT,
+            bit_depth: depth,
+            channels: ch,
+            spf,
+        })
+    }
+
+    #[test]
+    fn derives_the_sinks_own_format_not_the_old_hardcoded_default() {
+        // A 16R sink configured for 96 kHz / 4 ch / 12 spf — nothing like the
+        // Milan base. The derivation must follow the hardware.
+        let sink = aaf_spf(7, 32, 4, 12, false);
+        let got = talker_output_format(&[out_stream("In 1", sink, 0)], Some(96_000), 0).unwrap();
+        assert_eq!(got, sink);
+        assert_ne!(
+            got.0, OLD_HARDCODED,
+            "derivation returned the old hardcoded Milan base format for a 96 kHz/4 ch sink"
+        );
+        let a = got.aaf().unwrap();
+        assert_eq!((a.nsr_hz(), a.channels, a.spf), (Some(96_000), 4, 12));
+    }
+
+    #[test]
+    fn picks_the_sink_named_by_listener_uid() {
+        let first = aaf_spf(5, 32, 8, 6, false);
+        let second = aaf_spf(5, 32, 2, 6, false);
+        let inputs = [out_stream("In 1", first, 0), out_stream("In 2", second, 0)];
+        assert_eq!(
+            talker_output_format(&inputs, Some(48_000), 1).unwrap(),
+            second
+        );
+        assert_eq!(
+            talker_output_format(&inputs, Some(48_000), 0).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn a_sink_that_does_not_exist_is_refused() {
+        let inputs = [out_stream("In 1", aaf_spf(5, 32, 8, 6, false), 0)];
+        assert_eq!(
+            talker_output_format(&inputs, Some(48_000), 3),
+            Err(TalkerFormatError::NoSuchStreamInput {
+                listener_uid: 3,
+                available: 1
+            })
+        );
+        // No sinks at all is the same refusal, not a panic.
+        assert!(matches!(
+            talker_output_format(&[], Some(48_000), 0),
+            Err(TalkerFormatError::NoSuchStreamInput { available: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn a_non_aaf_sink_is_refused() {
+        let crf = StreamFormat(0x0410_6001_0000_BB80);
+        let err = talker_output_format(&[out_stream("In 1", crf, 0)], Some(48_000), 0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TalkerFormatError::NotAaf {
+                    listener_uid: 0,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_up_to_format_is_refused_because_channels_and_spf_are_maxima() {
+        // `ut` means "up to": 8 ch / 6 spf are upper bounds, so there is no
+        // exact format to transmit.
+        let upto = aaf_spf(5, 32, 8, 6, true);
+        assert_eq!(
+            talker_output_format(&[out_stream("In 1", upto, 0)], Some(48_000), 0),
+            Err(TalkerFormatError::UpToFormat { listener_uid: 0 })
+        );
+        // The same format without `ut` is accepted, so the refusal is the
+        // bit's doing and not something else about the format.
+        let exact = aaf_spf(5, 32, 8, 6, false);
+        assert!(talker_output_format(&[out_stream("In 1", exact, 0)], Some(48_000), 0).is_ok());
+    }
+
+    #[test]
+    fn audio_unit_and_sink_disagreeing_on_rate_is_refused() {
+        let sink = aaf_spf(5, 32, 8, 6, false); // 48 kHz
+        assert_eq!(
+            talker_output_format(&[out_stream("In 1", sink, 0)], Some(96_000), 0),
+            Err(TalkerFormatError::RateMismatch {
+                audio_unit_hz: 96_000,
+                stream_hz: 48_000
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_audio_unit_rate_skips_the_cross_check_rather_than_inventing_one() {
+        let sink = aaf_spf(5, 32, 8, 6, false);
+        assert_eq!(
+            talker_output_format(&[out_stream("In 1", sink, 0)], None, 0).unwrap(),
+            sink
+        );
     }
 }

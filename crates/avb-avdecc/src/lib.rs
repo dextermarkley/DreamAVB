@@ -33,5 +33,7 @@ pub use acmp::{Acmpdu, A5_RESOURCE_STATUSES};
 pub use adp::{Adpdu, EntityTable};
 pub use aecp::{AecpEngine, AemPdu, MvuPdu};
 pub use controller::{BindOutcome, BindTarget, Binder};
-pub use derive::{listener_model, DeriveError, ListenerModel};
+pub use derive::{
+    listener_model, talker_output_format, DeriveError, ListenerModel, TalkerFormatError,
+};
 pub use entity::{ListenerEntity, ListenerSm};

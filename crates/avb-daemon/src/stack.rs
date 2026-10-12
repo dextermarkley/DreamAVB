@@ -2420,28 +2420,47 @@ fn talker_loop(
     listener: Option<u64>,
     listener_uid: u16,
 ) -> Result<(), Exit> {
-    use avb_avtp::stream_format::{AafFormat, StreamFormat};
+    use avb_avtp::stream_format::AafFormat;
     use avb_avtp::talker::AafTalker;
     use avb_core::eth::{EthHeader, VlanTag};
     use avb_core::{StreamId, TxFrame};
 
     use crate::dextio::DextPort;
 
-    // The output format MUST match the 16R's STREAM_INPUT exactly (Milan: AAF
-    // INT_32BIT, 48 kHz, 8 ch, 6 spf). The real value is read from the 16R's
-    // AEM (never hardcoded) during bring-up; the Milan base format is the
-    // bootstrap default used until the AEM read lands.
-    let stream_format = StreamFormat(0x0205_0220_0200_6000);
-    let fmt: AafFormat = stream_format.aaf().ok_or(Exit::DextFault)?;
-    let hz = fmt.nsr_hz().ok_or(Exit::DextFault)? as u64;
-    let spf = usize::from(fmt.spf);
-    let channels = usize::from(fmt.channels);
-
     // Our talker stream id = our MAC + a unique id (0 for the first output
     // stream). The 16R identifies the stream it listens to by this id.
     let info = dext.device().info().map_err(|_| Exit::DextFault)?;
     let our_mac = avb_core::MacAddr::new(info.mac);
     let our_stream_id = StreamId::from_parts(our_mac, 0);
+    let our_id = avb_core::Eui64::from_mac(our_mac);
+
+    // ---- The output format, read from the 16R ------------------------------
+    //
+    // AGENTS.md: rates, channel counts and stream counts are NEVER hardcoded.
+    // This used to be a literal Milan base format (48 kHz / 8 ch / 6 spf),
+    // which happens to match this 16R and would silently mismatch a
+    // differently-configured one — the 16R would then discard every packet,
+    // which looks exactly like a transmit fault.
+    //
+    // Ordering note: the format comes from the 16R, our entity model is built
+    // FROM the format, and our ADP is built from the model. So discovery has to
+    // run before the model exists, and we advertise ourselves as soon as it
+    // does — still before any ACMP, which is what a Milan entity requires
+    // (review H3).
+    let listener_timeout_ns = opts.discover_timeout.saturating_mul(1_000_000_000);
+    let (listener_id, listener_mac) =
+        discover_listener(opts, log, dext, our_id, our_mac, listener)?;
+    let peers = AecpPeers {
+        our_mac,
+        our_id,
+        target: listener_id,
+        target_mac: listener_mac,
+    };
+    let stream_format = derive_talker_format(log, dext, peers, listener_uid, listener_timeout_ns)?;
+    let fmt: AafFormat = stream_format.aaf().ok_or(Exit::DextFault)?;
+    let hz = fmt.nsr_hz().ok_or(Exit::DextFault)? as u64;
+    let spf = usize::from(fmt.spf);
+    let channels = usize::from(fmt.channels);
 
     // Create the OUTPUT ring (daemon = consumer, plug-in = producer). We create
     // it so the file exists with world perms before the plug-in attaches, the
@@ -2486,10 +2505,6 @@ fn talker_loop(
     // The packetizer for our stream.
     let mut talker = AafTalker::new(our_stream_id, fmt).ok_or(Exit::DextFault)?;
 
-    // Our entity id is the EUI-64 of our MAC (FF:FE inserted), exactly as every
-    // other path derives it — the 16R keys ACMP on it (review H4).
-    let our_id = avb_core::Eui64::from_mac(our_mac);
-
     // Our AEM, so the 16R can ENUMERATE us rather than merely discover us.
     //
     // ADP alone only tells a Milan controller that an entity exists; it then
@@ -2522,11 +2537,12 @@ fn talker_loop(
     );
     let mut entity = avb_avdecc::entity::TalkerEntity::new(model);
 
-    // Find the 16R (the LISTENER for this direction) — from --listener, or by
-    // ADP discovery — and announce ourselves as a talker so it knows us before
-    // we ask it to connect (review H3; a Milan entity ignores ACMP from an
-    // entity it has not discovered).
-    let listener_id = discover_listener(opts, log, dext, &mut entity, our_mac, listener)?;
+    // Announce ourselves now that the model is real — it carries the format we
+    // just derived, so this ADP advertises an entity_model_id that will not
+    // change underneath the 16R. This must happen BEFORE any ACMP: a Milan
+    // entity ignores ACMP from an entity it has not discovered (review H3).
+    let adp = entity.advertise();
+    send_adp(dext, our_mac, &adp);
 
     // Connect as controller: tell the 16R to connect its STREAM_INPUT
     // [listener_uid] to our talker stream. Mirror of the record path's
@@ -3281,19 +3297,309 @@ fn send_aem_response(
     }
 }
 
-/// Resolve the 16R's entity id — the LISTENER for the playback direction.
-/// `--listener <id>` wins; otherwise discover via ADP exactly like the record
-/// path (the 16R is the sole AVDECC talker on the link). Advertises our own
-/// talker entity while waiting. Exits `TalkerNotFound` (6) on timeout or when
-/// several candidates make the choice ambiguous.
+/// The two ends of an AECP exchange: who we are, and the entity we are talking
+/// to. Bundled because every AECP helper needs all four and they always travel
+/// together.
+#[derive(Clone, Copy)]
+struct AecpPeers {
+    our_mac: avb_core::MacAddr,
+    our_id: avb_core::Eui64,
+    target: avb_core::Eui64,
+    target_mac: avb_core::MacAddr,
+}
+
+/// Read a set of AEM descriptors from the target over AECP `READ_DESCRIPTOR`,
+/// returning the raw descriptor bytes keyed by the `(descriptor_type,
+/// descriptor_index)` the response itself echoes.
+///
+/// Only SUCCESS responses are stored. A refusal (`NO_SUCH_DESCRIPTOR`,
+/// `NOT_IMPLEMENTED`) is logged and left ABSENT, so the caller can tell "the
+/// 16R said no" from "nothing came back" by which keys are missing rather than
+/// by a sentinel value.
+fn read_descriptors(
+    log: &Logger,
+    dext: &mut RealDext,
+    peers: AecpPeers,
+    want: &[(u16, u16)],
+    timeout_ns: u64,
+) -> Result<std::collections::BTreeMap<(u16, u16), Vec<u8>>, Exit> {
+    use avb_avdecc::aecp::{AecpEngine, AecpOutcome, AemPdu};
+    use avb_avdecc::constants::{aecp_msg, aecp_status, aem_cmd, subtype};
+    use avb_avtp::common::ETHERTYPE_AVTP;
+    use avb_core::eth::{EthFrame, EthHeader};
+    use avb_core::time::{MachTicks, Timebase};
+    use avb_core::TxFrame;
+
+    use crate::dextio::{DextPort, SendResult};
+
+    let info = dext.device().info().map_err(|_| Exit::DextFault)?;
+    let tb = Timebase {
+        numer: info.tb_numer,
+        denom: info.tb_denom,
+    };
+    let now_mach = || MachTicks(unsafe { mach2::mach_time::mach_absolute_time() });
+    let start = now_mach();
+    let ns_since = |t: MachTicks| tb.ticks_to_ns(now_mach().ticks_since(t));
+
+    // READ_DESCRIPTOR command payload (§7.4.5): configuration_index(2),
+    // reserved(2), descriptor_type(2), descriptor_index(2).
+    let read_payload = |dtype: u16, dindex: u16| -> Vec<u8> {
+        let mut v = Vec::with_capacity(8);
+        v.extend_from_slice(&0u16.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes());
+        v.extend_from_slice(&dtype.to_be_bytes());
+        v.extend_from_slice(&dindex.to_be_bytes());
+        v
+    };
+
+    let mut eng = AecpEngine::new(peers.our_id);
+    for &(dt, di) in want {
+        eng.enqueue(
+            peers.target,
+            peers.target_mac,
+            aem_cmd::READ_DESCRIPTOR,
+            read_payload(dt, di),
+        );
+    }
+
+    let mut got: std::collections::BTreeMap<(u16, u16), Vec<u8>> = Default::default();
+    loop {
+        if shutdown_requested() {
+            return Err(Exit::Interrupted);
+        }
+        if eng.queued_count() == 0 && eng.in_flight_count() == 0 {
+            break;
+        }
+        if ns_since(start) >= timeout_ns {
+            log.log(
+                Level::Warn,
+                "aecp",
+                &format!(
+                    "AEM read timed out with {} of {} descriptors in hand",
+                    got.len(),
+                    want.len()
+                ),
+            );
+            break;
+        }
+        let now = ns_since(start);
+
+        if let Some(send) = eng.poll(now) {
+            let hdr = EthHeader {
+                dst: send.target_mac,
+                src: peers.our_mac,
+                vlan: None,
+                ethertype: ETHERTYPE_AVTP,
+            };
+            if let Ok(f) = TxFrame::build(&hdr, &send.frame, false, 0) {
+                // Busy / NoResources are retried by the engine's own aging.
+                if matches!(dext.send(f.bytes(), false, 0), SendResult::Fatal) {
+                    return Err(Exit::DextFault);
+                }
+            }
+        }
+
+        for slot in dext.rx_ctl() {
+            let Ok(p) = EthFrame::parse(&slot.data) else {
+                continue;
+            };
+            if p.hdr.ethertype != ETHERTYPE_AVTP
+                || p.payload.first().copied() != Some(subtype::AECP)
+            {
+                continue;
+            }
+            let Some(resp) = AemPdu::decode(p.payload) else {
+                continue;
+            };
+            if resp.message_type != aecp_msg::AEM_RESPONSE {
+                continue;
+            }
+            let Some(AecpOutcome::Response(r)) = eng.on_rx(&resp, now) else {
+                continue;
+            };
+            if r.command_type != aem_cmd::READ_DESCRIPTOR {
+                continue;
+            }
+            // Response payload: configuration_index(2) reserved(2) descriptor.
+            let Some(d) = r.payload.get(4..) else {
+                continue;
+            };
+            if d.len() < 4 {
+                continue;
+            }
+            let dt = u16::from_be_bytes([*d.first().unwrap_or(&0), *d.get(1).unwrap_or(&0)]);
+            let di = u16::from_be_bytes([*d.get(2).unwrap_or(&0), *d.get(3).unwrap_or(&0)]);
+            if r.status != aecp_status::SUCCESS {
+                log.log(
+                    Level::Warn,
+                    "aecp",
+                    &format!(
+                        "16R refused descriptor type=0x{dt:04x} index={di} with status {}",
+                        r.status
+                    ),
+                );
+                continue;
+            }
+            got.insert((dt, di), d.to_vec());
+        }
+
+        let (_resends, outcomes) = eng.on_tick(now);
+        for o in outcomes {
+            if let AecpOutcome::TimedOut {
+                command_type,
+                sequence_id,
+            } = o
+            {
+                log.log(
+                    Level::Warn,
+                    "aecp",
+                    &format!("AEM read 0x{command_type:04x} seq {sequence_id} timed out"),
+                );
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    Ok(got)
+}
+
+/// Derive our talker output format from the 16R's own AEM.
+///
+/// `AGENTS.md`: sample rates, channel counts and stream counts are never
+/// hardcoded — they come from the 16R. This walks the part of its AEM that
+/// decides our output format: CONFIGURATION 0 for how many STREAM_INPUT sinks
+/// it has, each of those sinks, and AUDIO_UNIT 0 for the rate cross-check.
+/// [`avb_avdecc::talker_output_format`] then picks the sink we are about to
+/// bind.
+///
+/// Any failure is a refusal to transmit, never a fallback to a default. A
+/// format that does not match the sink makes the 16R discard every packet,
+/// which on the wire is indistinguishable from a transmit fault.
+fn derive_talker_format(
+    log: &Logger,
+    dext: &mut RealDext,
+    peers: AecpPeers,
+    listener_uid: u16,
+    timeout_ns: u64,
+) -> Result<avb_avtp::stream_format::StreamFormat, Exit> {
+    use avb_avdecc::aem::desc::{decode_audio_unit, decode_stream};
+    use avb_avdecc::constants::desc as aem_desc;
+
+    // Pass 1: the CONFIGURATION (for the STREAM_INPUT count) and the
+    // AUDIO_UNIT (for its current sampling rate).
+    let first = read_descriptors(
+        log,
+        dext,
+        peers,
+        &[(aem_desc::CONFIGURATION, 0), (aem_desc::AUDIO_UNIT, 0)],
+        timeout_ns,
+    )?;
+
+    let Some(config) = first.get(&(aem_desc::CONFIGURATION, 0)) else {
+        log.log(
+            Level::Error,
+            "aecp",
+            "the 16R did not return its CONFIGURATION descriptor, so the output format cannot be derived from its AEM (AGENTS.md forbids assuming one)",
+        );
+        return Err(Exit::TalkerNotFound);
+    };
+    // How many STREAM_INPUT sinks it exposes, from its own descriptor_counts.
+    let sink_count = config_descriptor_counts(config)
+        .into_iter()
+        .find(|(dt, _)| *dt == aem_desc::STREAM_INPUT)
+        .map(|(_, n)| n)
+        .unwrap_or(0);
+    if sink_count == 0 {
+        log.log(
+            Level::Error,
+            "aecp",
+            "the 16R's CONFIGURATION lists no STREAM_INPUT descriptors, so it has no sink to play to",
+        );
+        return Err(Exit::TalkerNotFound);
+    }
+
+    let audio_unit_hz = first
+        .get(&(aem_desc::AUDIO_UNIT, 0))
+        .and_then(|b| decode_audio_unit(b))
+        .map(|au| au.current_sampling_rate);
+
+    // Pass 2: every STREAM_INPUT, so the refusal can name how many exist and
+    // the derived format is indexed by the real descriptor index.
+    let want: Vec<(u16, u16)> = (0..sink_count)
+        .map(|i| (aem_desc::STREAM_INPUT, i))
+        .collect();
+    let sinks_raw = read_descriptors(log, dext, peers, &want, timeout_ns)?;
+
+    // Dense in descriptor index, so index i really is STREAM_INPUT i. A gap
+    // (the 16R refused one) truncates rather than silently shifting the rest.
+    let mut sinks = Vec::with_capacity(usize::from(sink_count));
+    for i in 0..sink_count {
+        match sinks_raw
+            .get(&(aem_desc::STREAM_INPUT, i))
+            .and_then(|b| decode_stream(b))
+        {
+            Some(s) => sinks.push(s),
+            None => break,
+        }
+    }
+    log.log(
+        Level::Info,
+        "aecp",
+        &format!(
+            "16R AEM: {} of {} STREAM_INPUT sinks read, AUDIO_UNIT rate {}",
+            sinks.len(),
+            sink_count,
+            audio_unit_hz
+                .map(|h| format!("{h} Hz"))
+                .unwrap_or_else(|| "unknown".into())
+        ),
+    );
+
+    match avb_avdecc::talker_output_format(&sinks, audio_unit_hz, listener_uid) {
+        Ok(fmt) => {
+            let a = fmt.aaf();
+            log.log(
+                Level::Info,
+                "aecp",
+                &format!(
+                    "output format derived from 16R STREAM_INPUT {listener_uid}: 0x{:016x} ({})",
+                    fmt.0,
+                    a.map(|a| format!(
+                        "{} Hz, {} ch, {} spf, {}-bit",
+                        a.nsr_hz().unwrap_or(0),
+                        a.channels,
+                        a.spf,
+                        a.bit_depth
+                    ))
+                    .unwrap_or_else(|| "not AAF".into())
+                ),
+            );
+            Ok(fmt)
+        }
+        Err(e) => {
+            log.log(
+                Level::Error,
+                "aecp",
+                &format!("cannot derive our output format from the 16R's AEM: {e}"),
+            );
+            Err(Exit::TalkerNotFound)
+        }
+    }
+}
+
+/// Resolve the 16R's entity id AND MAC — the LISTENER for the playback
+/// direction. `--listener <id>` selects which entity to wait for; otherwise the
+/// sole AVDECC entity on the link is taken, exactly like the record path. The
+/// MAC is required because the AEM read that derives our output format is a
+/// unicast AECP command. Exits `TalkerNotFound` (6) on timeout or when several
+/// candidates make the choice ambiguous.
 fn discover_listener(
     opts: &GlobalOpts,
     log: &Logger,
     dext: &mut RealDext,
-    entity: &mut avb_avdecc::entity::TalkerEntity,
+    our_id: avb_core::Eui64,
     our_mac: avb_core::MacAddr,
     want: Option<u64>,
-) -> Result<avb_core::Eui64, Exit> {
+) -> Result<(avb_core::Eui64, avb_core::MacAddr), Exit> {
     use avb_avdecc::adp::Adpdu;
     use avb_avdecc::constants::subtype;
     use avb_avdecc::EntityTable;
@@ -3304,17 +3610,21 @@ fn discover_listener(
 
     use crate::dextio::DextPort;
 
-    let our_id = entity.entity_id();
-    let adp = entity.advertise();
-    send_adp(dext, our_mac, &adp);
-    if let Some(id) = want {
-        let id = Eui64::from_u64(id);
+    // We need the 16R's MAC, not just its entity id: the AEM read that derives
+    // our output format is a UNICAST AECP command, and the only place its MAC
+    // comes from is an observed ADPDU. So `--listener` selects WHICH entity to
+    // wait for; it no longer skips discovery, because an id alone cannot be
+    // addressed.
+    let want_id = want.map(Eui64::from_u64);
+    if let Some(id) = want_id {
         log.log(
             Level::Info,
             "adp",
-            &format!("listener given: 0x{:016x}", u64::from_be_bytes(id.0)),
+            &format!(
+                "listener given: 0x{:016x} (waiting for its ADP to learn its MAC)",
+                u64::from_be_bytes(id.0)
+            ),
         );
-        return Ok(id);
     }
 
     let info = dext.device().info().map_err(|_| Exit::DextFault)?;
@@ -3361,12 +3671,13 @@ fn discover_listener(
             if let Ok(f) = TxFrame::build(&hdr, &discover.encode(), false, 0) {
                 let _ = dext.send(f.bytes(), false, 0);
             }
-            // Re-advertise ourselves too, not just ask who is there: ADP
-            // validity is 2 * valid_time, and a discovery that runs longer
-            // than that would otherwise let the 16R age us out of its table
-            // before we ever ask it to connect.
-            let adp = entity.advertise();
-            send_adp(dext, our_mac, &adp);
+            // We do NOT advertise ourselves here. Our ADP is built from our
+            // entity model, and the model's stream format is exactly what this
+            // discovery exists to go and read from the 16R. Advertising a
+            // placeholder first would publish an entity_model_id we are about
+            // to change. We advertise as soon as the model is real, which is
+            // still before any ACMP (a Milan entity ignores ACMP from an
+            // entity it has not discovered — review H3).
             last_discover = now_mach();
         }
         for slot in dext.rx_ctl() {
@@ -3380,27 +3691,34 @@ fn discover_listener(
                 }
             }
         }
-        match table.sole_talker() {
-            Ok(Some(id)) => {
-                log.log(
-                    Level::Info,
-                    "adp",
-                    &format!(
-                        "listener (16R) discovered: 0x{:016x}",
-                        u64::from_be_bytes(id.0)
-                    ),
-                );
-                return Ok(id);
-            }
-            Err(ids) => {
-                log.log(
-                    Level::Error,
-                    "adp",
-                    &format!("{} entities discovered; pass --listener <id>", ids.len()),
-                );
-                return Err(Exit::TalkerNotFound);
-            }
-            Ok(None) => {}
+        // With --listener we wait for THAT entity; otherwise the sole entity on
+        // the wire. Either way we return its MAC alongside its id.
+        let resolved = match want_id {
+            Some(id) => table.get(id).map(|e| (id, e.mac)),
+            None => match table.sole_talker() {
+                Ok(Some(id)) => table.get(id).map(|e| (id, e.mac)),
+                Err(ids) => {
+                    log.log(
+                        Level::Error,
+                        "adp",
+                        &format!("{} entities discovered; pass --listener <id>", ids.len()),
+                    );
+                    return Err(Exit::TalkerNotFound);
+                }
+                Ok(None) => None,
+            },
+        };
+        if let Some((id, mac)) = resolved {
+            log.log(
+                Level::Info,
+                "adp",
+                &format!(
+                    "listener (16R) discovered: 0x{:016x} at {:02x?}",
+                    u64::from_be_bytes(id.0),
+                    mac.octets()
+                ),
+            );
+            return Ok((id, mac));
         }
         if ns_since(start) >= deadline_ns {
             log.log(
