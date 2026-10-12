@@ -634,17 +634,13 @@ fn gptp_loop(
     seconds: u64,
     json_out: Option<&Path>,
 ) -> Result<(), Exit> {
-    use avb_core::rx::{Now, RxMeta};
     use avb_core::time::{MachTicks, Timebase};
-    use avb_core::MacAddr;
-    use avb_core::Outbox;
-    use avb_gptp::{Action, Port, PortConfig, TxTsResult as GTxTs};
 
-    use crate::dextio::{DextPort, SendResult, TxTsResult};
+    use crate::dextio::DextPort;
+    use crate::gptpsvc::{GptpService, DEFAULT_CLOCK_READ_NS};
 
-    // Our port identity + timebase come from the dext's GetInfo.
+    // Timebase for this loop's own deadlines; the service keeps its own copy.
     let info = dext.device().info().map_err(|_| Exit::DextFault)?;
-    let mac = MacAddr::new(info.mac);
     let tb = Timebase {
         numer: info.tb_numer,
         denom: info.tb_denom,
@@ -653,28 +649,15 @@ fn gptp_loop(
         log.log(Level::Error, "gptp", "dext reported an invalid timebase");
         return Err(Exit::DextFault);
     }
-    let cfg = PortConfig::i210(mac, tb);
 
     let now_mach = || MachTicks(unsafe { mach2::mach_time::mach_absolute_time() });
     let start = now_mach();
-    // Seed the port with the dext's CURRENT clock generation. If this is left
-    // at 0 while the dext's generation is non-zero (it increments on each
-    // RingAttach and SYSTIM step), every Pdelay exchange's RX timestamps look
-    // like they straddle a step and are discarded (pdelay_step_discard).
-    let clock_gen = dext.clock_gen();
-    let mut port = Port::new(cfg, start, clock_gen);
-
-    // The outbox the port fills each poll; drained to the dext this tick.
-    let mut out: Outbox<16> = Outbox::default();
-    // A frame held because the dext returned Busy/NoResources this tick.
-    let mut held: Option<avb_core::TxFrame> = None;
+    let mut svc = GptpService::new(dext, log, DEFAULT_CLOCK_READ_NS)?;
 
     let run_ticks = tb.ns_to_ticks(seconds.saturating_mul(1_000_000_000));
     let discover_ticks = tb.ns_to_ticks(opts.discover_timeout.saturating_mul(1_000_000_000));
     let mut peer_seen = false;
-    let mut last_clock_read = start;
     let mut last_status_log = start;
-    let clock_read_ticks = tb.ns_to_ticks(100_000_000); // 100 ms
     let status_log_ticks = tb.ns_to_ticks(5_000_000_000); // 5 s
 
     loop {
@@ -702,144 +685,24 @@ fn gptp_loop(
             return Err(Exit::Link);
         }
 
-        let now = Now::mach_only(now_t);
-
-        // 1) Drain RX control frames into the port.
-        for slot in dext.rx_ctl() {
-            let meta = RxMeta {
-                harvest: now_t,
-                hw_ts: slot.hw_ts_ns,
-                clock_gen: slot.clock_gen,
-                step_ambig: slot.step_ambig,
-                desc_vlan_tci: slot.desc_vlan_tci,
-                loopback: false,
-            };
-            let _ = port.handle_rx(now, &slot.data, meta);
-        }
-
-        // 2) Harvest a pending TX timestamp and route it to its exchange.
-        match dext.poll_tx_ts() {
-            TxTsResult::Ready { tag, systim_ns } => {
-                port.on_tx_timestamp(tag, GTxTs::Ok(systim_ns), now_t);
-            }
-            TxTsResult::Timeout => { /* exchange abandoned; port times it out */ }
-            TxTsResult::Pending | TxTsResult::Idle => {}
-        }
-
-        // 3) Poll the port for frames to send, draining any held frame first.
-        port.poll(now, &mut out);
-        if held.is_none() {
-            held = out.pop();
-        }
-        while let Some(frame) = held.take() {
-            // The 8 ms Pdelay_Resp gate (§5.2 / §7.3): drop a stale response.
-            if frame.want_ts && !port.want_ts_allowed() {
-                // A want_ts frame cannot go out while a step is pending/in
-                // flight; hold it for next tick.
-                held = Some(frame);
-                break;
-            }
-            if !port.pre_send(frame.tag, now_t) {
-                // Dropped by the pre-send gate (late Pdelay_Resp); discard.
-                held = out.pop();
-                continue;
-            }
-            match dext.send(frame.bytes(), frame.want_ts, frame.tag) {
-                SendResult::Ok => {
-                    port.on_frame_sent(frame.tag, now_t);
-                    // Harvest this frame's TX hardware timestamp right away for
-                    // a want_ts frame: the dext holds only ONE pending TX ts, so
-                    // the next want_ts send would overwrite it. Bounded ~10 ms
-                    // poll (the I210 latches within a few ms).
-                    if frame.want_ts {
-                        for _ in 0..20 {
-                            match dext.poll_tx_ts() {
-                                TxTsResult::Ready { tag, systim_ns } => {
-                                    port.on_tx_timestamp(tag, GTxTs::Ok(systim_ns), now_mach());
-                                    break;
-                                }
-                                TxTsResult::Timeout | TxTsResult::Idle => break,
-                                TxTsResult::Pending => {
-                                    std::thread::sleep(std::time::Duration::from_micros(500));
-                                }
-                            }
-                        }
-                    }
-                    held = out.pop();
-                }
-                SendResult::Busy | SendResult::NoResources => {
-                    // Retry this exact frame next tick.
-                    held = Some(frame);
-                    break;
-                }
-                SendResult::BadArgument => {
-                    log.log(
-                        Level::Warn,
-                        "gptp",
-                        "SendFrame BadArgument — dropping frame",
-                    );
-                    port.on_tx_failed(frame.tag);
-                    held = out.pop();
-                }
-                SendResult::Fatal => {
-                    log.log(Level::Error, "gptp", "SendFrame fatal — device gone");
-                    return Err(Exit::DextFault);
-                }
-            }
-        }
-
-        // 4) Execute servo / advertising actions.
-        while let Some(action) = port.take_action() {
-            match action {
-                Action::AdjFreq { ppb } => dext.adj_freq(ppb),
-                Action::StepClock { delta_ns } => {
-                    dext.step(delta_ns);
-                    let new_gen = dext.clock_gen();
-                    port.on_clock_stepped(now_t, new_gen);
-                }
-                Action::SetClock { delta_ns } => {
-                    // Absolute write: SetClock(ReadClock() + delta). Used for a
-                    // large offset (|offset| > 1 s) that the bounded step
-                    // register would reject — e.g. the initial SYSTIM↔GM epoch
-                    // gap (design §7.3).
-                    let (_mach, nic_ns) = dext.read_clock();
-                    let target = (nic_ns as i128 + i128::from(delta_ns)).max(0) as u64;
-                    dext.set_clock_abs(target);
-                    let new_gen = dext.clock_gen();
-                    port.on_clock_stepped(now_t, new_gen);
-                }
-                Action::AdvertiseAdp { .. } => { /* ADP advertising is the entity's job */ }
-            }
-        }
-
-        // 5) Feed the clock model periodically.
-        if now_t.ticks_since(last_clock_read) >= clock_read_ticks {
-            let (mach, nic_ns) = dext.read_clock();
-            if mach.0 != 0 {
-                // DextPort collapses the read to a midpoint; use it for both
-                // brackets (read jitter is already averaged out).
-                let reads = [avb_gptp::ClockRead {
-                    mach_before: mach.0,
-                    systim_ns: nic_ns,
-                    mach_after: mach.0,
-                }];
-                let _ = port.on_clock_read(now_t, &reads);
-            }
-            last_clock_read = now_t;
-        }
+        // One gPTP iteration: RX into the port, TX timestamps harvested,
+        // frames out, servo actions executed, clock model fed. Shared with
+        // the talker loop, which needs the same disciplined clock to stamp a
+        // presentation time on every audio PDU.
+        svc.service(dext, log, now_t)?;
 
         // Track whether the peer is exchanging gPTP at all (a received
         // Pdelay_Req or Pdelay_Resp proves a live gPTP neighbor). asCapable
         // and a servo lock are stronger conditions reported separately.
         {
-            let c = port.counters();
+            let c = svc.counters();
             if c.pdelay_req_rx > 0 || c.pdelay_resp_rx > 0 {
                 peer_seen = true;
             }
         }
         // No gPTP traffic at all within the discovery window → exit 6.
         if !peer_seen && now_t.ticks_since(start) >= discover_ticks {
-            let c = port.counters();
+            let c = svc.counters();
             log.log(
                 Level::Error,
                 "gptp",
@@ -853,15 +716,10 @@ fn gptp_loop(
             return Err(Exit::TalkerNotFound);
         }
 
-        // Drain the port's own log lines.
-        while let Some(line) = port.take_log() {
-            log.log(Level::Debug, "gptp", &line);
-        }
-
         // Periodic status line.
         if now_t.ticks_since(last_status_log) >= status_log_ticks {
-            let st = port.status();
-            let c = port.counters();
+            let st = svc.status();
+            let c = svc.counters();
             log.log(
                 Level::Info,
                 "gptp",
@@ -887,7 +745,7 @@ fn gptp_loop(
     }
 
     // Final status + optional JSON.
-    let st = port.status();
+    let st = svc.status();
     log.log(
         Level::Info,
         "gptp",
@@ -2573,9 +2431,8 @@ fn talker_loop(
     // INT_32BIT, 48 kHz, 8 ch, 6 spf). The real value is read from the 16R's
     // AEM (never hardcoded) during bring-up; the Milan base format is the
     // bootstrap default used until the AEM read lands.
-    let fmt: AafFormat = StreamFormat(0x0205_0220_0200_6000)
-        .aaf()
-        .ok_or(Exit::DextFault)?;
+    let stream_format = StreamFormat(0x0205_0220_0200_6000);
+    let fmt: AafFormat = stream_format.aaf().ok_or(Exit::DextFault)?;
     let hz = fmt.nsr_hz().ok_or(Exit::DextFault)? as u64;
     let spf = usize::from(fmt.spf);
     let channels = usize::from(fmt.channels);
@@ -2633,11 +2490,43 @@ fn talker_loop(
     // other path derives it — the 16R keys ACMP on it (review H4).
     let our_id = avb_core::Eui64::from_mac(our_mac);
 
+    // Our AEM, so the 16R can ENUMERATE us rather than merely discover us.
+    //
+    // ADP alone only tells a Milan controller that an entity exists; it then
+    // walks the AEM (ENTITY -> CONFIGURATION 0 -> every descriptor named by
+    // descriptor_counts) to learn what the entity can do. We answered no AECP
+    // at all before this — the responder existed in avb-avdecc but was never
+    // connected to the socket — so the walk died at its first command and the
+    // 16R had no model of us.
+    //
+    // The model is derived from `fmt`, the format we actually packetize with,
+    // so the channel count and rate in the AEM cannot disagree with the
+    // stream on the wire.
+    let model = avb_avdecc::entity::talker_model(
+        our_mac,
+        our_stream_id,
+        stream_format,
+        crate::FIRMWARE_VERSION,
+    )
+    .ok_or(Exit::DextFault)?;
+    log.log(
+        Level::Info,
+        "aem",
+        &format!(
+            "talker entity 0x{:016x} model 0x{:016x}: 1 STREAM_OUTPUT, {} ch @ {} Hz",
+            u64::from_be_bytes(our_id.0),
+            model.entity_model_id,
+            model.channels,
+            model.current_sampling_rate
+        ),
+    );
+    let mut entity = avb_avdecc::entity::TalkerEntity::new(model);
+
     // Find the 16R (the LISTENER for this direction) — from --listener, or by
     // ADP discovery — and announce ourselves as a talker so it knows us before
     // we ask it to connect (review H3; a Milan entity ignores ACMP from an
     // entity it has not discovered).
-    let listener_id = discover_listener(opts, log, dext, our_id, our_mac, listener)?;
+    let listener_id = discover_listener(opts, log, dext, &mut entity, our_mac, listener)?;
 
     // Connect as controller: tell the 16R to connect its STREAM_INPUT
     // [listener_uid] to our talker stream. Mirror of the record path's
@@ -2679,6 +2568,24 @@ fn talker_loop(
     }
     let now_mach = || MachTicks(unsafe { mach2::mach_time::mach_absolute_time() });
     let ns_since = |t: MachTicks| tb.ticks_to_ns(now_mach().ticks_since(t));
+
+    // ---- gPTP: the clock the presentation timestamps are read from --------
+    //
+    // The talker must service gPTP itself. The AVTP presentation timestamp is
+    // a reading of the DISCIPLINED clock, and the clock is only disciplined
+    // while something is pumping the servo — the `gptp` command's loop is a
+    // different process and does not help here. A loop that transmits without
+    // servicing gPTP is stamping an undisciplined, free-running SYSTIM.
+    //
+    // We re-anchor more often than the gptp command does (20 ms rather than
+    // 100 ms): the interpolation error between anchors is the residual
+    // frequency offset times the interval, and this is the timestamp the 16R
+    // schedules playout from.
+    let mut gptp =
+        crate::gptpsvc::GptpService::new(dext, log, crate::gptpsvc::TALKER_CLOCK_READ_NS)?;
+    // How long we wait for the servo before giving up, reusing the discovery
+    // timeout rather than inventing a second knob.
+    let lock_deadline_ns = opts.discover_timeout.saturating_mul(1_000_000_000);
 
     // ---- MSRP: advertise our stream so the 16R will accept it ---------------
     //
@@ -2768,7 +2675,24 @@ fn talker_loop(
     let mut underruns: u64 = 0;
     let mut last_connect = now_mach();
     let mut last_advert = now_mach();
-    let mut advert_index: u32 = 1;
+    // AEM commands we answered, and how many we had to refuse. A run where the
+    // 16R never asks us anything is a different failure from one where it asks
+    // and we answer NOT_IMPLEMENTED, and the summary must tell them apart.
+    let mut aecp_answered: u64 = 0;
+    let mut aecp_refused: u64 = 0;
+    // Ticks skipped because gPTP had no valid clock anchor (startup, or just
+    // after a servo step). Counted, not silently papered over.
+    let mut ts_unavailable: u64 = 0;
+    // Ticks transmitted while the servo had fallen out of LOCKED.
+    let mut ticks_unlocked: u64 = 0;
+    let mut warned_unlocked = false;
+    // Do not transmit until the clock is fit to timestamp with. Streaming on
+    // an undisciplined clock is not a degraded stream, it is a stream the
+    // listener will reject — and it is what made the earlier runs look like a
+    // transmit problem when the clock was the issue.
+    let mut armed = false;
+    let mut last_gptp_push = now_mach();
+    let mut last_gptp_service = now_mach();
 
     loop {
         if shutdown_requested() {
@@ -2784,13 +2708,21 @@ fn talker_loop(
             return Err(Exit::DextFault);
         }
 
-        // ---- MSRP service ---------------------------------------------------
+        // ---- Control-ring drain ---------------------------------------------
+        // ONE drain for every protocol. The control ring is a single shared
+        // queue, so a slot read here is gone for everyone: if gPTP drained it
+        // separately it would eat the MSRP and AECP frames, and vice versa.
+        // Each frame is routed by ethertype/subtype instead.
+        //
         // MRP is a two-way protocol: the participant must see the peer's
         // declarations to keep its own registered, and our Listener Ready
         // arrives here. This loop was pure TX before, which is why MSRP could
         // not simply be declared and forgotten.
         for slot in dext.rx_ctl() {
             let Ok(p) = EthFrame::parse(&slot.data) else {
+                // Not parseable as Ethernet — still offer it to gPTP, whose
+                // own parser handles the PTP L2 framing.
+                gptp.handle_rx(now_mach(), &slot);
                 continue;
             };
             if p.hdr.ethertype == ETHERTYPE_MSRP || p.hdr.ethertype == ETHERTYPE_MVRP {
@@ -2799,8 +2731,64 @@ fn talker_loop(
                     ..Default::default()
                 };
                 let _ = srp.handle_rx(srp_now(), &slot.data, meta);
+                continue;
+            }
+            if p.hdr.ethertype == avb_gptp::msg::ETHERTYPE_PTP {
+                gptp.handle_rx(now_mach(), &slot);
+                continue;
+            }
+            // ---- AECP: answer the 16R's AEM walk --------------------------
+            //
+            // This is what lets the 16R enumerate us. Byte 0 of an IEEE 1722
+            // control PDU is the subtype (NOT byte 1 — the codec had that
+            // inverted once and only real hardware caught it), so match on
+            // payload[0] before decoding.
+            if p.hdr.ethertype == avb_avtp::common::ETHERTYPE_AVTP
+                && p.payload.first().copied() == Some(avb_avdecc::constants::subtype::AECP)
+            {
+                let Some(cmd) = avb_avdecc::aecp::AemPdu::decode(p.payload) else {
+                    continue;
+                };
+                // Only commands addressed to us, and only commands: a
+                // RESPONSE here is an answer to something we sent as a
+                // controller, and answering it again would loop.
+                if cmd.target_entity_id != our_id
+                    || cmd.message_type != avb_avdecc::constants::aecp_msg::AEM_COMMAND
+                {
+                    continue;
+                }
+                let resp = entity.handle_aecp(&cmd, p.hdr.src, ns_since(start));
+                send_aem_response(dext, our_mac, p.hdr.src, &resp);
+                aecp_answered += 1;
+                if resp.status != avb_avdecc::constants::aecp_status::SUCCESS {
+                    aecp_refused += 1;
+                }
+                log.log(
+                    Level::Debug,
+                    "aecp",
+                    &format!(
+                        "cmd 0x{:04x} from {} -> status {}",
+                        cmd.command_type, p.hdr.src, resp.status
+                    ),
+                );
             }
         }
+        // Service gPTP with what the drain above routed into it. No second
+        // drain: the control ring is one shared queue.
+        //
+        // Throttled to 1 ms rather than run every pass. This loop spins at
+        // ~50 us to pace 8000 PDUs/s, and `service_no_rx` makes a dext IPC
+        // call (poll_tx_ts) each time — running it per pass would be ~20 000
+        // extra round trips a second, competing with the audio it is supposed
+        // to be timestamping. gPTP needs a couple of hundred messages a
+        // second at most, so 1 ms is ample. RX is NOT throttled: frames are
+        // fed in from the drain above on every pass, so a Pdelay response is
+        // never delayed by this.
+        if ns_since(last_gptp_service) >= 1_000_000 {
+            gptp.service_no_rx(dext, log, now_mach())?;
+            last_gptp_service = now_mach();
+        }
+
         while let Some(ev) = srp.pop_event() {
             log.log(Level::Debug, "srp", &format!("event: {ev:?}"));
             match ev {
@@ -2811,6 +2799,12 @@ fn talker_loop(
                 {
                     if !listener_ready {
                         listener_ready = true;
+                        entity.set_stream_info(avb_avdecc::entity::StreamInfo {
+                            connected: true,
+                            dest_mac: stream_dst,
+                            vlan_id: DEFAULT_DOMAIN.vid,
+                            msrp_accumulated_latency_ns: 0,
+                        });
                         log.log(
                             Level::Info,
                             "msrp",
@@ -2820,6 +2814,12 @@ fn talker_loop(
                 }
                 SrpEvent::ListenerWithdrawn { stream_id, .. } if stream_id.0 == our_stream_id.0 => {
                     listener_ready = false;
+                    entity.set_stream_info(avb_avdecc::entity::StreamInfo {
+                        connected: false,
+                        dest_mac: stream_dst,
+                        vlan_id: DEFAULT_DOMAIN.vid,
+                        msrp_accumulated_latency_ns: 0,
+                    });
                     log.log(
                         Level::Warn,
                         "msrp",
@@ -2836,10 +2836,11 @@ fn talker_loop(
         }
 
         // Keep our ADP advertisement alive (valid_time is short) so the 16R
-        // keeps us in its entity table.
+        // keeps us in its entity table. The PDU comes from the entity, which
+        // also owns the monotonic available_index.
         if ns_since(last_advert) >= 2_000_000_000 {
-            send_talker_adp(dext, our_mac, our_id, advert_index);
-            advert_index = advert_index.wrapping_add(1);
+            let adp = entity.advertise();
+            send_adp(dext, our_mac, &adp);
             last_advert = now_mach();
         }
 
@@ -2861,6 +2862,83 @@ fn talker_loop(
             last_connect = now_mach();
         }
 
+        // Push gPTP state into the entity once a second so GET_AVB_INFO and
+        // our ADP report the real grandmaster rather than a placeholder.
+        // status() does real work, so this is not done per PDU.
+        if ns_since(last_gptp_push) >= 1_000_000_000 {
+            let st = gptp.status();
+            entity.set_gptp(avb_avdecc::entity::GptpStatus {
+                grandmaster_id: u64::from_be_bytes(st.gm_identity.0),
+                domain_number: 0,
+                as_capable: st.as_capable,
+                propagation_delay_ns: st.path_delay_comp_ns.last.unwrap_or(0.0).max(0.0) as u32,
+            });
+            last_gptp_push = now_mach();
+        }
+
+        // ---- Readiness gate -------------------------------------------------
+        //
+        // A Milan talker must not stream on a clock that is not locked to the
+        // grandmaster: the presentation timestamps would be wrong by the
+        // clock's whole offset, and the listener discards them. So wait for
+        // the servo, bounded by the discovery timeout, instead of emitting
+        // 8000 badly-stamped PDUs per second.
+        if !armed {
+            if gptp.is_locked() {
+                armed = true;
+                let st = gptp.status();
+                log.log(
+                    Level::Info,
+                    "play",
+                    &format!(
+                        "gPTP locked (asCapable={} offset {:.0} ns, path delay {:.0} ns) — arming the talker",
+                        st.as_capable,
+                        st.offset_ns.last.unwrap_or(f64::NAN),
+                        st.path_delay_comp_ns.last.unwrap_or(f64::NAN),
+                    ),
+                );
+                // Start pacing from here, so the wait does not leave a backlog
+                // that would be emitted as a burst.
+                next_pdu_ns = ns_since(start);
+            } else {
+                if ns_since(start) >= lock_deadline_ns {
+                    let st = gptp.status();
+                    log.log(
+                        Level::Error,
+                        "play",
+                        &format!(
+                            "gPTP did not lock within {}s (state={} asCapable={} servo={}) — refusing to stream on an undisciplined clock",
+                            opts.discover_timeout,
+                            st.port_state.name(),
+                            st.as_capable,
+                            st.servo_state.name(),
+                        ),
+                    );
+                    return Err(Exit::TalkerNotFound);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+        } else if !gptp.is_locked() {
+            // Lost lock mid-run. SYSTIM keeps running at its last rate, so
+            // holdover timestamps stay usable for a while; keep streaming but
+            // say so once and count every tick.
+            ticks_unlocked += 1;
+            if !warned_unlocked {
+                warned_unlocked = true;
+                let st = gptp.status();
+                log.log(
+                    Level::Warn,
+                    "play",
+                    &format!(
+                        "gPTP left LOCKED mid-run (servo={} asCapable={}) — presentation timestamps are now holdover",
+                        st.servo_state.name(),
+                        st.as_capable
+                    ),
+                );
+            }
+        }
+
         // Not yet time for the next PDU: yield briefly and recheck.
         if elapsed < next_pdu_ns {
             std::thread::sleep(std::time::Duration::from_micros(50));
@@ -2880,10 +2958,25 @@ fn talker_loop(
             }
         }
 
-        // Presentation timestamp: gPTP now + offset, mod 2^32. Using mach-derived
-        // ns as the stand-in for the dext's disciplined gPTP clock until the hw
-        // milestone wires the real reading.
-        let gptp_now = elapsed; // placeholder for dext gPTP-now on hardware
+        // Presentation timestamp: gPTP now + offset, mod 2^32.
+        //
+        // This is the real disciplined clock, read from the gPTP service this
+        // loop is pumping. It used to be `elapsed` — nanoseconds since the
+        // loop started — which is not an approximation of gPTP time but an
+        // unrelated quantity: the 16R compares the timestamp against its own
+        // gPTP clock, so a stream whose timestamps start near zero is hours
+        // in the past and every PDU falls outside the acceptance window.
+        //
+        // `now_ns` returns None while there is no valid anchor (before the
+        // first clock read, and immediately after a servo step, when the
+        // previous anchor is stale by the step). We skip the tick rather than
+        // substitute something else: a PDU carrying a wrong presentation time
+        // is worse than a PDU not sent, because the listener acts on it.
+        let Some(gptp_now) = gptp.now_ns(now_mach()) else {
+            ts_unavailable += 1;
+            next_pdu_ns = next_pdu_ns.saturating_add(pdu_interval_ns);
+            continue;
+        };
         let avtp_ts = (gptp_now.wrapping_add(presentation_offset_ns) & 0xFFFF_FFFF) as u32;
 
         match talker.packetize(&sample_scratch, avtp_ts, true, &mut pdu_scratch) {
@@ -2932,14 +3025,31 @@ fn talker_loop(
         }
     }
 
+    // Tell the 16R we are going before we stop answering. Without this it
+    // holds us in its entity table for the full 2 * valid_time (20 s) and a
+    // restarted daemon can collide with its own stale entry.
+    let departing = entity.departing();
+    send_adp(dext, our_mac, &departing);
+
+    let final_gptp = gptp.status();
     log.log(
         Level::Info,
         "play",
         &format!(
-            "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns over {}s; 16R listener_ready={listener_ready}",
-            run_ns / 1_000_000_000
+            "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns over {}s; 16R listener_ready={listener_ready}; AEM commands answered={aecp_answered} refused={aecp_refused}; gPTP servo={} offset {:.0} ns, {ts_unavailable} ticks with no clock anchor, {ticks_unlocked} unlocked",
+            run_ns / 1_000_000_000,
+            final_gptp.servo_state.name(),
+            final_gptp.offset_ns.last.unwrap_or(f64::NAN),
         ),
     );
+    if aecp_answered == 0 {
+        log.log(
+            Level::Warn,
+            "aem",
+            "the 16R never sent us a single AEM command — it did not try to \
+             enumerate us, so check that our ADP advertisement is reaching it",
+        );
+    }
     if tx_rate_limited != 0 {
         log.log(
             Level::Warn,
@@ -3013,43 +3123,19 @@ fn talker_tspec(stream_id: avb_core::StreamId, pdu_len: usize) -> avb_srp::attr:
     }
 }
 
-/// Advertise OUR entity as a talker (ADP ENTITY_AVAILABLE) so the 16R has us
-/// in its entity table before we ask it to connect. Mirror of the listener
-/// path's `send_our_adp`, with talker capabilities instead of listener ones.
-fn send_talker_adp(
-    dext: &mut RealDext,
-    our_mac: avb_core::MacAddr,
-    our_id: avb_core::Eui64,
-    avail: u32,
-) {
-    use avb_avdecc::adp::Adpdu;
-    use avb_avdecc::constants::{entity_caps, talker_caps};
+/// Put an ADPDU on the wire, multicast to the AVDECC address.
+///
+/// The PDU itself comes from the entity, not from here: ADP and the ENTITY
+/// descriptor must advertise the same capabilities and the same
+/// `entity_model_id`, and a controller that sees them disagree treats the
+/// entity as misbehaving. Building one of them by hand is how they drift.
+fn send_adp(dext: &mut RealDext, our_mac: avb_core::MacAddr, adp: &avb_avdecc::adp::Adpdu) {
     use avb_avtp::common::ETHERTYPE_AVTP;
     use avb_core::eth::EthHeader;
     use avb_core::TxFrame;
 
     use crate::dextio::DextPort;
 
-    let adp = Adpdu {
-        message_type: avb_avdecc::constants::adp_msg::ENTITY_AVAILABLE,
-        valid_time: 10,
-        entity_id: our_id,
-        entity_model_id: 0,
-        entity_capabilities: entity_caps::AEM_SUPPORTED
-            | entity_caps::CLASS_A_SUPPORTED
-            | entity_caps::GPTP_SUPPORTED,
-        talker_stream_sources: 1,
-        talker_capabilities: talker_caps::IMPLEMENTED | talker_caps::AUDIO_SOURCE,
-        listener_stream_sinks: 0,
-        listener_capabilities: 0,
-        controller_capabilities: 0,
-        available_index: avail,
-        gptp_grandmaster_id: 0,
-        gptp_domain_number: 0,
-        identify_control_index: 0,
-        interface_index: 0,
-        association_id: 0,
-    };
     let hdr = EthHeader {
         dst: avb_core::AVDECC_MULTICAST,
         src: our_mac,
@@ -3057,6 +3143,33 @@ fn send_talker_adp(
         ethertype: ETHERTYPE_AVTP,
     };
     if let Ok(f) = TxFrame::build(&hdr, &adp.encode(), false, 0) {
+        let _ = dext.send(f.bytes(), false, 0);
+    }
+}
+
+/// Send an AEM response unicast back to the controller that asked.
+///
+/// Unicast, not multicast: an AEM response belongs to the one controller whose
+/// `sequence_id` it echoes.
+fn send_aem_response(
+    dext: &mut RealDext,
+    our_mac: avb_core::MacAddr,
+    dst: avb_core::MacAddr,
+    resp: &avb_avdecc::aecp::AemPdu,
+) {
+    use avb_avtp::common::ETHERTYPE_AVTP;
+    use avb_core::eth::EthHeader;
+    use avb_core::TxFrame;
+
+    use crate::dextio::DextPort;
+
+    let hdr = EthHeader {
+        dst,
+        src: our_mac,
+        vlan: None,
+        ethertype: ETHERTYPE_AVTP,
+    };
+    if let Ok(f) = TxFrame::build(&hdr, &resp.encode(), false, 0) {
         let _ = dext.send(f.bytes(), false, 0);
     }
 }
@@ -3070,7 +3183,7 @@ fn discover_listener(
     opts: &GlobalOpts,
     log: &Logger,
     dext: &mut RealDext,
-    our_id: avb_core::Eui64,
+    entity: &mut avb_avdecc::entity::TalkerEntity,
     our_mac: avb_core::MacAddr,
     want: Option<u64>,
 ) -> Result<avb_core::Eui64, Exit> {
@@ -3084,7 +3197,9 @@ fn discover_listener(
 
     use crate::dextio::DextPort;
 
-    send_talker_adp(dext, our_mac, our_id, 0);
+    let our_id = entity.entity_id();
+    let adp = entity.advertise();
+    send_adp(dext, our_mac, &adp);
     if let Some(id) = want {
         let id = Eui64::from_u64(id);
         log.log(
@@ -3139,6 +3254,12 @@ fn discover_listener(
             if let Ok(f) = TxFrame::build(&hdr, &discover.encode(), false, 0) {
                 let _ = dext.send(f.bytes(), false, 0);
             }
+            // Re-advertise ourselves too, not just ask who is there: ADP
+            // validity is 2 * valid_time, and a discovery that runs longer
+            // than that would otherwise let the 16R age us out of its table
+            // before we ever ask it to connect.
+            let adp = entity.advertise();
+            send_adp(dext, our_mac, &adp);
             last_discover = now_mach();
         }
         for slot in dext.rx_ctl() {

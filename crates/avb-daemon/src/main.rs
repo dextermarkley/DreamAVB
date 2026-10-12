@@ -20,6 +20,7 @@
 mod audio;
 mod dextio;
 mod exit;
+mod gptpsvc;
 mod log;
 mod pcap;
 #[cfg(test)]
@@ -30,6 +31,11 @@ mod stack;
 mod txsched;
 mod validate;
 mod wav;
+
+/// The `firmware_version` we report in our own ENTITY descriptor. A controller
+/// shows this to the user and keys cache invalidation on it alongside
+/// `entity_model_id`, so it must change when the build does.
+pub const FIRMWARE_VERSION: &str = concat!("phase1b-", env!("CARGO_PKG_VERSION"));
 
 use std::path::PathBuf;
 use std::process::ExitCode;
