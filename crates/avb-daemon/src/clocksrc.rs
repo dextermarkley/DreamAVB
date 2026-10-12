@@ -148,6 +148,22 @@ impl ClockSelector {
     }
 }
 
+/// Which recovered 16R media clock to believe.
+///
+/// `live` is the clock block our OWN inbound path publishes into the input
+/// ring it created; `attached` is one read from an input ring some other
+/// process created, mapped read-only at start-up.
+///
+/// The order matters and is the fix for a real bug: in a duplex session the
+/// input ring does not exist until the first AAF packet arrives, so the
+/// start-up attach always found nothing. With only that source, `decide` was
+/// handed `None` forever and demoted a session that had the 16R's media clock
+/// arriving every 125 us down to a gPTP-derived rate — 47999.693 Hz against
+/// the real 48000.001 Hz, a 6.4 ppm error the user hears as slow drift.
+pub fn recovered_for(live: Option<ClockBlock>, attached: Option<ClockBlock>) -> Option<ClockBlock> {
+    live.or(attached)
+}
+
 /// Publish a decision onto a ring: the effective code always, the basis when
 /// there is one.
 ///
@@ -189,6 +205,49 @@ mod tests {
         assert_eq!(d.effective, EffectiveClock::SixteenRStream);
         // The recovered rate is passed through untouched, not recomputed.
         assert_eq!(d.basis.map(|b| b.rate_hz_vs_mach), Some(47_994.0));
+    }
+
+    /// The duplex shape, end to end: there is never an attached input ring
+    /// (our own inbound path creates it after start-up), so the LIVE block has
+    /// to be what reaches `decide`. Feeding only the attached source is what
+    /// silently demoted duplex to a gPTP-derived rate.
+    #[test]
+    fn duplex_recovered_clock_comes_from_the_live_inbound_path() {
+        let live = recovered(true, 48_000.001);
+        let r = recovered_for(Some(live), None);
+        assert_eq!(r.map(|b| b.rate_hz_vs_mach), Some(48_000.001));
+
+        let d = decide(ClockSource::Auto, 48_000.0, r, Some(-6.4), true);
+        assert_eq!(d.effective, EffectiveClock::SixteenRStream);
+        assert_eq!(d.basis.map(|b| b.rate_hz_vs_mach), Some(48_000.001));
+
+        // With the live source dropped — the bug — the same session lands on
+        // gPTP instead, which is the regression this pins.
+        let bug = decide(ClockSource::Auto, 48_000.0, None, Some(-6.4), true);
+        assert_eq!(bug.effective, EffectiveClock::NetworkGptp);
+        assert_ne!(bug.effective, d.effective);
+    }
+
+    /// A `play` session alongside a separate `record` has no live inbound path
+    /// of its own, so the attached ring must still be used.
+    #[test]
+    fn a_play_only_session_still_uses_an_attached_input_ring() {
+        let attached = recovered(true, 47_994.0);
+        let r = recovered_for(None, Some(attached));
+        assert_eq!(r.map(|b| b.rate_hz_vs_mach), Some(47_994.0));
+        assert_eq!(recovered_for(None, None), None);
+    }
+
+    /// The live block wins over an attached one: it describes the stream this
+    /// process is actually placing into the ring.
+    #[test]
+    fn the_live_block_wins_over_an_attached_one() {
+        let live = recovered(true, 48_000.001);
+        let attached = recovered(true, 47_994.0);
+        assert_eq!(
+            recovered_for(Some(live), Some(attached)).map(|b| b.rate_hz_vs_mach),
+            Some(48_000.001)
+        );
     }
 
     #[test]

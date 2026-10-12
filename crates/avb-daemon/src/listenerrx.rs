@@ -100,6 +100,19 @@ impl ListenerRx {
         self.ring.as_ref().map(|_| self.stream_id)
     }
 
+    /// The 16R's media clock as recovered from the inbound stream, read back
+    /// from the clock block this path publishes into the input ring.
+    ///
+    /// This is the ONLY place the recovered clock is available in a duplex
+    /// session. The input ring is created here, on the first AAF packet — so
+    /// anything that tried to `ShmRing::attach()` it during start-up found
+    /// nothing and silently fell back to a gPTP-derived rate. The 16R's audio
+    /// hardware is what the samples are actually paced by, and a gPTP-derived
+    /// 48 kHz is a different 48 kHz.
+    pub fn recovered_clock(&self) -> Option<avb_audioring::ClockBlock> {
+        self.ring.as_ref()?.ring().read_clock()
+    }
+
     pub fn has_ring(&self) -> bool {
         self.ring.is_some()
     }

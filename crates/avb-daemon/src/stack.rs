@@ -2571,19 +2571,25 @@ fn talker_loop(
     for w in clocksel.take_warnings() {
         log.log(Level::Warn, "clock", &w);
     }
-    // The recovered 16R media clock lives on the INPUT ring, which exists only
-    // while a listener session runs. Attach read-only if it is there, so the
-    // "16R media clock" choice can be honoured during a simultaneous record
-    // and play.
+    // The recovered 16R media clock lives on the INPUT ring. In duplex our own
+    // inbound path creates that ring once the first AAF packet arrives, so
+    // there is nothing to attach yet and we must NOT conclude the clock is
+    // unavailable. Attaching read-only here covers only the other case: a
+    // `play` session running alongside a separate `record`.
     let recovered_ring = avb_audioring::ShmRing::attach().ok();
     log.log(
         Level::Info,
         "clock",
-        if recovered_ring.is_some() {
-            "input ring present — the 16R's recovered media clock is available"
-        } else {
-            "no input ring — the 16R's recovered media clock is unavailable \
-             (run `record` alongside `play` to use it)"
+        match (duplex, recovered_ring.is_some()) {
+            (true, _) => {
+                "duplex — the 16R's recovered media clock will come from our own inbound \
+                 stream once the first packet arrives"
+            }
+            (false, true) => "input ring present — the 16R's recovered media clock is available",
+            (false, false) => {
+                "no input ring — the 16R's recovered media clock is unavailable \
+                 (use `duplex`, or run `record` alongside `play`)"
+            }
         },
     );
     let mut last_clock_pub = now_mach();
@@ -3194,7 +3200,21 @@ fn talker_loop(
                 log.log(Level::Warn, "clock", &w);
             }
             let st = gptp.status();
-            let recovered = recovered_ring.as_ref().and_then(|r| r.ring().read_clock());
+            // Where the recovered 16R media clock comes from.
+            //
+            // In DUPLEX our own inbound path owns the input ring, and it
+            // creates that ring when the first AAF packet arrives — which is
+            // long after this loop's start-up `ShmRing::attach()` ran. So that
+            // attach always failed in duplex, `recovered` was always None, and
+            // a session with the 16R's media clock arriving on the wire every
+            // 125 us still reported it "unavailable" and ran the device
+            // timeline on a gPTP-derived rate instead. Ask the live inbound
+            // path first; the start-up attach remains the path for a `play`
+            // session running alongside a separate `record`.
+            let recovered = crate::clocksrc::recovered_for(
+                lrx.recovered_clock(),
+                recovered_ring.as_ref().and_then(|r| r.ring().read_clock()),
+            );
             let decision = clocksel.decide(
                 recovered,
                 st.gptp_ppm_vs_mach,
