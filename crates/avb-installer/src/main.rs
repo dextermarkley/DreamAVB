@@ -106,19 +106,166 @@ define_class!(
         }
 
         #[unsafe(method(request:didFailWithError:))]
-        fn did_fail(&self, _request: &OSSystemExtensionRequest, error: &NSError) {
+        fn did_fail(&self, request: &OSSystemExtensionRequest, error: &NSError) {
             let code = error.code();
-            eprintln!(
-                "request failed: {} (domain {}, code {} = {})",
-                error.localizedDescription(),
-                error.domain(),
-                code,
-                error_code_name(code)
-            );
-            std::process::exit(2);
+            let name = error_code_name(code);
+            // A failure callback is NOT proof the operation failed.
+            //
+            // On an UPGRADE, sysextd replaces the running dext and then reports
+            // ExtensionNotFound for the one it just superseded — so this fires
+            // with code 4 on a request that actually succeeded. Measured:
+            // activating 284.2.33 over a live 283.0.31 printed
+            // "request failed: ... code 4 = ExtensionNotFound" while
+            // `systemextensionsctl list` showed 284.2.33 [activated enabled]
+            // and the old one "terminating for upgrade via delegate".
+            //
+            // Exiting non-zero on that wastes a hardware session chasing a
+            // driver that is already loaded, so check the real state before
+            // believing the error.
+            let ident = unsafe { request.identifier() }.to_string();
+            match activated_enabled_version(&ident) {
+                Some(v) => {
+                    println!(
+                        "request reported an error ({name}, code {code}) but \
+                         {ident} is now activated and enabled at version {v} — \
+                         treating it as a successful upgrade"
+                    );
+                    eprintln!("  the error was: {}", error.localizedDescription());
+                    std::process::exit(0);
+                }
+                None => {
+                    eprintln!(
+                        "request failed: {} (domain {}, code {} = {name})",
+                        error.localizedDescription(),
+                        error.domain(),
+                        code,
+                    );
+                    std::process::exit(2);
+                }
+            }
         }
     }
 );
+
+/// The version of `ident` that `systemextensionsctl` reports as activated AND
+/// enabled, if any.
+///
+/// Shelling out rather than asking the framework: there is no public API for
+/// "what is active right now", and this is the same list a human would read to
+/// settle the question. Lines look like:
+///
+/// ```text
+/// *  *  -  com.avbaudio.installer.i210 (284.2.33/284.2.33)  AVBI210Driver  [activated enabled]
+/// ```
+///
+/// Both leading `*` columns (enabled, active) must be set, and the state must
+/// be `activated enabled` — a dext that is merely staged, disabled, or
+/// terminating does not count as success.
+fn activated_enabled_version(ident: &str) -> Option<String> {
+    let out = Command::new("/usr/bin/systemextensionsctl")
+        .arg("list")
+        .output()
+        .ok()?;
+    parse_activated_enabled(&String::from_utf8_lossy(&out.stdout), ident)
+}
+
+/// The pure parser behind [`activated_enabled_version`], split out so it can be
+/// tested against captured `systemextensionsctl` output instead of whatever
+/// this machine happens to have installed.
+fn parse_activated_enabled(text: &str, ident: &str) -> Option<String> {
+    text.lines()
+        .filter(|l| l.contains(ident) && l.contains("[activated enabled]"))
+        .find_map(|l| {
+            // The two status columns precede the team id and bundle id.
+            let cols: Vec<&str> = l.split('\t').collect();
+            let enabled = cols.first().is_some_and(|c| c.trim() == "*");
+            let active = cols.get(1).is_some_and(|c| c.trim() == "*");
+            if !(enabled && active) {
+                return None;
+            }
+            // "(284.2.33/284.2.33)" -> "284.2.33"
+            let open = l.find('(')?;
+            let close = l.get(open..)?.find(')')? + open;
+            let span = l.get(open + 1..close)?;
+            Some(span.split('/').next().unwrap_or(span).to_string())
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real `systemextensionsctl list` output captured during the upgrade that
+    /// exposed the misreport: 284.2.33 went live while sysextd reported
+    /// ExtensionNotFound, and 283.0.31 was still terminating.
+    const LIST: &str = "\
+--- com.apple.system_extension.driver_extension (Go to 'System Settings' to modify)
+enabled\tactive\tteamID\tbundleID (version)\tname\t[state]
+*\t*\t-\tcom.avbaudio.installer.i210 (284.2.33/284.2.33)\tAVBI210Driver\t[activated enabled]
+*\t*\t64H3QYW26T\tcom.fender.tusbaudiodriver (1.15.0/1.15.0)\tcom.fender.tusbaudiodriver\t[activated enabled]
+\t*\t8NG8NMGYVF\tcom.avbaudio.installer.i210 (282.7.31/282.7.31)\tAVBI210Driver\t[activated disabled]
+\t\t-\tcom.avbaudio.installer.i210 (283.0.31/283.0.31)\tAVBI210Driver\t[terminating for upgrade via delegate]
+";
+
+    #[test]
+    fn finds_the_activated_enabled_version_among_several_entries() {
+        assert_eq!(
+            parse_activated_enabled(LIST, DEXT_I210),
+            Some("284.2.33".to_string())
+        );
+    }
+
+    /// The three non-live states in that same output must NOT be read as
+    /// success: a disabled one, a terminating one, and another vendor's dext.
+    #[test]
+    fn staged_disabled_and_terminating_entries_do_not_count() {
+        // Strip the one live line; nothing else may satisfy the query, even
+        // though two other i210 entries remain.
+        let without_live: String = LIST
+            .lines()
+            .filter(|l| !l.contains("284.2.33"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            without_live.contains("282.7.31"),
+            "fixture still has others"
+        );
+        assert!(without_live.contains("283.0.31"));
+        assert_eq!(parse_activated_enabled(&without_live, DEXT_I210), None);
+    }
+
+    #[test]
+    fn another_bundle_id_is_not_ours() {
+        assert_eq!(
+            parse_activated_enabled(LIST, "com.fender.tusbaudiodriver"),
+            Some("1.15.0".to_string())
+        );
+        assert_eq!(parse_activated_enabled(LIST, DEXT_BCM), None);
+    }
+
+    /// An entry marked `[activated enabled]` but missing a status column is
+    /// not live, so the state string alone must not be trusted.
+    #[test]
+    fn the_state_string_alone_is_not_enough() {
+        let half =
+            "\t*\t-\tcom.avbaudio.installer.i210 (9.9.9/9.9.9)\tAVBI210Driver\t[activated enabled]";
+        assert_eq!(parse_activated_enabled(half, DEXT_I210), None);
+    }
+
+    #[test]
+    fn empty_or_malformed_output_is_not_a_version() {
+        assert_eq!(parse_activated_enabled("", DEXT_I210), None);
+        assert_eq!(parse_activated_enabled("garbage", DEXT_I210), None);
+        // Marked live but with no version parenthesis to read.
+        assert_eq!(
+            parse_activated_enabled(
+                "*\t*\t-\tcom.avbaudio.installer.i210\tAVBI210Driver\t[activated enabled]",
+                DEXT_I210
+            ),
+            None
+        );
+    }
+}
 
 impl AvbRequestDelegate {
     fn new() -> Retained<Self> {
