@@ -12,8 +12,11 @@ Read this file first, then `AGENTS.md` (rules) and the docs it points to.
   - The design is approved at rev 5: `.agents/tasks/phase1a-design.md`. Design review pass 5 is APPROVED.
   - The plan is `.agents/tasks/phase1a-plan.md`. It is split into FEAT files under `.agents/tasks/task-phase1a-listener/`.
 - Phase 1b (Mac → 16R playback, talker) is in progress on branch `feat/companion-app`.
-  See "Phase 1b: talker" below for the resume point. Audio does not yet reach
-  the 16R's outputs.
+  See "Phase 1b: talker" below for the resume point. **Bidirectional audio now
+  works on the live 16R** (`1e88c37`): `avb-daemon duplex` gets Listener Ready
+  in both directions, with the outbound peak measured at -8.7 dBFS and ~48000
+  frames/s inbound. Remaining known gaps are the Mac-vs-16R media clock, one
+  stream per direction out of eight, and a talker-only AEM.
 
 | FEAT | Scope | Status | Commit |
 |---|---|---|---|
@@ -125,60 +128,71 @@ covered by a test that would have):
 
 ### Resume point
 
-The dext for (5) is now INSTALLED and attached: `284.2.33` is `activated
-enabled` and driving the I210 (`avb-probe info` reads the device through it).
-Do not re-activate for the TX ceiling. Note that `package.sh` derives its
-version from the wall clock, so a repackage bumps the PACKAGE version while
-the installed one stays `284.2.33` — that difference is a version-number
-artifact, not a content difference.
+**Bidirectional audio WORKS on the live 16R** (`1e88c37`). `avb-daemon duplex`
+reaches `listener_ready=true` in both directions with real audio measured on
+each. The verified 30 s / 60 s runs are under "Verified on hardware at
+`1e88c37`" below. Four hardware-only bugs had to be fixed to get there; all
+four are described in `54c5d92`'s commit message and summarised under
+"Hard-won lessons".
 
-The HAL plug-in is currently NOT installed (it was removed by hand while
-chasing a coreaudiod CPU spike that turned out not to be ours — see "Hard-won
-lessons"). It must be reinstalled before a playback test:
+The dext for (5) is INSTALLED and attached: `284.2.33` is `activated enabled`
+and driving the I210 (`avb-probe info` reads the device through it). Do not
+re-activate for the TX ceiling. Note that `package.sh` derives its version
+from the wall clock, so a repackage bumps the PACKAGE version while the
+installed one stays `284.2.33` — a version-number artifact, not a content
+difference.
+
+The HAL plug-in IS installed (`/Library/Audio/Plug-Ins/HAL/AVBAudio.driver`,
+installed 2026-10-12 09:10) and is producing into the output ring: a duplex run
+reports `0 underruns` and a non-zero outbound peak, which is only possible with
+a live producer. The earlier note that it was missing is stale.
+
+To re-verify the whole chain, nothing needs to be run by hand — use the
+companion app's **Audio** toggle. For a bounded CLI run instead:
 
 ```
-sudo cp -R /Users/dexter/AVB-Audio/build/AVBAudio.driver /Library/Audio/Plug-Ins/HAL/
-sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
-/Users/dexter/AVB-Audio/build/AVBInstaller.app/Contents/MacOS/avb-daemon play --seconds 60 --log-level info
+/Users/dexter/AVB-Audio/build/AVBInstaller.app/Contents/MacOS/avb-daemon duplex --seconds 30 --log-level info
 ```
 
-`play` now WAITS for gPTP lock before transmitting a single PDU, so expect a
-`gPTP locked ... arming the talker` line first; if the servo does not lock
-within the discovery timeout the run exits rather than streaming on an
-undisciplined clock. Then read the summary: `PDUs on the wire` should be
-~8000/s with `rate-limited 0`, `AEM commands answered` should be non-zero (if
-it is zero the 16R never tried to enumerate us, which is a different fault),
-and `listener_ready` must become true.
+Read, in order: `selected 16R STREAM_INPUT 1 (Return 1-8)`,
+`output format derived`, `answered CONNECT_TX_COMMAND`,
+`16R declared Listener Ready`, `gPTP locked ... arming the talker`, then the
+two summary lines. The outbound peak distinguishes audio from
+correctly-formed silence; `frames placed into the input ring` must be ~48000/s.
 
-The output format is no longer hardcoded (`d01d534`). `play` now discovers the
-16R, reads its CONFIGURATION, every STREAM_INPUT and AUDIO_UNIT 0 over AECP,
-and derives the format from the sink named by `--listener-uid`. Two
-consequences to expect on hardware:
+The output format is no longer hardcoded (`d01d534`). `duplex`/`play` discover
+the 16R, read its CONFIGURATION, every STREAM_INPUT/STREAM_OUTPUT and
+AUDIO_UNIT 0 over AECP, and derive both directions' formats from the streams
+actually bound. Any failure REFUSES to transmit rather than falling back.
 
-- A new log line, `16R AEM: N of M STREAM_INPUT sinks read`, then
-  `output format derived from 16R STREAM_INPUT <uid>`. Any failure REFUSES to
-  transmit rather than falling back to a default.
-- `--listener <id>` now selects which entity to WAIT for rather than skipping
+- `--listener-uid` is now OPTIONAL and defaults to **derived**, not 0. The
+  16R's STREAM_INPUT 0 is `Return CRF` and STREAM_OUTPUT 0 is `Send CRF` — its
+  media clock, not audio — so a fixed 0 reserved and connected a stream that
+  carries no audio. Its audio streams are 1..=8 (`Return 1-8` ..
+  `Return 57-64`, 8 ch each = 64 channels).
+- `--listener <id>` selects which entity to WAIT for rather than skipping
   discovery, because a unicast AECP read needs the 16R's MAC and only an
   observed ADPDU carries it.
-- UNVERIFIED RISK: we no longer advertise ourselves during the discovery
-  window, because our ADP is built from the entity model and the model is
-  built from the format we are going to read. If the 16R declines AECP from a
-  controller it has not discovered, the AEM read times out with a clear
-  message. That is an empirical question for the next hardware run; the fix,
-  if needed, is a bootstrap advertisement before the read.
+- RESOLVED (was an unverified risk): not advertising ourselves during the
+  discovery window is FINE. The 16R answers AECP from a controller it has not
+  yet discovered — `9 of 9 STREAM_INPUT sinks read` on every run. No bootstrap
+  advertisement is needed.
 
 Still unbuilt, and the next likely blockers:
 
-- **Duplex is BUILT but UNVERIFIED on hardware.** `avb-daemon duplex` runs
-  both directions in one process and the companion drives it; nothing about it
-  has met the 16R. Run it and read the two inbound warnings first (see the
-  product section below). The AEM is the known incompleteness: our entity
-  still advertises a talker-only model, so the inbound data path works
-  (ACMP CONNECT_TX + MSRP Listener Ready do not need us to advertise a
-  STREAM_INPUT) while a third-party controller would not see our input
-  stream. Merging the listener and talker AEM models into one entity is the
-  fix, and is also what CLOCK_SOURCE needs below.
+- **The 16R asks us for CONTROL (`0x001a`) index 0 and we answer
+  NO_SUCH_DESCRIPTOR** — five times per run. We never advertise CONTROL in our
+  `descriptor_counts`, so the refusal is spec-correct and it does NOT block
+  binding (`listener_ready=true` with the refusals present). Milan does
+  require an IDENTIFY control, so a third-party controller may want it. Not
+  urgent, and it must not be guessed: a CONTROL descriptor with an invented
+  `control_type` is exactly the unanchored-wire-field mistake `AGENTS.md`
+  forbids.
+- **Our AEM advertises a talker-only model.** The inbound data path works
+  without it (ACMP CONNECT_TX + MSRP Listener Ready do not need us to
+  advertise a STREAM_INPUT), but a third-party controller would not see our
+  input stream. Merging the listener and talker AEM models into one entity is
+  the fix, and is also what CLOCK_SOURCE needs below.
 - **GET_STREAM_INFO answers NOT_IMPLEMENTED on purpose.** Its 32-bit flags
   word needs bit positions from 1722.1-2021 Table 7.206. The working group's
   own clarification (Illouz, "AVDECC clarifications Part 2 — AEM commands",
@@ -195,7 +209,42 @@ Still unbuilt, and the next likely blockers:
 - **The media clock is the Mac's, not the 16R's.** CoreAudio produces on the
   host clock while we transmit paced by gPTP, so the two drift. This is the
   mirror image of the listener's ring problem and is why STREAM_OUTPUT does
-  not advertise CLOCK_SYNC_SOURCE. Unaddressed.
+  not advertise CLOCK_SYNC_SOURCE. Unaddressed, and the most likely cause of
+  audible artefacts over a long outbound run.
+- **Only one stream per direction.** We bind STREAM_INPUT 1 / STREAM_OUTPUT 1,
+  so 8 channels each way out of the 16R's 64. Binding all eight is the next
+  capacity step.
+
+## Verified on hardware at `1e88c37` (duplex, live 16R over the I210)
+
+Two runs, `avb-daemon duplex --seconds 30` and `--seconds 60`, both exit 0:
+
+```
+selected 16R STREAM_INPUT 1 (Return 1-8) as our audio sink
+output format derived from 16R STREAM_INPUT 1: 0x0205022002006000
+  (48000 Hz, 8 ch, 6 spf, 32-bit)
+16R AEM: 9 of 9 STREAM_INPUT sinks read, AUDIO_UNIT rate 48000 Hz
+16R AEM: 9 of 9 STREAM_OUTPUT sources read
+selected 16R STREAM_OUTPUT 1 (Send 1-8) as our audio source
+answered CONNECT_TX_COMMAND from the 16R: type 0x00 -> 0x01 status 0
+16R declared Listener Ready for our stream — accepted
+gPTP locked (asCapable=true offset 85 ns, path delay 144 ns)
+
+talker done:   163007 PDUs on the wire, 0 rate-limited, 0 otherwise refused,
+               0 underruns over 30s; outbound peak 788886592 (-8.7 dBFS);
+               16R listener_ready=true; AEM answered=51 refused=5;
+               ACMP talker commands answered=1; gPTP servo=LOCKED offset 0 ns
+listener done: 239267 audio slots, 0 not decodable as AAF, 1435602 frames
+               placed into the input ring, 0 format mismatches;
+               Listener Ready declared for 1 stream(s), dext filter entries 1
+```
+
+- Inbound rate: 1435602 frames / 30 s = **47853/s**, and 2878416 / 60 s =
+  **47974/s** — 48 kHz within 0.06 %.
+- Outbound peak **-8.7 dBFS** proves the whole CoreAudio -> HAL plug-in ->
+  output ring -> AAF -> 16R chain carries real audio, not framed silence.
+- The 5 AEM refusals are all CONTROL `0x001a` index 0 (see above) and do not
+  prevent binding.
 
 ## Product packaging and the companion app (at `22dbef0`)
 
@@ -383,6 +432,35 @@ TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ make -C /Users/dexter/AVB-Audio/driv
 - 16R / Milan streams are AAF PCM 32-bit, 8 ch per stream, 6 samples/frame at 48 kHz, class A. Rates and channel counts must come from the AEM, never be hardcoded.
 - GPL/LGPL references (Linux tg3/igb, igb_avb kernel part, L-Acoustics avdecc) may be used for behavior only. Never copy their code.
 - Distribution later needs a paid Apple Developer account plus a DriverKit PCI entitlement request for 8086:1533. The odds are better than for the Broadcom.
+- **`unique_id` 0 on a Milan device is not audio.** The 16R's STREAM_INPUT 0 is
+  `Return CRF` and STREAM_OUTPUT 0 is `Send CRF` — its media-clock stream.
+  Binding it succeeds at every protocol layer (reservation, ACMP, Listener
+  Ready) and moves no audio. Always derive the stream index from the AEM
+  (`derive::first_audio_stream`) and refuse when there is no AAF stream, rather
+  than defaulting to 0.
+- **A talker MUST answer the listener's `CONNECT_TX_COMMAND`.** Sending
+  `CONNECT_RX_COMMAND` as the controller is only half of ACMP: the listener
+  then asks the TALKER to connect, and only after `CONNECT_TX_RESPONSE` does it
+  declare MSRP Listener Ready. We never routed inbound ACMP in the talker loop,
+  so the 16R waited on us forever and discarded every PDU — which looks exactly
+  like a transmit fault. `avb-daemon`'s summary now reports
+  `ACMP talker commands answered`, so "never asked to connect" is
+  distinguishable from "asked and then withheld Ready".
+- **Descriptor `*_offset` fields are ABSOLUTE from the descriptor's first byte,
+  and the array does not follow the fixed part.** The 16R puts STREAM formats
+  at byte 132 (not 86) and AUDIO_UNIT `current_sampling_rate` at 136 (not 80 —
+  there are 14 `(number_of_*, base_*)` port pairs in between). Reading them
+  sequentially gave ten all-zero formats and a healthy 48 kHz unit decoded as
+  "0 Hz". Every unit test passed because our encoder wrote the same wrong
+  layout our decoder read — a **round-trip tautology**, the same class as the
+  wrong `WriteMix` FourCC. The fix is `aem::desc::hw_16r`: decode tests pinned
+  to hex captured off the wire by `avb-daemon aem-dump`, which cannot agree
+  with a bug in our own layout. Never accept `decode(encode(x)) == x` as
+  evidence of wire-format correctness.
+- **A protocol success is not an audio success.** A duplex run can report
+  Listener Ready, 8000 PDUs/s, zero underruns and zero rate-limited while
+  transmitting pure zeros. The talker now reports the outbound peak in dBFS, or
+  says "digital silence" outright.
 
 ## User decisions
 
