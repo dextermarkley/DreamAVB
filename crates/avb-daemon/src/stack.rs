@@ -2856,6 +2856,10 @@ fn talker_loop(
     // — a different fault from the dext rate-limiting us, and it must not hide
     // behind the PDU count.
     let mut missed_intervals: u64 = 0;
+    // When the talker armed, so the summary can report rates over the window
+    // frames were actually being sent in rather than over the whole run, which
+    // includes discovery, the AEM reads and the gPTP lock wait.
+    let mut armed_at_ns: Option<u64> = None;
     let mut last_connect = now_mach();
     let mut last_advert = now_mach();
     // AEM commands we answered, and how many we had to refuse. A run where the
@@ -3360,6 +3364,7 @@ fn talker_loop(
         if !armed {
             if gptp.is_locked() {
                 armed = true;
+                armed_at_ns = Some(ns_since(start));
                 let st = gptp.status();
                 log.log(
                     Level::Info,
@@ -3787,6 +3792,36 @@ fn talker_loop(
             "the 16R never sent us a single AEM command — it did not try to \
              enumerate us, so check that our ADP advertisement is reaching it",
         );
+    }
+    // What TX ceiling the dext ACTUALLY enforced, measured.
+    //
+    // The ceiling is compiled into the driver and nothing reports it, so after
+    // an upgrade that silently did not take there is no way to tell which one
+    // is live — a blind instrument, and this project has been caught by those
+    // before. Attempts, grants and the window are all in hand, so derive it
+    // rather than reasoning about build timestamps.
+    if let Some(armed_ns) = armed_at_ns {
+        let window_s = (run_ns.saturating_sub(armed_ns)) as f64 / 1e9;
+        let attempts = tx_pdus + tx_rate_limited + tx_rejected;
+        if window_s > 1.0 && attempts > 0 {
+            log.log(
+                Level::Info,
+                dir,
+                &format!(
+                    "TX over the {window_s:.1}s armed window: {:.0} frames/s attempted, {:.0}/s reached the wire{}",
+                    attempts as f64 / window_s,
+                    tx_pdus as f64 / window_s,
+                    if tx_rate_limited > 0 {
+                        format!(
+                            " — the dext granted about {:.0} frames/s, which is its compiled-in SAF-6 ceiling whatever the source now says",
+                            tx_pdus as f64 / window_s
+                        )
+                    } else {
+                        String::new()
+                    }
+                ),
+            );
+        }
     }
     if tx_rate_limited != 0 {
         log.log(

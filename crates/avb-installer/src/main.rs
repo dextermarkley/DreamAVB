@@ -123,8 +123,11 @@ define_class!(
             // driver that is already loaded, so check the real state before
             // believing the error.
             let ident = unsafe { request.identifier() }.to_string();
+            let want = bundled_dext_version(&ident);
             match activated_enabled_version(&ident) {
-                Some(v) => {
+                // Active AND the version we asked for: the benign
+                // upgrade-reports-failure case.
+                Some(v) if want.as_deref().is_none_or(|w| w == v) => {
                     println!(
                         "request reported an error ({name}, code {code}) but \
                          {ident} is now activated and enabled at version {v} — \
@@ -132,6 +135,32 @@ define_class!(
                     );
                     eprintln!("  the error was: {}", error.localizedDescription());
                     std::process::exit(0);
+                }
+                // Active, but STILL AT THE OLD VERSION. This is a genuinely
+                // failed upgrade and must not be reported as a success.
+                //
+                // The first version of this check asked only "is the
+                // identifier activated and enabled", which is true of the
+                // extension that was ALREADY running — so a request that
+                // changed nothing printed "treating it as a successful
+                // upgrade" and exited 0. Measured: asking for 284.20.50 while
+                // 284.19.2 was live reported success at 284.19.2, and the new
+                // driver never loaded. Comparing against what we actually
+                // submitted is the whole point of verifying.
+                Some(v) => {
+                    eprintln!(
+                        "request FAILED: {ident} is still at version {v}, but this bundle \
+                         asked for {}",
+                        want.as_deref().unwrap_or("(unknown)")
+                    );
+                    eprintln!("  the error was: {}", error.localizedDescription());
+                    eprintln!(
+                        "  the running extension was NOT replaced. sysextd often has an older \
+                         copy stuck in `terminating for upgrade via delegate`, which blocks \
+                         further upgrades until a reboot clears it — check \
+                         `systemextensionsctl list`."
+                    );
+                    std::process::exit(2);
                 }
                 None => {
                     eprintln!(
@@ -147,10 +176,40 @@ define_class!(
     }
 );
 
+/// The version of `ident` that THIS bundle is asking to install, read from the
+/// extension's own `Info.plist` inside `Contents/Library/SystemExtensions/`.
+///
+/// Needed to tell a successful upgrade from one that changed nothing. The
+/// activation request itself does not report the version it submitted on the
+/// failure path, and `action_for_replacing` — which does see both versions —
+/// is not called at all when sysextd declines to treat the request as a
+/// replacement, which is exactly the case that needs catching.
+///
+/// `None` means we could not read it, and the caller then falls back to the
+/// weaker "is it active at all" check rather than refusing a good upgrade.
+fn bundled_dext_version(ident: &str) -> Option<String> {
+    let plist = NSBundle::mainBundle()
+        .bundlePath()
+        .to_string()
+        .parse::<std::path::PathBuf>()
+        .ok()?
+        .join("Contents/Library/SystemExtensions")
+        .join(format!("{ident}.dext"))
+        .join("Info.plist");
+    let text = std::fs::read_to_string(&plist).ok()?;
+    // Minimal, dependency-free read of one string key from an XML plist:
+    // <key>CFBundleVersion</key> followed by the next <string>…</string>.
+    let after_key = text.split("<key>CFBundleVersion</key>").nth(1)?;
+    let open = after_key.find("<string>")? + "<string>".len();
+    let rest = after_key.get(open..)?;
+    let close = rest.find("</string>")?;
+    let v = rest.get(..close)?.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
 /// The version of `ident` that `systemextensionsctl` reports as activated AND
 /// enabled, if any.
-///
-/// Shelling out rather than asking the framework: there is no public API for
+////// Shelling out rather than asking the framework: there is no public API for
 /// "what is active right now", and this is the same list a human would read to
 /// settle the question. Lines look like:
 ///
@@ -263,6 +322,60 @@ enabled\tactive\tteamID\tbundleID (version)\tname\t[state]
                 DEXT_I210
             ),
             None
+        );
+    }
+
+    /// Real output from the FAILED upgrade this check was added for: the
+    /// request asked for 284.20.50 and 284.19.2 stayed live, with an older
+    /// copy still stuck terminating.
+    const LIST_STALLED: &str = "\
+--- com.apple.system_extension.driver_extension (Go to 'System Settings' to modify)
+enabled\tactive\tteamID\tbundleID (version)\tname\t[state]
+*\t*\t-\tcom.avbaudio.installer.i210 (284.19.2/284.19.2)\tAVBI210Driver\t[activated enabled]
+\t\t-\tcom.avbaudio.installer.i210 (284.2.33/284.2.33)\tAVBI210Driver\t[terminating for upgrade via delegate]
+\t*\t8NG8NMGYVF\tcom.avbaudio.installer.i210 (282.7.31/282.7.31)\tAVBI210Driver\t[activated disabled]
+";
+
+    /// THE REGRESSION. "Is the identifier activated and enabled" is true of
+    /// the extension that was ALREADY running, so a request that replaced
+    /// nothing reported a successful upgrade and exited 0. The version we
+    /// submitted has to be part of the comparison.
+    ///
+    /// Asserts the DECISION, not just the parse.
+    #[test]
+    fn an_upgrade_that_changed_nothing_is_not_a_success() {
+        let active = parse_activated_enabled(LIST_STALLED, DEXT_I210).expect("one is live");
+        assert_eq!(active, "284.19.2");
+
+        // The predicate `did_fail` applies.
+        let is_success = |want: Option<&str>, active: &str| want.is_none_or(|w| w == active);
+
+        // The real case: asked for 284.20.50, got 284.19.2 — NOT a success.
+        assert!(
+            !is_success(Some("284.20.50"), &active),
+            "a stalled upgrade must not report success"
+        );
+        // The benign case this must still allow: the version we asked for IS
+        // live and sysextd merely reported ExtensionNotFound for the one it
+        // superseded.
+        assert!(is_success(Some("284.19.2"), &active));
+        // An unreadable bundle version falls back to the weaker check rather
+        // than refusing a good upgrade.
+        assert!(is_success(None, &active));
+    }
+
+    /// An older copy stuck `terminating for upgrade via delegate` must not be
+    /// read as active, or the stalled list would look like a clean one.
+    #[test]
+    fn a_terminating_copy_is_not_read_as_active() {
+        assert_eq!(
+            parse_activated_enabled(LIST_STALLED, DEXT_I210).as_deref(),
+            Some("284.19.2")
+        );
+        assert!(LIST_STALLED.contains("284.2.33"));
+        assert_ne!(
+            parse_activated_enabled(LIST_STALLED, DEXT_I210).as_deref(),
+            Some("284.2.33")
         );
     }
 }
