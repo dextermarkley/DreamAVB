@@ -241,6 +241,15 @@ pub mod clock_source {
     pub const EXTERNAL: u16 = 0x0001;
     pub const INPUT_STREAM: u16 = 0x0002;
 }
+/// AVB_INTERFACE `interface_flags` (§7.2.8). The design (§9.3) names the two
+/// we set: GPTP_SUPPORTED and SRP_SUPPORTED. GPTP_GRANDMASTER_SUPPORTED is
+/// named here so it can be asserted ABSENT -- our port is slave-only and never
+/// sends Announce or Sync (§7), so claiming it would be false.
+pub mod if_flags {
+    pub const GPTP_GRANDMASTER_SUPPORTED: u16 = 1 << 0;
+    pub const GPTP_SUPPORTED: u16 = 1 << 1;
+    pub const SRP_SUPPORTED: u16 = 1 << 2;
+}
 
 /// Stream flags in STREAM_INPUT/OUTPUT descriptors (IEEE 1722.1-2021 §7.2.6,
 /// Table 7.11).
