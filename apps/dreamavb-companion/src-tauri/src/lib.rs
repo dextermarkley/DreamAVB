@@ -708,17 +708,66 @@ async fn set_clock_source(value: String) -> Result<ClockSourceInfo, String> {
     Ok(clock_source_info(loaded, warnings))
 }
 
-/// Has the popover actually taken focus since it was last shown?
-///
-/// Clicking a menu-bar status item does NOT give the popover key focus on
-/// macOS — the status item keeps it — so `WindowEvent::Focused(false)` can
-/// arrive immediately after `show()`. The hide-on-blur handler then closes the
-/// window in the same breath as opening it, which looks exactly like a tray
-/// icon that does nothing. So a blur is only honoured once the window has
-/// genuinely been focused.
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
+/// Has the popover taken focus since it was last shown?
 static POPOVER_FOCUSED: AtomicBool = AtomicBool::new(false);
+
+/// When the popover was last shown, for the blur grace period below.
+static POPOVER_SHOWN_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How long after `show()` a blur is ignored.
+///
+/// A focus guard alone is NOT enough, and assuming otherwise is why the tray
+/// icon still looked dead after the first fix: `toggle_window` asks for focus
+/// explicitly, so `Focused(true)` arrives at once and arms the guard, the
+/// status item then takes focus back, and the resulting `Focused(false)` hides
+/// the window in the same breath as opening it. A short window of time is the
+/// robust form, because it does not depend on the order macOS delivers focus
+/// events in.
+const BLUR_GRACE: Duration = Duration::from_millis(600);
+
+/// Should a `Focused(false)` event actually hide the popover?
+///
+/// Pure so the grace period is testable without a window: `visible_for` is how
+/// long the popover has been up, `None` when it was never shown.
+fn should_hide_on_blur(ever_focused: bool, visible_for: Option<Duration>) -> bool {
+    match visible_for {
+        Some(d) => ever_focused && d >= BLUR_GRACE,
+        None => false,
+    }
+}
+
+/// Append a line to `~/Library/Logs/DreamAVB.log`.
+///
+/// The tray click path cannot be observed from a test — whether macOS delivers
+/// the click as `Left`+`Up` at all, and what rectangle it reports, is only
+/// knowable from the running app. Two fixes were made from theory before this
+/// existed; this is the instrument.
+fn diag(msg: &str) {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let mut path = std::path::PathBuf::from(home);
+    path.push("Library/Logs");
+    let _ = std::fs::create_dir_all(&path);
+    path.push("DreamAVB.log");
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(f, "[{secs}] {msg}");
+}
 
 /// Show the popover under the tray icon, or hide it if it is already up.
 ///
@@ -728,22 +777,71 @@ static POPOVER_FOCUSED: AtomicBool = AtomicBool::new(false);
 /// documented as positioning "near the tray" but never set a position at all.
 fn toggle_window(app: &tauri::AppHandle, icon_rect: Option<tauri::Rect>) {
     let Some(w) = app.get_webview_window("main") else {
+        diag("toggle: no window labelled 'main'");
         return;
     };
-    if w.is_visible().unwrap_or(false) {
+    let visible = w.is_visible().unwrap_or(false);
+    diag(&format!("toggle: visible_before={visible} rect={icon_rect:?}"));
+    if visible {
         let _ = w.hide();
+        *POPOVER_SHOWN_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return;
     }
     if let Some(rect) = icon_rect {
         position_under(&w, rect);
     }
     POPOVER_FOCUSED.store(false, Ordering::SeqCst);
-    let _ = w.show();
+    *POPOVER_SHOWN_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    let shown = w.show();
     // An Accessory app has no Dock icon and is not "active", so the window
     // will not come forward on its own: ask for the app AND the window.
     #[cfg(target_os = "macos")]
     let _ = w.set_focus();
     let _ = w.set_always_on_top(true);
+    diag(&format!(
+        "toggle: show={:?} visible_after={:?} pos={:?} size={:?}",
+        shown.is_ok(),
+        w.is_visible(),
+        w.outer_position(),
+        w.outer_size()
+    ));
+}
+
+/// A monitor's physical bounds, for [`popover_position`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MonitorBox {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// Where to put the popover for a status item at `icon_x`/`icon_y`.
+///
+/// Pure so the clamping is testable. Both axes are bounded: clamping only `x`
+/// (as this first did) leaves a `y` from the click event free to put the window
+/// wholly off-screen, which is indistinguishable from a tray icon that does
+/// nothing. `mon` is `None` when the monitor cannot be read, in which case the
+/// icon position is used unclamped.
+fn popover_position(
+    icon_x: f64,
+    icon_y: f64,
+    icon_w: f64,
+    win_w: f64,
+    win_h: f64,
+    mon: Option<MonitorBox>,
+    margin: f64,
+) -> (i32, i32) {
+    // Centre on the icon; just below the menu bar, where the icon's rect ends.
+    let mut x = icon_x + icon_w / 2.0 - win_w / 2.0;
+    let mut y = icon_y + margin / 2.0;
+    if let Some(m) = mon {
+        // max() after min() so a window wider/taller than the screen still
+        // lands on it rather than being pushed off the near edge.
+        x = x.min(m.x + m.w - win_w - margin).max(m.x + margin);
+        y = y.min(m.y + m.h - win_h - margin).max(m.y + margin);
+    }
+    (x.round() as i32, y.round() as i32)
 }
 
 /// Place the popover centred under the status item, clamped onto the screen.
@@ -759,27 +857,25 @@ fn position_under(w: &tauri::WebviewWindow, rect: tauri::Rect) {
         (Position::Logical(p), _) => (p.x * scale, p.y * scale, 0.0),
     };
     let (icon_x, icon_y, icon_w) = icon;
-    let win_w = w
+    let (win_w, win_h) = w
         .outer_size()
-        .map(|s| s.width as f64)
-        .unwrap_or(360.0 * scale);
-    // Centre on the icon, then nudge inside the screen's right edge so the
-    // popover is never half off-screen for an icon near the corner.
-    let mut x = icon_x + icon_w / 2.0 - win_w / 2.0;
-    if let Ok(Some(mon)) = w.current_monitor() {
-        let m = mon.position();
-        let size = mon.size();
-        let left = f64::from(m.x);
-        let right = left + f64::from(size.width);
-        let margin = 8.0 * scale;
-        x = x.max(left + margin).min(right - win_w - margin);
-    }
-    // Just below the menu bar, which is where the icon's rect ends.
-    let y = icon_y + 4.0 * scale;
-    let _ = w.set_position(Position::Physical(PhysicalPosition {
-        x: x.round() as i32,
-        y: y.round() as i32,
-    }));
+        .map(|s| (s.width as f64, s.height as f64))
+        .unwrap_or((360.0 * scale, 520.0 * scale));
+    let mon = w.current_monitor().ok().flatten().map(|m| {
+        let p = m.position();
+        let s = m.size();
+        MonitorBox {
+            x: f64::from(p.x),
+            y: f64::from(p.y),
+            w: f64::from(s.width),
+            h: f64::from(s.height),
+        }
+    });
+    let (x, y) = popover_position(icon_x, icon_y, icon_w, win_w, win_h, mon, 8.0 * scale);
+    diag(&format!(
+        "position: icon=({icon_x},{icon_y},w={icon_w}) win=({win_w}x{win_h}) mon={mon:?} -> ({x},{y})"
+    ));
+    let _ = w.set_position(Position::Physical(PhysicalPosition { x, y }));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -797,6 +893,7 @@ pub fn run() {
             set_clock_source
         ])
         .setup(|app| {
+            diag("--- DreamAVB starting ---");
             // Menu-bar app: no dock icon.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -817,6 +914,9 @@ pub fn run() {
                 .show_menu_on_left_click(false);
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
+                diag("tray: icon loaded from bundle");
+            } else {
+                diag("tray: NO icon (not running from an .app bundle)");
             }
             let _tray = tray
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -827,6 +927,10 @@ pub fn run() {
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
+                    // Log EVERY event, not just the one we act on: whether
+                    // macOS delivers the click as Left+Up at all is exactly
+                    // what we could not previously tell.
+                    diag(&format!("tray event: {event:?}"));
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
@@ -840,21 +944,30 @@ pub fn run() {
                 .build(app)?;
 
             // Menu-bar popover behaviour: close when it loses focus, the way
-            // every other menu-bar app behaves (review L11) — but ONLY once it
-            // has actually been focused. Clicking a status item does not give
-            // the popover key focus on macOS, so a blur can arrive straight
-            // after `show()`; hiding on that closed the window in the same
-            // breath as opening it, which looked like a dead tray icon.
+            // every other menu-bar app behaves (review L11) — but not in the
+            // first moments after being shown. See `BLUR_GRACE`: we ask for
+            // focus ourselves, so a focus-only guard is armed instantly and
+            // the following blur closed the window as fast as it opened.
             if let Some(w) = app.get_webview_window("main") {
                 let hide = w.clone();
                 w.on_window_event(move |ev| match ev {
                     tauri::WindowEvent::Focused(true) => {
                         POPOVER_FOCUSED.store(true, Ordering::SeqCst);
+                        diag("window: focused");
                     }
-                    tauri::WindowEvent::Focused(false)
-                        if POPOVER_FOCUSED.load(Ordering::SeqCst) =>
-                    {
-                        let _ = hide.hide();
+                    tauri::WindowEvent::Focused(false) => {
+                        let visible_for = POPOVER_SHOWN_AT
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|t| t.elapsed());
+                        let ever = POPOVER_FOCUSED.load(Ordering::SeqCst);
+                        let hiding = should_hide_on_blur(ever, visible_for);
+                        diag(&format!(
+                            "window: blur ever_focused={ever} visible_for={visible_for:?} hiding={hiding}"
+                        ));
+                        if hiding {
+                            let _ = hide.hide();
+                        }
                     }
                     _ => {}
                 });
@@ -1062,5 +1175,89 @@ mod tests {
             info.effective_label, "Mac internal",
             "must not name a clock when none is sourcing audio"
         );
+    }
+
+    // --- popover show/hide behaviour ---------------------------------------
+
+    #[test]
+    fn blur_is_ignored_before_the_grace_period() {
+        // The regression that made the tray icon look dead: we ask for focus
+        // ourselves, so `Focused(true)` arrives at once and a focus-only guard
+        // is armed. The blur that immediately follows must NOT hide the window.
+        assert!(
+            !should_hide_on_blur(true, Some(Duration::from_millis(5))),
+            "a blur milliseconds after show() must not close the popover"
+        );
+    }
+
+    #[test]
+    fn blur_hides_once_the_popover_has_settled() {
+        assert!(should_hide_on_blur(
+            true,
+            Some(BLUR_GRACE + Duration::from_millis(1))
+        ));
+    }
+
+    #[test]
+    fn blur_does_nothing_when_never_focused_or_never_shown() {
+        assert!(!should_hide_on_blur(false, Some(Duration::from_secs(10))));
+        assert!(!should_hide_on_blur(true, None));
+    }
+
+    const SCREEN: MonitorBox = MonitorBox {
+        x: 0.0,
+        y: 0.0,
+        w: 1920.0,
+        h: 1080.0,
+    };
+
+    #[test]
+    fn popover_centres_under_the_icon() {
+        let (x, y) = popover_position(900.0, 24.0, 24.0, 360.0, 520.0, Some(SCREEN), 8.0);
+        assert_eq!(x, 732, "centred: 900 + 12 - 180");
+        assert_eq!(y, 28, "just below the icon's rect");
+    }
+
+    #[test]
+    fn popover_stays_on_screen_for_a_corner_icon() {
+        // An icon at the far right would otherwise put most of the window past
+        // the screen edge.
+        let (x, _) = popover_position(1900.0, 24.0, 24.0, 360.0, 520.0, Some(SCREEN), 8.0);
+        assert!(
+            x + 360 <= 1920 - 8 + 1,
+            "right edge must stay on screen, got x={x}"
+        );
+    }
+
+    #[test]
+    fn popover_y_is_clamped_too() {
+        // Clamping only x (the first version of this) let a bogus or
+        // flipped-coordinate y put the window wholly off-screen — which looks
+        // exactly like a tray icon that does nothing.
+        let (_, y) = popover_position(900.0, 5000.0, 24.0, 360.0, 520.0, Some(SCREEN), 8.0);
+        assert!(
+            y + 520 <= 1080 - 8 + 1,
+            "bottom edge must stay on screen, got y={y}"
+        );
+    }
+
+    #[test]
+    fn popover_lands_on_screen_when_larger_than_it() {
+        // A window taller than the display must still touch the near edge
+        // rather than be pushed off it by the clamp order.
+        let small = MonitorBox {
+            x: 0.0,
+            y: 0.0,
+            w: 300.0,
+            h: 400.0,
+        };
+        let (x, y) = popover_position(100.0, 24.0, 24.0, 360.0, 520.0, Some(small), 8.0);
+        assert_eq!((x, y), (8, 8), "clamped to the top-left margin");
+    }
+
+    #[test]
+    fn popover_without_a_monitor_uses_the_icon_position() {
+        let (x, y) = popover_position(900.0, 24.0, 24.0, 360.0, 520.0, None, 8.0);
+        assert_eq!((x, y), (732, 28));
     }
 }
