@@ -436,8 +436,31 @@ fn status_for(state: DextSysextState, faulted: bool, nic: Option<Nic>) -> Status
     }
 }
 
-/// True if `avb-probe info` reports a dext fault (non-zero exit or a fault
-/// marker in its output). Read-only.
+/// Parse the dext fault CODE out of `avb-probe info` stdout.
+///
+/// The probe ALWAYS prints the word "fault", because `fault` is the field
+/// LABEL and the code is its value — a healthy I210 prints
+/// `stage          timesync   fault 0 (none)`. So a substring test for
+/// "fault" is true for every successful probe, which is exactly what this
+/// used to do: the UI reported a permanent fault on healthy hardware and
+/// could never show Active. Compare the CODE to zero instead.
+///
+/// `None` means no `fault <code>` field was found, which is UNKNOWN rather
+/// than healthy; the caller keeps the established policy of never asserting
+/// a fault without positive evidence.
+fn parse_fault_code(stdout: &str) -> Option<u32> {
+    stdout.lines().find_map(|line| {
+        line.split("fault ")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse::<u32>()
+            .ok()
+    })
+}
+
+/// True if `avb-probe info` reports a dext fault (non-zero exit, or a
+/// non-zero fault code in its output). Read-only.
 fn probe_fault() -> bool {
     match Command::new(helper_path("avb-probe")).arg("info").output() {
         Ok(o) => {
@@ -445,7 +468,9 @@ fn probe_fault() -> bool {
                 return true;
             }
             let s = String::from_utf8_lossy(&o.stdout);
-            s.to_lowercase().contains("fault")
+            // An absent field is unknown, not faulted — same policy as a
+            // probe we could not run at all.
+            parse_fault_code(&s).is_some_and(|code| code != 0)
         }
         // Can't run the probe → don't assert a fault; treat as not-faulted.
         Err(_) => false,
@@ -781,7 +806,9 @@ fn toggle_window(app: &tauri::AppHandle, icon_rect: Option<tauri::Rect>) {
         return;
     };
     let visible = w.is_visible().unwrap_or(false);
-    diag(&format!("toggle: visible_before={visible} rect={icon_rect:?}"));
+    diag(&format!(
+        "toggle: visible_before={visible} rect={icon_rect:?}"
+    ));
     if visible {
         let _ = w.hide();
         *POPOVER_SHOWN_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1014,6 +1041,50 @@ mod tests {
             status_for(DextSysextState::Enabled, true, Some(nic_i210())).state,
             DriverState::Fault
         );
+    }
+
+    /// Verbatim `avb-probe info` output from the live I210 on 2026-10-12,
+    /// with the dext attached and the link up. The device is HEALTHY: the
+    /// fault code is 0.
+    const HEALTHY_PROBE: &str = "\
+nic            Intel I210 (nic_kind 2, service AVBI210Driver)
+vendor:device  0x15338086   subsystem 0x02141ab6
+hw_rev         0x00000003   (PCI revision ID)
+CTRL           0x081c0241   STATUS 0x00380783   TIMINCA 0x00000000
+stage          timesync   fault 0 (none)
+flags          0x0  link_up=false 1000FD=false
+STATUS link    up=true speed=1000 Mb/s full
+mac            64:4b:f0:12:73:b8   timebase 125/3
+";
+
+    /// Regression: the probe always PRINTS the word "fault" because it is a
+    /// field label, so the old `contains("fault")` test reported a fault on
+    /// every healthy device and the UI could never leave the Fault state.
+    /// This asserts against real captured output, not a constructed string,
+    /// so it cannot pass by restating the parser's own assumption.
+    #[test]
+    fn healthy_probe_output_is_not_a_fault() {
+        assert_eq!(parse_fault_code(HEALTHY_PROBE), Some(0));
+        // The bug, stated directly: the label is present, the fault is not.
+        assert!(HEALTHY_PROBE.contains("fault"));
+        assert!(!parse_fault_code(HEALTHY_PROBE).is_some_and(|c| c != 0));
+    }
+
+    #[test]
+    fn nonzero_fault_code_is_a_fault() {
+        let faulted = HEALTHY_PROBE.replace("fault 0 (none)", "fault 3 (tx_hang)");
+        assert_eq!(parse_fault_code(&faulted), Some(3));
+        assert!(parse_fault_code(&faulted).is_some_and(|c| c != 0));
+    }
+
+    /// An absent field is UNKNOWN, not healthy and not faulted — the caller
+    /// must not assert a fault without positive evidence.
+    #[test]
+    fn missing_fault_field_is_unknown() {
+        assert_eq!(parse_fault_code("nic   Intel I210\nflags 0x0\n"), None);
+        assert_eq!(parse_fault_code(""), None);
+        // A label with no parseable code must not read as a fault either.
+        assert_eq!(parse_fault_code("stage timesync   fault\n"), None);
     }
 
     /// Regression (review M4): a stale enabled record must not report Active

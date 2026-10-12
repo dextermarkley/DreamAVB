@@ -5,18 +5,45 @@ const invoke = window.__TAURI__.core.invoke;
 const el = (id) => document.getElementById(id);
 let currentNics = [];
 let busy = false;
+// Driver state the NIC list was last built for. Our dext claiming or
+// releasing the I210 removes or restores its enX interface, so the list
+// genuinely differs between states and must be rebuilt when one changes.
+let nicListState = null;
 
 async function loadNics() {
-  currentNics = await invoke("list_nics");
+  const nics = await invoke("list_nics");
   const sel = el("nic");
+  const prev = sel.value;
+  currentNics = nics;
   sel.innerHTML = "";
-  for (const n of currentNics) {
+  for (const n of nics) {
     const o = document.createElement("option");
     o.value = n.bsd_name;
-    o.textContent = `${n.display} · ${n.bsd_name}`;
+    // With our dext owning the I210 there is no enX interface, so the ioreg
+    // fallback supplies no BSD name — don't render a dangling separator.
+    o.textContent = n.bsd_name ? `${n.display} · ${n.bsd_name}` : n.display;
     o.disabled = !n.supported;
     sel.appendChild(o);
   }
+  // Rebuilding the <select> drops the selection; restore it when the same
+  // NIC is still on offer, so a poll can't move the user's choice.
+  if (prev && nics.some((n) => n.bsd_name === prev)) sel.value = prev;
+}
+
+/// Re-query the NIC list only when it could actually have changed: we have
+/// nothing usable to show, or the driver state moved.
+///
+/// This used to run exactly once at startup, and `list_nics` depends on
+/// `system_profiler` and `ioreg` — both of which can come up empty at login,
+/// while the dext is still attaching or under a post-boot disk storm that
+/// makes `system_profiler` crawl (it was measured timing out outright). With
+/// no retry, an empty list persisted until the app was relaunched, which is
+/// exactly what was observed. It stays cheap: once a supported NIC is listed
+/// and the state is steady, no subprocess is spawned.
+async function maybeReloadNics(state) {
+  if (currentNics.some((n) => n.supported) && state === nicListState) return;
+  nicListState = state;
+  await loadNics();
 }
 
 function paintStatus(st) {
@@ -56,7 +83,11 @@ function paintStatus(st) {
 
 async function refreshStatus() {
   try {
-    paintStatus(await invoke("status"));
+    const st = await invoke("status");
+    paintStatus(st);
+    // The status poll is where the driver state is known, so it is also
+    // where a NIC-list rebuild can be decided.
+    await maybeReloadNics(st.state);
   } catch (e) {
     console.error(e);
   }
@@ -199,7 +230,9 @@ el("link").addEventListener("click", () => {
 
 // Boot.
 (async () => {
-  await loadNics();
+  // No separate loadNics() here: refreshStatus owns the NIC list, so the
+  // first population and every later retry go down one path rather than two
+  // that can disagree.
   await refreshStatus();
   await refreshClock();
   // One 2 s poll drives both the status and the clock line — the clock's
