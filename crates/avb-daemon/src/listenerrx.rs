@@ -56,6 +56,18 @@ pub struct ListenerRx {
     write_pos: u64,
     format_mismatch: u64,
     frames_placed: u64,
+    /// AAF packets DISCARDED because they belong to a stream other than the
+    /// primary, and the distinct stream ids they came from.
+    ///
+    /// This path binds ONE stream. The 16R advertises eight AAF streams of
+    /// eight channels each, and once a controller connects them it sends all
+    /// of them: a 25 s `record` run took 1 612 459 audio slots off the wire and
+    /// placed 1 199 976 frames — exactly one stream's worth — throwing the
+    /// other seven away here. Nothing counted that, so the summary read as a
+    /// clean 8-channel capture rather than a 64-channel capture with 56
+    /// channels dropped on the floor.
+    non_primary_pdus: u64,
+    non_primary_streams: std::collections::BTreeSet<u64>,
 }
 
 impl Default for ListenerRx {
@@ -79,7 +91,19 @@ impl ListenerRx {
             write_pos: 0,
             format_mismatch: 0,
             frames_placed: 0,
+            non_primary_pdus: 0,
+            non_primary_streams: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// AAF packets discarded because they were not the primary stream, and how
+    /// many distinct streams they came from.
+    ///
+    /// A non-zero count means audio the 16R sent us was thrown away: this path
+    /// binds one 8-channel stream and the 16R talks eight of them. Reported so
+    /// a capture that drops 56 of 64 channels cannot look like a clean one.
+    pub fn non_primary(&self) -> (u64, usize) {
+        (self.non_primary_pdus, self.non_primary_streams.len())
     }
 
     /// Packets refused because their geometry disagreed with the ring's.
@@ -140,6 +164,8 @@ impl ListenerRx {
             return Placement::NoRing;
         }
         if sid != self.stream_id {
+            self.non_primary_pdus += 1;
+            self.non_primary_streams.insert(sid);
             return Placement::NotPrimary;
         }
 

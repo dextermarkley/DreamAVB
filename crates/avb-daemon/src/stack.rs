@@ -2073,6 +2073,7 @@ fn streams_loop(
         "streams",
         &format!("audio ring: raw_slots={raw_audio_slots} non_aaf_or_undecoded={aaf_decode_fail} format_mismatch={} frames_placed={}", lrx.format_mismatches(), lrx.frames_placed()),
     );
+    report_discarded_streams(log, "streams", &lrx);
     let _ = first_slot_dump;
     // Channel-map: report channels whose peak |sample| is well above the noise
     // floor (a live signal). 32-bit full scale is 2^31; use ~0.1% (-60 dBFS).
@@ -3397,6 +3398,7 @@ fn talker_loop(
                 in_filter.len(),
             ),
         );
+        report_discarded_streams(log, "duplex", &lrx);
         if in_declared.is_empty() {
             log.log(
                 Level::Warn,
@@ -3910,6 +3912,31 @@ fn derive_talker_format(
             Err(Exit::TalkerNotFound)
         }
     }
+}
+
+/// Report AAF audio the inbound path THREW AWAY because it binds one stream.
+///
+/// The 16R exposes eight 8-channel AAF streams per direction, and once a
+/// controller connects them it talks all of them. This path keeps one, so a
+/// run can take 64 channels off the wire and report a clean 8-channel capture
+/// — 1 612 459 audio slots in, 1 199 976 frames placed, and no line saying the
+/// other seven streams were discarded. Say it plainly instead.
+fn report_discarded_streams(log: &Logger, dir: &str, lrx: &crate::listenerrx::ListenerRx) {
+    let (pdus, streams) = lrx.non_primary();
+    if pdus == 0 {
+        return;
+    }
+    log.log(
+        Level::Warn,
+        dir,
+        &format!(
+            "DISCARDED {pdus} AAF packets from {streams} other stream(s): this path binds ONE \
+             stream and the 16R is talking {} — that is {} of its channels being dropped, not a \
+             fault but not the full device either",
+            streams + 1,
+            streams * 8
+        ),
+    );
 }
 
 /// How a `--listener-uid` choice reads in a log line: an explicit sink index,
