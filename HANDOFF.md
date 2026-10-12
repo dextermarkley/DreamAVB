@@ -109,6 +109,19 @@ covered by a test that would have):
    the audio flood starved our own gPTP/MSRP/MVRP of tokens (measured: 382 553
    of 441 373 dropped in 60 s). Now 20 000/s. The send site also discarded
    `SendResult`, so the summary counted attempts as sends. `f7d81d0`.
+6. We answered no AECP at all, so the 16R could discover us over ADP and then
+   learn nothing: a Milan controller enumerates by walking ENTITY ->
+   CONFIGURATION 0 -> every descriptor in `descriptor_counts`, and we had no
+   CONFIGURATION descriptor and `talker_stream_sources = 0`. The responder had
+   existed in `avb-avdecc` since Phase 1a and was never connected to the
+   socket — the daemon only LOGGED inbound AECP. `entity::talker` now answers
+   the whole walk for the playback direction, and the daemon dispatches to it.
+   `04f7541`.
+7. The AVTP presentation timestamp was nanoseconds-since-loop-start, and the
+   talker loop never serviced gPTP, so the clock it would have read was
+   free-running anyway. `gptpsvc::GptpService` is the `gptp` command's loop
+   body, now shared; the talker pumps it, reads the disciplined clock, and
+   refuses to stream until the servo is LOCKED. `04f7541`.
 
 ### Resume point
 
@@ -122,21 +135,40 @@ the dext needs replacing.
 /Users/dexter/AVB-Audio/build/AVBInstaller.app/Contents/MacOS/avb-daemon play --seconds 60 --log-level info
 ```
 
-Then read the summary line: `PDUs on the wire` should be ~8000/s with
-`rate-limited 0`, and `listener_ready` must become true. If it stays false the
-16R rejected the reservation — look for a Talker Failed with a failure code.
+`play` now WAITS for gPTP lock before transmitting a single PDU, so expect a
+`gPTP locked ... arming the talker` line first; if the servo does not lock
+within the discovery timeout the run exits rather than streaming on an
+undisciplined clock. Then read the summary: `PDUs on the wire` should be
+~8000/s with `rate-limited 0`, `AEM commands answered` should be non-zero (if
+it is zero the 16R never tried to enumerate us, which is a different fault),
+and `listener_ready` must become true.
 
-Still unbuilt, and the next likely blockers: we cannot answer AECP
-`READ_DESCRIPTOR`, so the 16R cannot enumerate our entity even after ADP
-discovery; and the presentation timestamp uses a mach-time stand-in rather than
-the dext's disciplined gPTP-now, which the 16R's acceptance window may reject.
+Still unbuilt, and the next likely blockers:
 
-## Verified at `a999d83` (Phase 1b)
+- **GET_STREAM_INFO answers NOT_IMPLEMENTED on purpose.** Its 32-bit flags
+  word needs bit positions from 1722.1-2021 Table 7.206. The working group's
+  own clarification (Illouz, "AVDECC clarifications Part 2 — AEM commands",
+  rev 4, §6.2) confirms the field semantics but gives no numeric positions.
+  Every descriptor we DO encode is anchored — the same layouts decoded 21 real
+  16R descriptors in hw-avdecc — whereas this response originates a flags word
+  we have never parsed, so a wrong bit asserts something false about our
+  stream with nothing to catch it. Needs the standard, not a guess.
+- **No START_STREAMING / STOP_STREAMING.** The same clarification (§6.1.2)
+  says a controller sets a talker source active with START_STREAMING on its
+  STREAM_OUTPUT. We are our own controller here (we send CONNECT_RX_COMMAND to
+  the 16R), so it may not matter on this link, but a third-party AVDECC
+  controller would expect it.
+- **The media clock is the Mac's, not the 16R's.** CoreAudio produces on the
+  host clock while we transmit paced by gPTP, so the two drift. This is the
+  mirror image of the listener's ring problem and is why STREAM_OUTPUT does
+  not advertise CLOCK_SYNC_SOURCE. Unaddressed.
+
+## Verified at `04f7541` (Phase 1b)
 
 - `cargo fmt --all --check`: clean.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
-- `cargo test --workspace --locked`: all pass — avdecc 88, srp 31, gptp 59,
-  daemon 31, dext 28, mediaclock 26, core 22, avtp 16, probe 16, audioring 15,
+- `cargo test --workspace --locked`: 370 pass — avdecc 116, srp 31, gptp 59,
+  daemon 34, dext 28, mediaclock 26, core 22, avtp 16, probe 16, audioring 15,
   coreaudio 7.
 - C++ host tests: 342 i210 checks and 97 tg3 checks pass.
 - `xcodebuild … AVBI210Driver`: BUILD SUCCEEDED, 0 compiler warnings.
