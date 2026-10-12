@@ -174,6 +174,47 @@ After a reboot, re-run `avb-installer activate` (no sudo needed), confirm with
 `avb-installer status` that the hashes MATCH, then a duplex run should report
 `via ONE CALL PER INTERVAL` and ~64000 frames/s.
 
+**Prefer a Thunderbolt REPLUG over a reboot.** Researched 2026-10-12: there is
+no documented reboot-free way to replace an always-matched dext, and the
+cheapest real option is to un-match it by removing its device.
+
+- An in-place `activationRequest` ALWAYS defers the incumbent's termination to
+  reboot for an always-matched dext. Someone with the identical problem (an
+  always-matched `SCSIControllerDriverKit` dext) reports exactly our symptom in
+  Apple Developer Forums thread 836344: "the new version reaches
+  `[activated enabled]` but never starts; the old process keeps running until
+  reboot". Karabiner-DriverKit-VirtualHIDDevice's own `DEVELOPMENT.md` says the
+  same: "submit does not restart your driverkit userspace process. The most
+  reliable way to restart your userspace process is reboot."
+- `IOService::Terminate()` is NOT a self-termination escape hatch. The
+  DriverKit 25.5 SDK header documents it for services the driver itself made:
+  "An IOService object created with `Create()` may be removed by calling
+  `Terminate()`." Do not ship a self-terminate selector on that basis — it
+  would be an undocumented use of the API on a matched driver.
+- A dext cannot un-match itself either: "There is no way for a DriverKit driver
+  to programmatically modify the DriverKit driver's matching rules."
+- `systemextensionsctl developer on` does NOT help here. It allows loading from
+  outside `/Applications` with SIP disabled; it does not replace a running
+  driver.
+- macOS has no software PCIe/Thunderbolt re-enumeration command, so the device
+  must actually go away.
+
+Since the I210 is behind Thunderbolt, **unplug and replug the adapter** instead
+of rebooting: that un-matches the dext, which is precisely what sysextd is
+waiting for, and it costs seconds instead of a full restart. Then `activate`
+and check hashes with `avb-installer status`.
+
+One UNTESTED alternative, worth a try only because its worst case is the reboot
+we would otherwise do: `avb-installer deactivate` then `activate`. If
+deactivation terminates the incumbent, the device is released and the new build
+loads. If it merely defers (`terminating for uninstall but still running` is a
+documented state) nothing is lost. The risk is that the device IS released,
+Apple's generic `AppleEthernetE1000` claims it, and the activate cannot win the
+match until a reboot — leaving no AVB driver in the meantime.
+
+Note also that most iteration does NOT need this: the dext ABI changes rarely,
+and daemon, plug-in and companion changes all reload without touching it.
+
 The HAL plug-in IS installed (`/Library/Audio/Plug-Ins/HAL/AVBAudio.driver`)
 and is at **64 channels** in and out; `avb_audioring::DEVICE_CHANNELS` is the
 single source of that width because the plug-in refuses a ring that disagrees.
