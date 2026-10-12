@@ -11,6 +11,9 @@ Read this file first, then `AGENTS.md` (rules) and the docs it points to.
 - Phase 1a (16R → Mac recording to WAV, listener only) is in progress on branch `phase1a-listener`.
   - The design is approved at rev 5: `.agents/tasks/phase1a-design.md`. Design review pass 5 is APPROVED.
   - The plan is `.agents/tasks/phase1a-plan.md`. It is split into FEAT files under `.agents/tasks/task-phase1a-listener/`.
+- Phase 1b (Mac → 16R playback, talker) is in progress on branch `feat/companion-app`.
+  See "Phase 1b: talker" below for the resume point. Audio does not yet reach
+  the 16R's outputs.
 
 | FEAT | Scope | Status | Commit |
 |---|---|---|---|
@@ -72,6 +75,72 @@ inversion (adp/aecp/acmp), READ_DESCRIPTOR missing reserved field.
 The ctl/audio/rec threads (§5.1) and the full `run`/`record` loops are wired
 during the hardware milestones; the daemon binary carries a documented
 crate-level `#![allow(dead_code)]` until then (see the FEAT-005 deviations).
+
+## Phase 1b: talker (Mac → 16R)
+
+Branch `feat/companion-app`. The playback path exists end to end — CoreAudio
+output device → shm ring → AAF PDUs on the wire — and is confirmed moving real
+audio into the ring on hardware. **Audio does not yet come out of the 16R.**
+
+Found on the live 16R, none of it caught by the unit suite (each is now
+covered by a test that would have):
+
+1. `kAudioServerPlugInIOOperationWriteMix` was guessed as `'wmix'`. Apple's
+   value is `'rite'`. The plug-in declined WriteMix, the HAL never dispatched
+   it, and every transmitted PDU was zero-fill. `31279be`. The one test
+   covering it was a tautology (our constant against itself). All 66 FourCCs
+   and terminal types are now pinned to literal SDK numbers, and
+   `scripts/audit-coreaudio-constants.py` re-checks them against the SDK
+   headers (exits non-zero on a mismatch).
+2. `kAudioStreamTerminalTypeSpeaker` was `0x0301`, the USB Audio Class value,
+   not CoreAudio's `'spkr'`. `e1e4d68`, found by that audit.
+3. The plug-in kept writing into a *deleted* ring after a daemon restart: the
+   daemon unlinks and recreates the ring file (new inode), the old mapping
+   stays valid, and `start_io` attached only `if guard.is_none()`. Silent until
+   coreaudiod restarted. Now re-attaches on an inode change. `7676de3`.
+4. No MSRP Talker Advertise was ever declared, so the 16R listed no input
+   device — a Milan listener accepts no stream it has not been advertised. The
+   talker loop also had to learn to RECEIVE, since MRP is two-way and Listener
+   Ready arrives via RX. `c00c4d8`. The TSpec is spec-derived, **not** copied
+   from a working talker: the 16R sent no Advertise of its own to compare
+   against. `talker_tspec` is pure and tested.
+5. `AVB_TX_RATE_PER_SEC` was 1000, shared across every frame the dext sends. A
+   class A talker needs 8000/s, so 7 of 8 audio PDUs never reached the wire and
+   the audio flood starved our own gPTP/MSRP/MVRP of tokens (measured: 382 553
+   of 441 373 dropped in 60 s). Now 20 000/s. The send site also discarded
+   `SendResult`, so the summary counted attempts as sends. `f7d81d0`.
+
+### Resume point
+
+The dext must be REINSTALLED for (5) to take effect — the ceiling is compiled
+into it. Packaged dext is `284.1.16`; `283.0.31` is installed. The HAL plug-in
+installed on this machine already postdates every plug-in fix above, so only
+the dext needs replacing.
+
+```
+/Users/dexter/AVB-Audio/build/AVBInstaller.app/Contents/MacOS/avb-installer activate
+/Users/dexter/AVB-Audio/build/AVBInstaller.app/Contents/MacOS/avb-daemon play --seconds 60 --log-level info
+```
+
+Then read the summary line: `PDUs on the wire` should be ~8000/s with
+`rate-limited 0`, and `listener_ready` must become true. If it stays false the
+16R rejected the reservation — look for a Talker Failed with a failure code.
+
+Still unbuilt, and the next likely blockers: we cannot answer AECP
+`READ_DESCRIPTOR`, so the 16R cannot enumerate our entity even after ADP
+discovery; and the presentation timestamp uses a mach-time stand-in rather than
+the dext's disciplined gPTP-now, which the 16R's acceptance window may reject.
+
+## Verified at `a999d83` (Phase 1b)
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo test --workspace --locked`: all pass — avdecc 88, srp 31, gptp 59,
+  daemon 31, dext 28, mediaclock 26, core 22, avtp 16, probe 16, audioring 15,
+  coreaudio 7.
+- C++ host tests: 342 i210 checks and 97 tg3 checks pass.
+- `xcodebuild … AVBI210Driver`: BUILD SUCCEEDED, 0 compiler warnings.
+- `scripts/package.sh --adhoc`: dext `284.1.16`, all shipped binaries arm64.
 
 ## Verified at the FEAT-005 commit (`a631a82`)
 
