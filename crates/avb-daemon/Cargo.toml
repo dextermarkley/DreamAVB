@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 avb-core = { path = "../avb-core" }
+avb-config = { path = "../avb-config" }
 avb-dext = { path = "../avb-dext" }
 avb-gptp = { path = "../avb-gptp" }
 avb-srp = { path = "../avb-srp" }

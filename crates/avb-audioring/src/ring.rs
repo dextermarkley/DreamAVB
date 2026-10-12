@@ -315,6 +315,22 @@ impl AudioRing {
 
     // --- clock block seqlock (§10.6; uses the avb-core protocol) ---
 
+    /// Publish which clock is disciplining this ring's sample rate.
+    ///
+    /// A plain `u32`, not part of the clock-block seqlock: it changes at human
+    /// speed (when the user picks a source, or a lock comes and goes), so a
+    /// single relaxed store is enough and a reader can never see a torn value.
+    /// Pass `avb_config::EffectiveClock::code()`; this crate deliberately does
+    /// not depend on `avb-config`, so the meaning lives there.
+    pub fn set_effective_clock(&self, code: u32) {
+        self.store_u32(field::EFFECTIVE_CLOCK, code);
+    }
+
+    /// The published effective-clock code, or 0 if a daemon never wrote one.
+    pub fn effective_clock(&self) -> u32 {
+        self.load_u32(field::EFFECTIVE_CLOCK)
+    }
+
     /// Publish the clock model into the header's clock block (writer = audio).
     pub fn publish_clock(&self, m: &crate::ClockBlock) {
         let base = field::CLOCK_BLOCK;

@@ -91,6 +91,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "avb-config"
+version = "0.1.0"
+
+[[package]]
 name = "avb-core"
 version = "0.1.0"
 
@@ -620,6 +624,7 @@ name = "dreamavb-companion"
 version = "0.1.0"
 dependencies = [
  "avb-audioring",
+ "avb-config",
  "serde",
  "serde_json",
  "tauri",

@@ -2587,6 +2587,50 @@ fn talker_loop(
     // timeout rather than inventing a second knob.
     let lock_deadline_ns = opts.discover_timeout.saturating_mul(1_000_000_000);
 
+    // ---- Clock source ------------------------------------------------------
+    //
+    // Which clock the Mac sources audio on, as chosen in the companion app.
+    // We and the 16R do not share an oscillator: a nominal 48 kHz here is not
+    // the same 48 kHz there, so sourcing on the Mac's crystal drifts against
+    // the listener until the stream breaks.
+    //
+    // The config path is LOGGED rather than assumed. The daemon and the app
+    // agree on $HOME, so a daemon started under sudo would read root's file
+    // instead and silently run on defaults.
+    let mut clocksel = crate::clocksrc::ClockSelector::load(hz as f64);
+    log.log(
+        Level::Info,
+        "clock",
+        &format!(
+            "clock source: {} ({}) [{}]",
+            clocksel.selected().label(),
+            clocksel.selected(),
+            clocksel
+                .config_path()
+                .unwrap_or("HOME unset; using defaults")
+        ),
+    );
+    for w in clocksel.take_warnings() {
+        log.log(Level::Warn, "clock", &w);
+    }
+    // The recovered 16R media clock lives on the INPUT ring, which exists only
+    // while a listener session runs. Attach read-only if it is there, so the
+    // "16R media clock" choice can be honoured during a simultaneous record
+    // and play.
+    let recovered_ring = avb_audioring::ShmRing::attach().ok();
+    log.log(
+        Level::Info,
+        "clock",
+        if recovered_ring.is_some() {
+            "input ring present — the 16R's recovered media clock is available"
+        } else {
+            "no input ring — the 16R's recovered media clock is unavailable \
+             (run `record` alongside `play` to use it)"
+        },
+    );
+    let mut last_clock_pub = now_mach();
+    let mut last_effective: Option<avb_config::EffectiveClock> = None;
+
     // ---- MSRP: advertise our stream so the 16R will accept it ---------------
     //
     // A listener does not accept a stream it has not been told about. SRP is
@@ -2937,6 +2981,69 @@ fn talker_loop(
                     ),
                 );
             }
+        }
+
+        // ---- Clock source: resolve and publish ------------------------------
+        //
+        // Once a second, not per PDU: the inputs change at human speed (the
+        // user picks a source, a lock comes or goes) and this re-reads a file.
+        // The daemon is the authority — it publishes BOTH the basis and the
+        // verdict onto the output ring, and the plug-in follows that rather
+        // than deciding for itself.
+        if ns_since(last_clock_pub) >= crate::clocksrc::CONFIG_RELOAD_NS {
+            if let Some(newsel) = clocksel.reload() {
+                log.log(
+                    Level::Info,
+                    "clock",
+                    &format!("clock source changed to {} ({newsel})", newsel.label()),
+                );
+            }
+            for w in clocksel.take_warnings() {
+                log.log(Level::Warn, "clock", &w);
+            }
+            let st = gptp.status();
+            let recovered = recovered_ring.as_ref().and_then(|r| r.ring().read_clock());
+            let decision = clocksel.decide(
+                recovered,
+                st.gptp_ppm_vs_mach,
+                st.servo_state == avb_gptp::ServoState::Locked && st.as_capable,
+            );
+            crate::clocksrc::publish(out_ring.ring(), &decision);
+            // Report only transitions: a per-second line saying the same thing
+            // buries the one that matters.
+            if last_effective != Some(decision.effective) {
+                let rate = decision
+                    .basis
+                    .map(|b| format!("{:.3} Hz", b.rate_hz_vs_mach))
+                    .unwrap_or_else(|| format!("{hz} Hz nominal"));
+                let level = if decision.effective.is_network_disciplined() {
+                    Level::Info
+                } else {
+                    // Not an error — it can be exactly what the user asked
+                    // for — but it is the state in which audio drifts against
+                    // the 16R, so it must not look routine.
+                    Level::Warn
+                };
+                log.log(
+                    Level::Info,
+                    "clock",
+                    &format!(
+                        "sourcing on {} ({}) at {rate}",
+                        decision.effective.label(),
+                        decision.effective.reason()
+                    ),
+                );
+                if level == Level::Warn {
+                    log.log(
+                        Level::Warn,
+                        "clock",
+                        "the sample clock is not disciplined to the network — \
+                         audio will drift against the 16R",
+                    );
+                }
+                last_effective = Some(decision.effective);
+            }
+            last_clock_pub = now_mach();
         }
 
         // Not yet time for the next PDU: yield briefly and recheck.

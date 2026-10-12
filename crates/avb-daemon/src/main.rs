@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 mod audio;
+mod clocksrc;
 mod dextio;
 mod exit;
 mod gptpsvc;

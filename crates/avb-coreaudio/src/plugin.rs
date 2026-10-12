@@ -839,17 +839,53 @@ pub extern "C" fn stop_io(
 /// disciplined rate here lets `get_zero_time_stamp` run the device timeline at
 /// the true data rate.
 ///
-/// `None` when the ring is unattached or unlocked, so the caller falls back to
-/// the nominal-rate stand-in and the device stays alive.
+/// `None` means "run the device timeline at the nominal rate".
+///
+/// THE DAEMON DECIDES, THIS FOLLOWS. The daemon is the only process that can
+/// see the user's selection, the gPTP servo and a recovered media clock at
+/// once, so it resolves them and publishes both a basis (the ring's clock
+/// block) and a verdict (the ring's effective-clock code). Deciding here
+/// instead would override the user: a session that is both recording and
+/// playing has a locked input-ring clock, so preferring it would put the
+/// device on the 16R's clock even when the user explicitly chose the Mac's.
+///
+/// Order:
+/// 1. The OUTPUT ring's verdict, when a clock-aware daemon wrote one. A
+///    `MacInternal` verdict returns `None` and stops — it is a decision, not
+///    an absence, so we must not go looking for another clock.
+/// 2. Otherwise the input ring's recovered clock. This covers a record-only
+///    session (no output ring at all) and a daemon predating clock selection,
+///    whose header reads as code 0.
+///
+/// This device has ONE timeline for both directions (a single
+/// `GetZeroTimeStamp` serving the input and output streams), so whatever is
+/// returned here governs the rate CoreAudio both delivers and consumes at.
+/// That is what makes sourcing on the 16R's clock work without a second
+/// device or a resampler.
 pub fn ring_disciplined_rate_hz() -> Option<f64> {
-    let guard = IO.lock().ok()?;
-    let state = guard.as_ref()?;
-    let cb = state.shm.ring().read_clock()?;
-    if cb.locked && cb.rate_hz_vs_mach.is_finite() && cb.rate_hz_vs_mach > 0.0 {
-        Some(cb.rate_hz_vs_mach)
-    } else {
-        None
+    fn usable(cb: &avb_audioring::ClockBlock) -> Option<f64> {
+        (cb.locked && cb.rate_hz_vs_mach.is_finite() && cb.rate_hz_vs_mach > 0.0)
+            .then_some(cb.rate_hz_vs_mach)
     }
+    // 1. The daemon's verdict on the output ring.
+    if let Ok(guard) = OUT_IO.lock() {
+        if let Some(state) = guard.as_ref() {
+            let ring = state.prod.ring();
+            match avb_config::EffectiveClock::from_code(ring.effective_clock()) {
+                Some(avb_config::EffectiveClock::MacInternal(_)) => return None,
+                Some(_) => return ring.read_clock().as_ref().and_then(usable),
+                // Code 0 / unrecognised: no verdict, fall through.
+                None => {}
+            }
+        }
+    }
+    // 2. The input ring's recovered 16R media clock.
+    let guard = IO.lock().ok()?;
+    guard
+        .as_ref()
+        .and_then(|s| s.shm.ring().read_clock())
+        .as_ref()
+        .and_then(usable)
 }
 
 pub extern "C" fn do_io_operation(

@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use avb_config::{ClockSource, Config, EffectiveClock};
 use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -572,6 +573,141 @@ fn parse_stats(v: &serde_json::Value) -> Stats {
         abi_version: g("abi_version") as u32,
     }
 }
+// ---------------------------------------------------------------------------
+// Clock source
+
+/// One selectable clock-source option, for the UI's `<select>`. Derived from
+/// `ClockSource::ALL` so the UI never hardcodes the list — adding a variant to
+/// the crate adds it here, and to the dropdown, with no UI change.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClockOption {
+    /// The stable token (`ClockSource::as_str`), stored in the config file and
+    /// passed back to `set_clock_source`.
+    pub value: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// The clock-source snapshot the UI renders: both what the user SELECTED and
+/// what is actually IN FORCE, so the UI never claims a clock that is not
+/// running the stream (see `avb_config::EffectiveClock`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClockSourceInfo {
+    /// The selected source's stable token.
+    pub selected: String,
+    /// Every option in UI order, derived from `ClockSource::ALL`.
+    pub options: Vec<ClockOption>,
+    /// Human label of the clock actually in force.
+    pub effective_label: String,
+    /// Why that clock is in force.
+    pub effective_reason: String,
+    /// False when the effective clock is undisciplined (the drift state) — the
+    /// UI warns on this.
+    pub network_disciplined: bool,
+    /// Complaints from `Config::load` (e.g. a malformed config line). Must not
+    /// be swallowed.
+    pub warnings: Vec<String>,
+}
+
+fn clock_options() -> Vec<ClockOption> {
+    ClockSource::ALL
+        .iter()
+        .map(|s| ClockOption {
+            value: s.as_str().to_string(),
+            label: s.label().to_string(),
+            description: s.description().to_string(),
+        })
+        .collect()
+}
+
+/// The effective clock the DAEMON published, read from a ring header.
+///
+/// This replaces an earlier attempt to re-derive the answer here with
+/// `avb_config::resolve`. That could not work: a gPTP servo lock is not
+/// observable from this process (the only read-only `avb-probe` facts,
+/// `info` and `counters`, carry no servo state, and the subcommands that
+/// touch gPTP actively drive the device and would disturb a live stream), so
+/// the gPTP input was hardcoded `false` and every `Network time` selection
+/// reported as the Mac clock even while gPTP was running the stream.
+///
+/// The daemon is the only process that sees the selection, the servo and a
+/// recovered media clock at once, so it resolves them and publishes the
+/// verdict. Reading one field it wrote cannot be wrong in that way.
+///
+/// Checks the OUTPUT ring first (the talker's, where the verdict is written),
+/// then the input ring. `None` means no daemon is running, or one too old to
+/// publish a verdict — which is NOT the same as "undisciplined" and must be
+/// reported differently.
+fn published_effective_clock() -> Option<EffectiveClock> {
+    for name in [avb_audioring::SHM_NAME_OUT, avb_audioring::SHM_NAME] {
+        if let Some(e) = avb_audioring::ShmRing::attach_ro_at(name)
+            .ok()
+            .and_then(|shm| EffectiveClock::from_code(shm.ring().effective_clock()))
+        {
+            return Some(e);
+        }
+    }
+    None
+}
+
+/// Build the UI snapshot: the user's selection from disk, and what is actually
+/// in force from the daemon.
+fn clock_source_info(cfg: Config, warnings: Vec<String>) -> ClockSourceInfo {
+    let (effective_label, effective_reason, network_disciplined) =
+        match published_effective_clock() {
+            Some(e) => (
+                e.label().to_string(),
+                e.reason().to_string(),
+                e.is_network_disciplined(),
+            ),
+            // No daemon, so nothing is sourcing audio at all. Saying "Mac
+            // internal" here would claim a clock is in use when no stream
+            // exists; say plainly that it is not running.
+            None => (
+                "—".to_string(),
+                "no daemon running; this takes effect when a stream starts".to_string(),
+                false,
+            ),
+        };
+    ClockSourceInfo {
+        selected: cfg.clock_source.as_str().to_string(),
+        options: clock_options(),
+        effective_label,
+        effective_reason,
+        network_disciplined,
+        warnings,
+    }
+}
+
+/// Current clock-source selection + the clock actually in force.
+///
+/// `async` so Tauri runs it off the main thread (review M3): `ring_clock_locked`
+/// touches the shared ring.
+#[tauri::command]
+async fn get_clock_source() -> ClockSourceInfo {
+    let (cfg, warnings) = Config::load();
+    clock_source_info(cfg, warnings)
+}
+
+/// Change the clock source. Unknown tokens are REJECTED, not silently
+/// defaulted — a bad token means a UI bug, and hiding it would leave the user
+/// on a clock they did not pick. On success the config is persisted and the
+/// same snapshot is returned so the UI re-renders from one response.
+#[tauri::command]
+async fn set_clock_source(value: String) -> Result<ClockSourceInfo, String> {
+    let source =
+        ClockSource::parse(&value).ok_or_else(|| format!("unknown clock source {value:?}"))?;
+    let cfg = Config {
+        clock_source: source,
+    };
+    cfg.save()
+        .map_err(|e| format!("could not save settings: {e}"))?;
+    // Reload so any warnings about the on-disk file (and the canonical parse)
+    // are reflected, not just this in-memory value.
+    let (loaded, warnings) = Config::load();
+    Ok(clock_source_info(loaded, warnings))
+}
+
 /// Toggle the main popover window near the tray.
 fn toggle_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -594,7 +730,9 @@ pub fn run() {
             disable_driver,
             status,
             stats,
-            open_project_page
+            open_project_page,
+            get_clock_source,
+            set_clock_source
         ])
         .setup(|app| {
             // Menu-bar app: no dock icon.
@@ -778,5 +916,71 @@ mod tests {
             "{s} is in the shared temp dir"
         );
         assert!(s.contains(&std::process::id().to_string()));
+    }
+
+    /// The dropdown options are DERIVED from the crate's `ClockSource::ALL`,
+    /// not hardcoded here or in the UI: same count, same order, and every
+    /// emitted token parses back to the variant it came from (so a value the UI
+    /// sends to `set_clock_source` is always one `ClockSource::parse` accepts).
+    #[test]
+    fn clock_options_are_derived_from_the_crate() {
+        let opts = clock_options();
+        assert_eq!(opts.len(), ClockSource::ALL.len());
+        for (opt, src) in opts.iter().zip(ClockSource::ALL.iter()) {
+            assert_eq!(opt.value, src.as_str());
+            assert_eq!(ClockSource::parse(&opt.value), Some(*src));
+            assert!(!opt.label.is_empty());
+            assert!(!opt.description.is_empty());
+        }
+    }
+
+    /// The snapshot reports the SELECTION from disk and the EFFECTIVE clock
+    /// from the daemon — two different facts, deliberately not conflated. With
+    /// no daemon running the selection is still shown (so the control reflects
+    /// what is saved) while nothing is claimed to be in force.
+    #[test]
+    fn the_selection_is_reported_separately_from_what_is_in_force() {
+        let cfg = Config {
+            clock_source: ClockSource::MacInternal,
+        };
+        let info = clock_source_info(cfg, vec!["a warning".to_string()]);
+        assert_eq!(info.selected, "mac");
+        // No ring in a unit test, so no verdict is published.
+        assert!(!info.network_disciplined);
+        assert!(
+            info.effective_reason.contains("no daemon"),
+            "got {:?}",
+            info.effective_reason
+        );
+        // Warnings must survive into the snapshot, not be swallowed.
+        assert_eq!(info.warnings, vec!["a warning".to_string()]);
+    }
+
+    /// With no daemon running there is no published verdict, and the snapshot
+    /// must say so rather than naming a clock. Reporting "Mac internal" here
+    /// would claim a clock is sourcing audio when no stream exists at all.
+    #[test]
+    fn no_daemon_reports_no_effective_clock_rather_than_the_mac() {
+        // No ring is attached in a unit test, so this exercises the None arm.
+        assert!(published_effective_clock().is_none());
+        let info = clock_source_info(
+            Config {
+                clock_source: ClockSource::NetworkGptp,
+            },
+            Vec::new(),
+        );
+        // The SELECTION is still reported, so the control shows what is saved.
+        assert_eq!(info.selected, "gptp");
+        // But nothing is claimed to be in force.
+        assert!(!info.network_disciplined);
+        assert!(
+            info.effective_reason.contains("no daemon"),
+            "reason should say why there is no effective clock, got {:?}",
+            info.effective_reason
+        );
+        assert_ne!(
+            info.effective_label, "Mac internal",
+            "must not name a clock when none is sourcing audio"
+        );
     }
 }

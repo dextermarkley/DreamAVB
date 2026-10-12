@@ -1,0 +1,16 @@
+[package]
+name = "avb-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Deliberately DEPENDENCY-FREE.
+#
+# This crate is shared with the Tauri companion app, which is not a workspace
+# member and pins its own serde (=1.0.210) against the workspace's (=1.0.229).
+# Two exact requirements on one major version cannot be resolved together, so a
+# serde dependency here would break the app's build. The config is one field;
+# a key=value line needs no serialization framework.
+[dependencies]

@@ -44,7 +44,13 @@ pub mod field {
     pub const FRAME_BYTES: usize = 32;
     pub const STREAM_COUNT: usize = 36;
     pub const DATA_OFFSET: usize = 40;
-    pub const RESERVED_44: usize = 44;
+    /// Which clock is actually disciplining this ring's sample rate, as
+    /// `avb_config::EffectiveClock::code()`. 0 means never written, which is
+    /// what a ring from a daemon that predates clock selection reads as — so a
+    /// reader must treat 0 as "unknown", not as a clock. Was `RESERVED_44`;
+    /// claiming a reserved word does not change the ring ABI version, because
+    /// a reader that ignores it behaves exactly as before.
+    pub const EFFECTIVE_CLOCK: usize = 44;
     pub const CONFIG_GENERATION: usize = 48;
     pub const WRITE_FRAME: usize = 128;
     pub const READ_FRAME: usize = 256;
