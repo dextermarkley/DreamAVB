@@ -177,16 +177,35 @@ struct AvbRxBatch {
 // network. It applies to EVERY frame, audio and control alike.
 //
 // Derivation: an SR class A stream is one frame per 125 us observation
-// interval = 8000 frames/s. The ceiling must clear that with room left over,
-// because the bucket is shared -- at 1000/s a talker consumed every token and
-// starved gPTP, MSRP and MVRP of theirs, so the stream reservation handshake
-// could not complete (measured: 382 553 of 441 373 frames dropped in one 60 s
-// run). 20 000/s = 2.5 class-A streams, leaving >= 12 000 frames/s for control
-// traffic that a stream can never take. It remains a real bound: 20 000 frames
-// at the 1522 B maximum is ~243 Mbit/s, under a quarter of a 1 Gbit link.
+// interval = 8000 frames/s. The ceiling must clear EVERY stream we talk at
+// once, with room left over, because the bucket is shared -- at 1000/s a
+// talker consumed every token and starved gPTP, MSRP and MVRP of theirs, so
+// the stream reservation handshake could not complete (measured: 382 553 of
+// 441 373 frames dropped in one 60 s run).
+//
+// The PreSonus 16R exposes 8 AAF audio streams in each direction (8 channels
+// each, 64 channels total), so a full-width talker sends
+// AVB_TX_MAX_CLASS_A_STREAMS * 8000 = 64 000 frames/s. 80 000/s leaves
+// 16 000 frames/s that a stream can never take, against the ~100/s control
+// traffic actually needs.
+//
+// HONEST NOTE on what this still bounds. At the old 20 000/s the ceiling also
+// bounded BANDWIDTH: 20 000 frames at the 1522 B maximum is ~243 Mbit/s, a
+// quarter of a 1 Gbit link. At 80 000/s that is no longer true (80 000 * 1522 B
+// would be ~974 Mbit/s, the whole link). It remains a real bound on what we
+// actually emit, because every frame this driver sends is a fixed, known size:
+// a 48 kHz / 8 ch / 6 spf / 32-bit AAF frame is 234 B, so 80 000/s is
+// ~150 Mbit/s, and the control frames are smaller still. A frame-count ceiling
+// cannot bound bytes for a client that varies frame size; bounding bytes would
+// need a second byte-rate bucket, which is the right fix if this driver ever
+// carries a variable-size payload.
+//
+// Changing this value requires REINSTALLING the dext (`avb-installer
+// activate`): it is compiled in, not read from the client.
 //
 // Must divide 1e9 evenly (see the static_assert on kTxTokenNs).
-#define AVB_TX_RATE_PER_SEC     20000u      // dext token bucket (SAF-6)
+#define AVB_TX_MAX_CLASS_A_STREAMS 8u       // the 16R's AAF streams per direction
+#define AVB_TX_RATE_PER_SEC     80000u      // dext token bucket (SAF-6)
 #define AVB_TX_BURST            64u
 
 // AvbRxSlot.cls

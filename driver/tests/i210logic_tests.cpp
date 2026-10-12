@@ -54,10 +54,16 @@ static_assert(AVB_RX_SLOT_DATA_MAX == 1984 && AVB_RX_CTL_SLOTS == 512 && AVB_RX_
 static_assert(AVB_RX_CTL_OFFSET == 16384 && AVB_RX_AUDIO_OFFSET == 16384 + 512 * 2048);
 static_assert(AVB_RX_MEM_SIZE == 17842176u && AVB_CONSUMER_MEM_SIZE == 16384);
 static_assert(AVB_MAX_STREAMS == 16 && AVB_STEP_CLOCK_MAX_NS == 1000000000ll);
-static_assert(AVB_TX_RATE_PER_SEC == 20000 && AVB_TX_BURST == 64);
-// The ceiling must clear one SR class A stream (8000 frames/s, one per 125 us)
-// with headroom for control traffic, since the bucket is shared across all TX.
-static_assert(AVB_TX_RATE_PER_SEC > 8000, "a class A talker must fit under SAF-6");
+static_assert(AVB_TX_RATE_PER_SEC == 80000 && AVB_TX_BURST == 64);
+static_assert(AVB_TX_MAX_CLASS_A_STREAMS == 8);
+// The ceiling must clear EVERY SR class A stream we talk at once (8000
+// frames/s each, one per 125 us) with headroom for control traffic, since the
+// bucket is shared across all TX. The 16R has 8 AAF streams per direction, so
+// a full-width talker needs 64 000 frames/s.
+static_assert(AVB_TX_RATE_PER_SEC > AVB_TX_MAX_CLASS_A_STREAMS * 8000u,
+              "a full-width class A talker must fit under SAF-6");
+static_assert(AVB_TX_RATE_PER_SEC - AVB_TX_MAX_CLASS_A_STREAMS * 8000u >= 8000u,
+              "control traffic needs headroom a stream can never take");
 static_assert(kAvbRxNone == 0 && kAvbRxGptp == 1 && kAvbRxMsrp == 2 && kAvbRxMvrp == 3 && kAvbRxAvdecc == 4 &&
               kAvbRxMaap == 5 && kAvbRxStream == 6 && AVB_RX_CLASS_COUNT == 7);
 static_assert(AVB_RXF_TS_HW == 1 && AVB_RXF_VLAN_FRAME == 2 && AVB_RXF_VLAN_DESC == 4 &&
@@ -630,8 +636,37 @@ static void testTokenBucket() {
         denied += tokenBucketTake(&a, i * 125000ull) ? 0 : 1;
     }
     CHECK(denied == 0);
-    std::printf("pass: tokenBucketTake (%u/s, burst %u; %d in 1 s; class A 8000/8000)\n",
-                AVB_TX_RATE_PER_SEC, AVB_TX_BURST, okCount);
+    // And it must pass a FULL-WIDTH talker: all AVB_TX_MAX_CLASS_A_STREAMS
+    // streams emitting together, one frame each per 125 us observation
+    // interval, for a full second. That is 64 000 frames/s on the 16R, over
+    // three times the old 20 000/s ceiling -- so 8-stream playback was capped
+    // at 2.5 streams' worth of frames and the rest were silently denied.
+    TokenBucket w{};
+    int deniedWide = 0;
+    for (uint64_t iv = 0; iv < 8000; iv++) {
+        for (uint32_t s2 = 0; s2 < AVB_TX_MAX_CLASS_A_STREAMS; s2++) {
+            deniedWide += tokenBucketTake(&w, iv * 125000ull) ? 0 : 1;
+        }
+    }
+    CHECK(deniedWide == 0);
+    // Control traffic must still get through alongside a full-width talker:
+    // gPTP, MSRP, MVRP and AVDECC share this one bucket, and starving them is
+    // what stopped Listener Ready from ever arriving at 1000/s.
+    TokenBucket c2{};
+    int deniedCtl = 0;
+    for (uint64_t iv = 0; iv < 8000; iv++) {
+        for (uint32_t s2 = 0; s2 < AVB_TX_MAX_CLASS_A_STREAMS; s2++) {
+            tokenBucketTake(&c2, iv * 125000ull);
+        }
+        // ~100 control frames/s: one every 80th interval.
+        if (iv % 80 == 0) {
+            deniedCtl += tokenBucketTake(&c2, iv * 125000ull) ? 0 : 1;
+        }
+    }
+    CHECK(deniedCtl == 0);
+    std::printf("pass: tokenBucketTake (%u/s, burst %u; %d in 1 s; class A 8000/8000; "
+                "%u streams wide 0 denied; control 0 denied)\n",
+                AVB_TX_RATE_PER_SEC, AVB_TX_BURST, okCount, AVB_TX_MAX_CLASS_A_STREAMS);
 }
 
 static void testStatsAccumulate() {

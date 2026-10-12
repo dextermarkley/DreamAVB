@@ -228,18 +228,26 @@ pub const CONSUMER_MEM_SIZE: u32 = 16384;
 /// S_max.
 pub const MAX_STREAMS: u32 = 16;
 pub const STEP_CLOCK_MAX_NS: i64 = 1_000_000_000;
+/// The 16R's AAF audio streams per direction (8 channels each, 64 total). The
+/// TX ceiling has to clear all of them at once.
+pub const TX_MAX_CLASS_A_STREAMS: u32 = 8;
 /// Dext TX token bucket (SAF-6). Shared across ALL transmitted frames, audio
-/// and control alike, so it must clear one SR class A stream (8000 frames/s,
-/// one per 125 us observation interval) with headroom left for gPTP, MSRP,
-/// MVRP and AVDECC. See the derivation in `driver/AVBShared.h`.
-pub const TX_RATE_PER_SEC: u32 = 20000;
+/// and control alike, so it must clear every SR class A stream we talk at once
+/// (8000 frames/s each, one per 125 us observation interval) with headroom
+/// left for gPTP, MSRP, MVRP and AVDECC. See the derivation in
+/// `driver/AVBShared.h`.
+///
+/// Changing this requires REINSTALLING the dext: it is compiled into the
+/// driver, not supplied by the client.
+pub const TX_RATE_PER_SEC: u32 = 80000;
 // Compile-time, so the bound holds even if the test below is ever removed.
 // Mirrors the `static_assert`s in `driver/AVBShared.h` / `I210Logic.hpp`.
 const _: () = {
     assert!(
-        TX_RATE_PER_SEC > 8000,
+        TX_RATE_PER_SEC > TX_MAX_CLASS_A_STREAMS * 8000,
         "the TX ceiling is shared across every frame we send, so it must clear \
-         one SR class A stream (8000 frames/s) with room for control traffic"
+         EVERY class A stream we talk at once (8000 frames/s each) with room \
+         left for control traffic"
     );
     assert!(
         1_000_000_000 % TX_RATE_PER_SEC == 0,
@@ -682,7 +690,8 @@ mod tests {
         assert_eq!(CONSUMER_MEM_SIZE, 16384);
         assert_eq!(MAX_STREAMS, 16);
         assert_eq!(STEP_CLOCK_MAX_NS, 1_000_000_000);
-        assert_eq!(TX_RATE_PER_SEC, 20000);
+        assert_eq!(TX_RATE_PER_SEC, 80000);
+        assert_eq!(TX_MAX_CLASS_A_STREAMS, 8);
         assert_eq!(TX_BURST, 64);
         assert_eq!(RX_CLASS_COUNT, 7);
         assert_eq!(RXF_TS_HW, 1);
