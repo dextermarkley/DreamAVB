@@ -1032,6 +1032,210 @@ async fn eval_auto_select_nic() -> AutoSelectInfo {
     auto_select_info(cfg, &nics)
 }
 
+// ---- The audio engine: one duplex daemon, both directions ------------------
+//
+// This is what makes the app able to deliver audio without the user running a
+// command. It supervises exactly ONE `avb-daemon duplex` process.
+//
+// One, not two, because the dext allows a single RingAttach per connection: a
+// second daemon attaching the same I210 is refused with
+// kIOReturnExclusiveAccess and exits Owned (9). So `play` + `record` side by
+// side cannot work, and `duplex` runs both directions in one loop.
+
+/// The running duplex daemon, if any.
+static AUDIO: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+/// Where the daemon's own output goes, so a failed start is diagnosable
+/// instead of silent. The app has no console to inherit.
+fn audio_log_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    let mut p = PathBuf::from(home);
+    p.push("Library/Logs/DreamAVB-daemon.log");
+    Some(p)
+}
+
+/// What the UI shows for the audio engine.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AudioStatus {
+    pub running: bool,
+    pub pid: Option<u32>,
+    /// Why it is not running, when it is not. Empty while running.
+    pub reason: String,
+    /// Where the daemon's log is, so the UI can point at it.
+    pub log_path: String,
+}
+
+/// Reap the child if it has exited, so `running` reflects reality rather than
+/// "we spawned something once". A daemon that exited on its own — no link, the
+/// rings owned by another client, gPTP never locked — must not read as
+/// running.
+fn audio_status_locked(slot: &mut Option<std::process::Child>) -> AudioStatus {
+    let log_path = audio_log_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let Some(child) = slot.as_mut() else {
+        return AudioStatus {
+            running: false,
+            pid: None,
+            reason: "not started".into(),
+            log_path,
+        };
+    };
+    match child.try_wait() {
+        // Still running.
+        Ok(None) => AudioStatus {
+            running: true,
+            pid: Some(child.id()),
+            reason: String::new(),
+            log_path,
+        },
+        // Exited by itself. Report the code: the daemon's exit codes are
+        // meaningful (9 = rings owned by another client, 6 = nothing
+        // discovered, 5 = no link), so passing it through is the difference
+        // between a usable message and "it stopped".
+        Ok(Some(st)) => {
+            let code = st.code().unwrap_or(-1);
+            *slot = None;
+            AudioStatus {
+                running: false,
+                pid: None,
+                reason: format!("the audio daemon exited with code {code} — see the log"),
+                log_path,
+            }
+        }
+        Err(e) => AudioStatus {
+            running: false,
+            pid: None,
+            reason: format!("could not read the audio daemon's state: {e}"),
+            log_path,
+        },
+    }
+}
+
+#[tauri::command]
+async fn audio_status() -> AudioStatus {
+    let mut guard = match AUDIO.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    audio_status_locked(&mut guard)
+}
+
+#[tauri::command]
+async fn start_audio() -> Result<AudioStatus, String> {
+    let mut guard = match AUDIO.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    // Idempotent: a second start must not spawn a second daemon, which the
+    // dext would refuse anyway — and the refusal would look like a fault.
+    let cur = audio_status_locked(&mut guard);
+    if cur.running {
+        return Ok(cur);
+    }
+
+    // The driver must own the NIC first. Starting the daemon against the OS
+    // default driver fails in a way that reads like a daemon bug, so say the
+    // real thing instead.
+    let st = current_status();
+    if st.state != DriverState::Active {
+        return Err(
+            "turn DreamAVB on for the network interface first — the audio daemon needs the \
+             driver to own the device"
+                .to_string(),
+        );
+    }
+
+    let bin = helper_path("avb-daemon");
+    let log = audio_log_path().ok_or_else(|| "HOME is not set".to_string())?;
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Append rather than truncate: the previous run's failure is usually what
+    // explains the current one.
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| format!("could not open {}: {e}", log.display()))?;
+    let err = out
+        .try_clone()
+        .map_err(|e| format!("could not open {}: {e}", log.display()))?;
+
+    // No --seconds: run until we stop it.
+    let child = Command::new(&bin)
+        .arg("duplex")
+        .arg("--log-level")
+        .arg("info")
+        .stdout(out)
+        .stderr(err)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", bin.display()))?;
+    *guard = Some(child);
+    Ok(audio_status_locked(&mut guard))
+}
+
+#[tauri::command]
+async fn stop_audio() -> Result<AudioStatus, String> {
+    let mut guard = match AUDIO.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    stop_audio_locked(&mut guard);
+    Ok(audio_status_locked(&mut guard))
+}
+
+/// Stop the daemon with SIGTERM, not SIGKILL.
+///
+/// The daemon installs signal handlers and shuts down deliberately: it sends an
+/// ADP DEPARTING so the 16R drops us from its entity table immediately. Killed
+/// with SIGKILL it cannot, and the 16R holds a stale entry for the full
+/// 2 × valid_time (20 s), which a restarted daemon then collides with.
+fn stop_audio_locked(slot: &mut Option<std::process::Child>) {
+    let Some(child) = slot.as_mut() else {
+        return;
+    };
+    let pid = child.id();
+    // SIGTERM, then give it a moment to depart cleanly.
+    unsafe { libc_kill(pid as i32, SIGTERM) };
+    for _ in 0..40 {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                *slot = None;
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    // It did not go. Escalate rather than leak a process holding the dext,
+    // which would block every later start.
+    let _ = child.kill();
+    let _ = child.wait();
+    *slot = None;
+}
+
+/// Stop the daemon on app exit. A daemon left running would keep the dext's
+/// rings attached with no UI to stop it.
+pub fn shutdown_audio() {
+    let mut guard = match AUDIO.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    stop_audio_locked(&mut guard);
+}
+
+const SIGTERM: i32 = 15;
+
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -1221,7 +1425,10 @@ pub fn run() {
             set_launch_at_login,
             get_auto_select_nic,
             set_auto_select_nic,
-            eval_auto_select_nic
+            eval_auto_select_nic,
+            audio_status,
+            start_audio,
+            stop_audio
         ])
         .setup(|app| {
             diag("--- DreamAVB starting ---");
@@ -1305,8 +1512,16 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running DreamAVB companion");
+        .build(tauri::generate_context!())
+        .expect("error while building DreamAVB companion")
+        .run(|_app, ev| {
+            // Never leave the audio daemon running with no UI to stop it: it
+            // holds the dext's rings attached, so the next start would be
+            // refused with Owned and look like a fault.
+            if let tauri::RunEvent::Exit = ev {
+                shutdown_audio();
+            }
+        });
 }
 
 #[cfg(test)]
@@ -1753,6 +1968,88 @@ mac            64:4b:f0:12:73:b8   timebase 125/3
             info.reason.contains('2'),
             "count should be surfaced: {}",
             info.reason
+        );
+    }
+
+    // --- the audio engine -------------------------------------------------
+    //
+    // The supervisor's one job that can silently lie is `running`: a daemon
+    // that exited by itself must not keep reading as running, or the UI shows
+    // audio flowing when the process is gone. These drive real child
+    // processes rather than asserting our own constants back at us.
+
+    #[test]
+    fn audio_status_with_nothing_started_is_not_running() {
+        let mut slot = None;
+        let st = audio_status_locked(&mut slot);
+        assert!(!st.running);
+        assert_eq!(st.pid, None);
+        assert_eq!(st.reason, "not started");
+    }
+
+    #[test]
+    fn a_daemon_that_exited_stops_reading_as_running_and_reports_its_code() {
+        // `false` exits 1 immediately — stands in for the daemon exiting on
+        // its own (no link, rings owned, gPTP never locked).
+        let child = Command::new("/usr/bin/false")
+            .spawn()
+            .expect("spawn /usr/bin/false");
+        let mut slot = Some(child);
+        // Give it a moment to actually exit, then poll until reaped.
+        let mut st = audio_status_locked(&mut slot);
+        for _ in 0..100 {
+            if !st.running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            st = audio_status_locked(&mut slot);
+        }
+        assert!(!st.running, "an exited daemon must not read as running");
+        assert!(
+            st.reason.contains("exited with code 1"),
+            "the exit code is how the user learns WHY: {}",
+            st.reason
+        );
+        // Reaped, so the slot is cleared and a restart is possible.
+        assert!(slot.is_none(), "the exited child must be cleared");
+    }
+
+    #[test]
+    fn a_live_daemon_reads_as_running_with_its_pid() {
+        // `sleep` stands in for a daemon that is up and staying up.
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let expected = child.id();
+        let mut slot = Some(child);
+        let st = audio_status_locked(&mut slot);
+        assert!(st.running);
+        assert_eq!(st.pid, Some(expected));
+        assert!(st.reason.is_empty(), "no reason while running");
+        // stop_audio_locked must actually reap it, not leak a process that
+        // would hold the driver's rings and block every later start.
+        stop_audio_locked(&mut slot);
+        assert!(slot.is_none(), "stop must clear the slot");
+    }
+
+    #[test]
+    fn stop_is_safe_when_nothing_is_running() {
+        let mut slot = None;
+        stop_audio_locked(&mut slot);
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn the_daemon_log_lives_under_the_users_logs_folder() {
+        if std::env::var_os("HOME").is_none() {
+            return;
+        }
+        let p = audio_log_path().expect("HOME is set");
+        let s = p.display().to_string();
+        assert!(
+            s.ends_with("/Library/Logs/DreamAVB-daemon.log"),
+            "unexpected log path: {s}"
         );
     }
 }

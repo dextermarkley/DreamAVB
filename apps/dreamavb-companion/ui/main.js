@@ -224,6 +224,76 @@ el("statsToggle").addEventListener("click", () => {
   if (open) refreshStats();
 });
 
+// --- Audio engine: the duplex daemon --------------------------------------
+//
+// One daemon does BOTH directions. It cannot be two processes: the driver
+// allows a single client to own the hardware rings, so a second one is
+// refused.
+
+let audioBusy = false;
+
+function paintAudio(info) {
+  const dot = el("audioDot");
+  const main = el("audioMain");
+  const sub = el("audioSub");
+  const box = el("audio");
+  if (info.running) {
+    dot.className = "status-dot ok";
+    main.textContent = "Audio running";
+    sub.textContent =
+      "Bidirectional audio with the 16R" +
+      (info.pid ? ` · daemon ${info.pid}` : "");
+    if (!audioBusy) box.checked = true;
+  } else {
+    dot.className = "status-dot";
+    main.textContent = "Audio stopped";
+    // Distinguish "never started" from "started and then exited": the second
+    // is a fault worth showing, the first is just the resting state.
+    sub.textContent =
+      info.reason && info.reason !== "not started"
+        ? info.reason
+        : "Start bidirectional audio with the 16R";
+    if (!audioBusy) box.checked = false;
+  }
+}
+
+async function refreshAudio() {
+  try {
+    paintAudio(await invoke("audio_status"));
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+el("audio").addEventListener("change", async (ev) => {
+  if (audioBusy) return;
+  audioBusy = true;
+  const want = ev.target.checked;
+  ev.target.disabled = true;
+  try {
+    paintAudio({
+      running: want,
+      reason: "",
+      pid: null,
+      log_path: "",
+    });
+    const info = want
+      ? await invoke("start_audio")
+      : await invoke("stop_audio");
+    audioBusy = false;
+    paintAudio(info);
+  } catch (e) {
+    // A refusal here is usually "turn the driver on first", which is
+    // actionable, so show it rather than silently reverting the switch.
+    showError(String(e));
+    audioBusy = false;
+    await refreshAudio();
+  } finally {
+    ev.target.disabled = false;
+    audioBusy = false;
+  }
+});
+
 el("link").addEventListener("click", () => {
   invoke("open_project_page");
 });
@@ -349,6 +419,7 @@ el("autoSelectNic").addEventListener("change", async (ev) => {
   await refreshClock();
   await refreshLaunchAtLogin();
   await refreshAutoSelectSetting();
+  await refreshAudio();
   // Auto-select runs ONCE at startup, after the first NIC list is populated.
   // It only selects (never enables the driver) and only when unambiguous; it
   // defers to a choice the user already made this session.
@@ -363,6 +434,7 @@ el("autoSelectNic").addEventListener("change", async (ev) => {
   setInterval(() => {
     refreshStatus();
     refreshClock();
+    refreshAudio();
   }, 2000);
   setInterval(() => {
     if (el("stats").classList.contains("open")) refreshStats();

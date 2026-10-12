@@ -1804,21 +1804,11 @@ fn streams_loop(
     // format (channels/rate/spf) is known — never hardcoded. `ShmProducer`
     // owns the mapping and the producer together. The media clock drives the
     // ring's clock block for the plug-in's timebase.
-    let mut ring: Option<avb_audioring::ShmProducer> = None;
-    let mut mclk: Option<avb_mediaclock::MediaClock> = None;
-    let mut ring_stream_id: u64 = 0;
-    let mut ring_spf: usize = 0;
-    // Geometry the ring was built from (first packet of the primary stream).
-    // Later packets must match it exactly, or the placement would be blind.
-    let mut ring_channels: u16 = 0;
-    let mut ring_bit_depth: u8 = 0;
-    let mut ring_format: u8 = 0;
-    let mut ring_nsr: u8 = 0;
-    let mut ring_data_len: u16 = 0;
-    let mut ring_format_mismatch: u64 = 0;
-    // Sequential write cursor for the ring FIFO (frames). Advanced by spf per
-    // placed packet; the plug-in's Consumer drains it in order.
-    let mut ring_write_pos: u64 = 0;
+    //
+    // The inbound path itself (ring creation from the first packet's geometry,
+    // placement, media clock) lives in `listenerrx`, shared with the duplex
+    // loop so there is one implementation of it.
+    let mut lrx = crate::listenerrx::ListenerRx::new();
     let run_ns = seconds.saturating_mul(1_000_000_000);
     let interval_ns = interval.max(1).saturating_mul(1_000_000_000);
     let count_start = now_mach();
@@ -1941,142 +1931,16 @@ fn streams_loop(
                     }
                 }
                 last_seq.insert(sid, seq);
-                // 1b-1: build the shm ring + producer on the first AAF packet
-                // and bind it to that stream_id as the primary. Geometry comes
-                // from the packet's AAF header (channels/rate/spf), never a
-                // literal. The plug-in exposes exactly these channels.
-                if ring.is_none() {
-                    let ch = usize::from(pdu.hdr.channels_per_frame.max(1));
-                    let rate = avb_avtp::stream_format::nsr_hz(pdu.hdr.nsr).unwrap_or(48_000);
-                    // Samples per frame = data_len / (channels × bytes/sample).
-                    let bps = avb_avtp::aaf::bytes_per_sample(pdu.hdr.format).unwrap_or(4);
-                    let spf = (usize::from(pdu.hdr.stream_data_length) / (ch * bps.max(1))).max(1);
-                    if let Some(consts) = avb_mediaclock::RateConsts::new(rate, spf as u32) {
-                        let cfg = avb_audioring::RingConfig {
-                            channels: ch as u32,
-                            valid_bits: if pdu.hdr.bit_depth == 0 {
-                                24
-                            } else {
-                                u32::from(pdu.hdr.bit_depth)
-                            },
-                            nominal_rate_hz: rate,
-                            capacity_frames: consts.capacity_frames as u32,
-                            streams: vec![avb_audioring::StreamSlot {
-                                stream_id: sid,
-                                first_channel: 0,
-                                channels: ch as u32,
-                                bit_depth: if pdu.hdr.bit_depth == 0 {
-                                    24
-                                } else {
-                                    u32::from(pdu.hdr.bit_depth)
-                                },
-                            }],
-                            channel_map: (0..ch).map(|c| (0u16, c as u16)).collect(),
-                        };
-                        match avb_audioring::ShmProducer::create(
-                            &cfg,
-                            &[(0, ch, u32::from(pdu.hdr.bit_depth.max(24)))],
-                            consts.lag_frames,
-                            consts.silent_lag,
-                        ) {
-                            Ok(rp) => {
-                                mclk = Some(avb_mediaclock::MediaClock::new(consts, 0));
-                                ring = Some(rp);
-                                ring_stream_id = sid;
-                                ring_spf = spf;
-                                ring_channels = pdu.hdr.channels_per_frame;
-                                ring_bit_depth = pdu.hdr.bit_depth;
-                                ring_format = pdu.hdr.format;
-                                ring_nsr = pdu.hdr.nsr;
-                                ring_data_len = pdu.hdr.stream_data_length;
-                                log.log(
-                                    Level::Info,
-                                    "ring",
-                                    &format!(
-                                        "shm ring {} bound: stream 0x{sid:016x}, {ch} ch @ {rate} Hz, spf={spf}, cap={}",
-                                        avb_audioring::SHM_NAME,
-                                        consts.capacity_frames
-                                    ),
-                                );
-                            }
-                            Err(e) => {
-                                log.log(
-                                    Level::Error,
-                                    "ring",
-                                    &format!("shm ring create failed: {e}"),
-                                );
-                            }
-                        }
-                    }
-                }
-                // Feed the primary stream into the ring: drive the media clock
-                // on its tv=1 packets, place the PCM at the clock's ring frame,
-                // publish the clock model, and commit the frontier.
-                if sid == ring_stream_id {
-                    if let (Some(rp), Some(mc)) = (ring.as_mut(), mclk.as_mut()) {
-                        let arrival = ns_since(count_start);
-                        let pt = if pdu.hdr.stream.tv {
-                            avb_mediaclock::presentation_time_ns(
-                                pdu.hdr.stream.avtp_timestamp,
-                                arrival,
-                            )
-                            .unwrap_or(arrival)
-                        } else {
-                            arrival
-                        };
-                        if pdu.hdr.stream.tv {
-                            mc.on_reference_packet(
-                                avb_mediaclock::RefPacket { pt_ns: pt, k: 1 },
-                                arrival,
-                                arrival,
-                            );
-                        }
-                        // Place samples SEQUENTIALLY at a running frame counter,
-                        // not at the media-clock's absolute ring_frame. The ring
-                        // is a FIFO the plug-in drains in order; clock-derived
-                        // absolute frames grow on a wall-clock timeline the
-                        // consumer can't track, lapping it by millions of frames
-                        // (= overrun garble). The media clock still timestamps
-                        // the clock block below for the plug-in's timebase.
-                        // Re-validate the packet against the geometry the ring
-                        // was built from (review M1). Only the first packet set
-                        // that geometry; a later packet with a different
-                        // format/channel count/length would be placed blind,
-                        // zero-filling the missing samples while the frame
-                        // counter kept advancing — silent corruption. The
-                        // audio.rs path already does this check.
-                        if pdu.hdr.channels_per_frame != ring_channels
-                            || pdu.hdr.bit_depth != ring_bit_depth
-                            || pdu.hdr.format != ring_format
-                            || pdu.hdr.nsr != ring_nsr
-                            || pdu.hdr.stream_data_length != ring_data_len
-                        {
-                            ring_format_mismatch += 1;
-                            continue;
-                        }
-                        let fmt = if pdu.hdr.format == avb_avtp::aaf::format::INT_24BIT {
-                            avb_audioring::SampleFormat::Int24
-                        } else {
-                            avb_audioring::SampleFormat::Int32
-                        };
-                        rp.producer()
-                            .place(0, ring_write_pos as i128, ring_spf, fmt, pdu.data);
-                        rp.producer().commit(false, None);
-                        ring_write_pos += ring_spf as u64;
-                        if mc.should_publish() {
-                            let model = mc.clock_model(arrival as f64, 0.0, 0.0);
-                            rp.ring().publish_clock(&avb_audioring::ClockBlock {
-                                anchor_frame: model.anchor_frame,
-                                anchor_mach: model.anchor_mach,
-                                mach_per_frame: model.mach_per_frame,
-                                rate_hz_vs_mach: model.rate_hz_vs_mach,
-                                media_ppm_vs_gptp: model.media_ppm_vs_gptp,
-                                uncertainty_ns: model.uncertainty_ns,
-                                locked: model.locked,
-                                reset_count: model.reset_count,
-                            });
-                        }
-                    }
+                // Feed the primary stream into the ring. The whole inbound
+                // path — building the ring from the first packet's own
+                // geometry, the media clock, placement and the published
+                // clock block — lives in `listenerrx`, shared with the duplex
+                // loop so there is one implementation of it.
+                let placement = lrx.on_pdu(log, &pdu, ns_since(count_start));
+                if placement == crate::listenerrx::Placement::FormatMismatch {
+                    // Not audio we can trust: skip it entirely rather than
+                    // recording or metering it.
+                    continue;
                 }
                 // WAV: record the PRIMARY stream (first AAF stream we see,
                 // which is the lowest stream_id -> 16R channels 1..N).
@@ -2207,7 +2071,7 @@ fn streams_loop(
     log.log(
         Level::Info,
         "streams",
-        &format!("audio ring: raw_slots={raw_audio_slots} non_aaf_or_undecoded={aaf_decode_fail} format_mismatch={ring_format_mismatch}"),
+        &format!("audio ring: raw_slots={raw_audio_slots} non_aaf_or_undecoded={aaf_decode_fail} format_mismatch={} frames_placed={}", lrx.format_mismatches(), lrx.frames_placed()),
     );
     let _ = first_slot_dump;
     // Channel-map: report channels whose peak |sample| is well above the noise
@@ -2401,17 +2265,65 @@ pub fn play(
         "play",
         &format!("play {seconds}s OUT to 16R (listener_uid={listener_uid})"),
     );
-    talker_loop(opts, &log, &mut dext, seconds, listener, listener_uid)
+    talker_loop(
+        opts,
+        &log,
+        &mut dext,
+        seconds,
+        listener,
+        listener_uid,
+        false,
+    )
+}
+
+/// Both directions in ONE process (the mode the companion app launches).
+///
+/// This exists because the dext permits one `RingAttach` per connection: a
+/// second `avb-daemon` attaching the same I210 is refused with
+/// `kIOReturnExclusiveAccess` and exits `Owned` (9). So `play` and `record`
+/// cannot be run side by side to get bidirectional audio — one loop has to do
+/// both, sharing a single control-ring drain and a single gPTP service,
+/// because the control ring is one queue and a slot read by one direction is
+/// gone for the other.
+///
+/// `seconds == 0` means run until SIGINT, which is how the companion runs it.
+pub fn duplex(
+    opts: &GlobalOpts,
+    seconds: u64,
+    listener: Option<u64>,
+    listener_uid: u16,
+    _start_timeout: u64,
+    _summary_out: Option<PathBuf>,
+) -> Result<(), Exit> {
+    install_signal_handlers();
+    let log = Logger::new(opts.level);
+    let mut dext = bring_up(opts, &log)?;
+    log.log(
+        Level::Info,
+        "duplex",
+        &if seconds == 0 {
+            format!("duplex IN+OUT with the 16R until SIGINT (listener_uid={listener_uid})")
+        } else {
+            format!("duplex {seconds}s IN+OUT with the 16R (listener_uid={listener_uid})")
+        },
+    );
+    talker_loop(opts, &log, &mut dext, seconds, listener, listener_uid, true)
 }
 
 /// The talker TX loop (design §5.2 TX side, Phase 1b-2). Creates the output
 /// ring, discovers the 16R and binds our STREAM_OUTPUT to its STREAM_INPUT via
 /// ACMP (as controller), then paces AAF PDUs from the ring on the media clock.
 ///
-/// The connect/advertise handshake and the TX pacing against the live I210 are
-/// finalized during the Phase 1b-2 hardware milestone (same staging the
-/// listener loops used); the sans-IO pieces — the output ring, the media-clock
-/// derivation and `AafTalker` packetization — are wired and unit-tested now.
+/// With `duplex` set it ALSO runs the inbound direction in the same loop:
+/// declaring MSRP Listener Ready when the 16R advertises its talker, installing
+/// the dext RX filter, re-asserting ACMP CONNECT_TX, and feeding received AAF
+/// into the input ring via [`crate::listenerrx`].
+///
+/// Both directions have to share one loop, not two processes: the dext allows
+/// one `RingAttach` per connection, so a second daemon gets
+/// `kIOReturnExclusiveAccess` and exits `Owned`. They also have to share one
+/// control-ring drain and one gPTP service, because the control ring is a
+/// single queue — a slot read by one direction is gone for the other.
 fn talker_loop(
     opts: &GlobalOpts,
     log: &Logger,
@@ -2419,6 +2331,7 @@ fn talker_loop(
     seconds: u64,
     listener: Option<u64>,
     listener_uid: u16,
+    duplex: bool,
 ) -> Result<(), Exit> {
     use avb_avtp::stream_format::AafFormat;
     use avb_avtp::talker::AafTalker;
@@ -2427,6 +2340,7 @@ fn talker_loop(
 
     use crate::dextio::DextPort;
 
+    let dir = if duplex { "duplex" } else { "play" };
     // Our talker stream id = our MAC + a unique id (0 for the first output
     // stream). The 16R identifies the stream it listens to by this id.
     let info = dext.device().info().map_err(|_| Exit::DextFault)?;
@@ -2663,7 +2577,9 @@ fn talker_loop(
     use crate::dextio::SendResult;
     use avb_core::eth::EthFrame;
     use avb_core::{Now, Outbox, RxMeta};
-    use avb_srp::attr::{Attribute, Talker, DEFAULT_DOMAIN, ETHERTYPE_MSRP, ETHERTYPE_MVRP};
+    use avb_srp::attr::{
+        Attribute, Listener, ListenerDecl, Talker, DEFAULT_DOMAIN, ETHERTYPE_MSRP, ETHERTYPE_MVRP,
+    };
     use avb_srp::participant::{Participant, ParticipantConfig, SrpEvent};
 
     let srp_cfg = ParticipantConfig {
@@ -2754,6 +2670,22 @@ fn talker_loop(
     let mut last_gptp_push = now_mach();
     let mut last_gptp_service = now_mach();
 
+    // ---- Inbound direction (duplex only) -----------------------------------
+    //
+    // The 16R → Mac half. The data path itself is `listenerrx`, shared with
+    // `streams_loop`. What is needed here is the declaration side: the 16R
+    // only streams to a listener that has declared MSRP Listener Ready for its
+    // stream, and the dext only delivers frames matching an installed filter.
+    let mut lrx = crate::listenerrx::ListenerRx::new();
+    // Dext RX filter entries: (stream_id, dest_mac, vlan).
+    let mut in_filter: Vec<(u64, [u8; 6], u16)> = Vec::new();
+    // Stream ids we have already declared Listener Ready for.
+    let mut in_declared: std::collections::BTreeSet<u64> = Default::default();
+    let mut in_connect_seq: u16 = 1000;
+    let mut last_in_connect = MachTicks(0);
+    let mut in_slots: u64 = 0;
+    let mut in_decode_fail: u64 = 0;
+
     loop {
         if shutdown_requested() {
             break;
@@ -2764,7 +2696,7 @@ fn talker_loop(
         }
         let h = dext.health();
         if h.fault != 0 {
-            log.log(Level::Error, "play", &format!("dext fault {}", h.fault));
+            log.log(Level::Error, dir, &format!("dext fault {}", h.fault));
             return Err(Exit::DextFault);
         }
 
@@ -2888,6 +2820,64 @@ fn talker_loop(
                 }
                 _ => {}
             }
+            // Inbound: the 16R advertising ITS talker is our cue to declare
+            // Listener Ready and install the dext filter. Without the
+            // declaration it never streams to us; without the filter the dext
+            // never delivers what it does send. This is the mirror of our own
+            // Talker Advertise above, which is what makes the 16R accept us.
+            if duplex {
+                if let SrpEvent::TalkerRegistered {
+                    stream_id,
+                    talker: t,
+                } = ev
+                {
+                    // Never our own stream reflected back at us.
+                    if stream_id.0 != our_stream_id.0 {
+                        if let Some(code) = t.failure_code() {
+                            // A Talker FAILED is not a usable advertise: the
+                            // 16R is saying it will not stream this source.
+                            log.log(
+                                Level::Warn,
+                                "srp",
+                                &format!(
+                                    "16R TALKER FAILED id=0x{:016x} code={code} — it refuses to stream this source to us",
+                                    stream_id.0
+                                ),
+                            );
+                        } else {
+                            let adv = t.advertise();
+                            let dmac = adv.dest_mac.octets();
+                            // The dext rejects vid 0, so fall back to the SR
+                            // class A VID we declared.
+                            let ta_vid = if adv.vlan_id == 0 {
+                                DEFAULT_DOMAIN.vid
+                            } else {
+                                adv.vlan_id
+                            };
+                            in_filter.retain(|(_, m, _)| *m != dmac);
+                            in_filter.push((stream_id.0, dmac, ta_vid));
+                            dext.set_filter(&in_filter);
+                            if in_declared.insert(stream_id.0) {
+                                srp.declare_new(
+                                    now_mach(),
+                                    Attribute::Listener(Listener {
+                                        stream_id,
+                                        decl: ListenerDecl::Ready,
+                                    }),
+                                );
+                                log.log(
+                                    Level::Info,
+                                    "srp",
+                                    &format!(
+                                        "16R talker advertise: id=0x{:016x} dest={dmac:02x?} vid={ta_vid} -> declared Listener Ready",
+                                        stream_id.0
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
         // Run the MRP timers and put whatever they produced on the wire.
         srp.poll(srp_now(), &mut srp_out);
@@ -2934,6 +2924,62 @@ fn talker_loop(
                 propagation_delay_ns: st.path_delay_comp_ns.last.unwrap_or(0.0).max(0.0) as u32,
             });
             last_gptp_push = now_mach();
+        }
+
+        // ---- Inbound audio (duplex) -----------------------------------------
+        //
+        // Deliberately BEFORE the TX readiness gate below. That gate waits for
+        // OUR servo to lock before transmitting, and `continue`s while it
+        // waits — but the inbound direction does not depend on our clock at
+        // all: the 16R stamps its own PDUs and we recover its media clock from
+        // them. Draining here means audio flows IN during the lock wait
+        // instead of being blocked by an unrelated condition.
+        if duplex {
+            // Ask the 16R to connect its STREAM_OUTPUT to us, re-asserted on
+            // the same ~1 s cadence Apple's controller uses so the Milan
+            // talker holds the connection and keeps advertising.
+            if last_in_connect.0 == 0 || ns_since(last_in_connect) >= 1_000_000_000 {
+                use avb_avdecc::acmp::Acmpdu;
+                use avb_avdecc::constants::{acmp_msg, acmp_status};
+                let pdu = Acmpdu {
+                    message_type: acmp_msg::CONNECT_TX_COMMAND,
+                    status: acmp_status::SUCCESS,
+                    stream_id: avb_core::StreamId(0),
+                    controller_entity_id: our_id,
+                    talker_entity_id: listener_id,
+                    listener_entity_id: our_id,
+                    talker_unique_id: 0,
+                    listener_unique_id: 0,
+                    sequence_id: in_connect_seq,
+                    ..Default::default()
+                };
+                in_connect_seq = in_connect_seq.wrapping_add(1);
+                let hdr = EthHeader {
+                    dst: avb_core::AVDECC_MULTICAST,
+                    src: our_mac,
+                    vlan: None,
+                    ethertype: avb_avtp::common::ETHERTYPE_AVTP,
+                };
+                if let Ok(f) = TxFrame::build(&hdr, &pdu.encode(), false, 0) {
+                    let _ = dext.send(f.bytes(), false, 0);
+                }
+                last_in_connect = now_mach();
+            }
+            for slot in dext.rx_audio() {
+                in_slots += 1;
+                // The audio ring carries whole Ethernet frames; AAF decode
+                // wants the AVTP payload, so strip the Ethernet/VLAN header.
+                let Ok(p) = avb_core::eth::EthFrame::parse(&slot.data) else {
+                    in_decode_fail += 1;
+                    continue;
+                };
+                match avb_avtp::aaf::decode(p.payload) {
+                    Ok(pdu) => {
+                        lrx.on_pdu(log, &pdu, elapsed);
+                    }
+                    Err(_) => in_decode_fail += 1,
+                }
+            }
         }
 
         // ---- Readiness gate -------------------------------------------------
@@ -3157,7 +3203,7 @@ fn talker_loop(
     let final_gptp = gptp.status();
     log.log(
         Level::Info,
-        "play",
+        dir,
         &format!(
             "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns over {}s; 16R listener_ready={listener_ready}; AEM commands answered={aecp_answered} refused={aecp_refused}; gPTP servo={} offset {:.0} ns, {ts_unavailable} ticks with no clock anchor, {ticks_unlocked} unlocked",
             run_ns / 1_000_000_000,
@@ -3165,6 +3211,40 @@ fn talker_loop(
             final_gptp.offset_ns.last.unwrap_or(f64::NAN),
         ),
     );
+    if duplex {
+        // Report the inbound direction SEPARATELY and in terms of frames
+        // actually placed. A direction that ran but moved nothing is the
+        // failure mode that hid the dead output path for weeks — the summary
+        // has to make "ran and moved audio" distinguishable from "ran".
+        log.log(
+            Level::Info,
+            "duplex",
+            &format!(
+                "listener done: {in_slots} audio slots, {in_decode_fail} not decodable as AAF, {} frames placed into the input ring, {} format mismatches; Listener Ready declared for {} stream(s), dext filter entries {}",
+                lrx.frames_placed(),
+                lrx.format_mismatches(),
+                in_declared.len(),
+                in_filter.len(),
+            ),
+        );
+        if in_declared.is_empty() {
+            log.log(
+                Level::Warn,
+                "duplex",
+                "the 16R never advertised a talker stream to us, so we never \
+                 declared Listener Ready and no audio could flow IN — check \
+                 that its STREAM_OUTPUT is connected to this entity",
+            );
+        } else if lrx.frames_placed() == 0 {
+            log.log(
+                Level::Warn,
+                "duplex",
+                "Listener Ready was declared but NOT ONE audio frame reached \
+                 the input ring — the reservation was made and the 16R still \
+                 did not stream, or the dext filter did not match its frames",
+            );
+        }
+    }
     if aecp_answered == 0 {
         log.log(
             Level::Warn,

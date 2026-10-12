@@ -170,15 +170,15 @@ consequences to expect on hardware:
 
 Still unbuilt, and the next likely blockers:
 
-- **Bidirectional audio needs ONE daemon process.** The dext enforces
-  `kIOReturnExclusiveAccess` ("one RingAttach per connection"), so `play` and
-  `record` CANNOT run as two processes — the second gets `Exit::Owned`. The
-  companion app is supposed to start everything needed for full duplex, so
-  this is the blocking piece of that feature: merge the listener loop
-  (`streams_loop`) and the talker loop (`talker_loop`) behind one control-ring
-  drain and one shared `GptpService`, exposed as a single long-running
-  subcommand with no `--seconds`. `run` is currently a stub and is the natural
-  home for it.
+- **Duplex is BUILT but UNVERIFIED on hardware.** `avb-daemon duplex` runs
+  both directions in one process and the companion drives it; nothing about it
+  has met the 16R. Run it and read the two inbound warnings first (see the
+  product section below). The AEM is the known incompleteness: our entity
+  still advertises a talker-only model, so the inbound data path works
+  (ACMP CONNECT_TX + MSRP Listener Ready do not need us to advertise a
+  STREAM_INPUT) while a third-party controller would not see our input
+  stream. Merging the listener and talker AEM models into one entity is the
+  fix, and is also what CLOCK_SOURCE needs below.
 - **GET_STREAM_INFO answers NOT_IMPLEMENTED on purpose.** Its 32-bit flags
   word needs bit positions from 1722.1-2021 Table 7.206. The working group's
   own clarification (Illouz, "AVDECC clarifications Part 2 — AEM commands",
@@ -227,11 +227,45 @@ The five product goals the user set, and where each stands:
 4. **Optional auto-select NIC — DONE.** Default OFF. Exactly one supported NIC
    is selected; zero or two-or-more selects nothing and says why. It SELECTS
    ONLY — it never activates the driver, so (2) still holds.
-5. **Companion starts everything for full duplex — NOT DONE.** Blocked on the
-   single-process duplex daemon described in the Phase 1b resume point above.
-   The app-side start/stop UI was deliberately not built yet: there is no
-   subcommand for it to drive, and a supervisor for a binary that does not
-   exist cannot be verified.
+5. **Companion starts everything for full duplex — DONE.** `avb-daemon duplex`
+   runs BOTH directions in one process, and the companion supervises exactly
+   one of them (Audio toggle in the popover). It must be one process: the dext
+   permits one `RingAttach` per connection, so a second daemon is refused with
+   `kIOReturnExclusiveAccess` and exits `Owned` (9). Both directions also share
+   ONE control-ring drain and ONE `GptpService`, because the control ring is a
+   single queue — a slot read by one direction is gone for the other.
+
+   Implementation notes that matter if this is touched again:
+   - `duplex` is `talker_loop(.., duplex: true)`, not a second loop. The talker
+     loop already did every shared piece (drain routing, gPTP, SRP, ADP, AECP,
+     clock-source publish); duplex adds the inbound declaration side and the
+     audio drain. There is deliberately no second implementation of either
+     direction.
+   - The inbound data path is `crate::listenerrx`, extracted from
+     `streams_loop` and shared with it. `streams_loop` calls the same code, so
+     the two cannot drift. Two copies of a wire path is how the wrong
+     `WriteMix` FourCC survived five reviews: one copy was never exercised.
+   - The inbound drain runs BEFORE the TX readiness gate on purpose. That gate
+     waits for OUR servo to lock and `continue`s while waiting, but inbound
+     audio does not depend on our clock at all — the 16R stamps its own PDUs.
+     Draining first means audio flows IN during the lock wait.
+   - The companion stops the daemon with SIGTERM, never SIGKILL: the daemon
+     sends an ADP DEPARTING on clean shutdown, and without it the 16R holds a
+     stale entry for 2 × valid_time (20 s) that a restarted daemon collides
+     with. It escalates to kill only after ~2 s, so a wedged daemon cannot
+     leak and hold the rings.
+   - `start_audio` refuses unless the driver is Active, because starting
+     against the OS default driver fails in a way that reads like a daemon bug.
+   - The daemon's own output goes to `~/Library/Logs/DreamAVB-daemon.log`
+     (appended, not truncated — the previous run usually explains this one).
+     The app has no console to inherit, so without this a failed start is
+     silent.
+   - UNVERIFIED ON HARDWARE. The duplex loop has never run against the 16R.
+     The summary is built so a dead direction cannot look healthy: it reports
+     inbound frames PLACED, and warns separately when the 16R never advertised
+     a talker (so no Listener Ready was declared) and when Listener Ready was
+     declared but not one frame arrived. Those two warnings are the first
+     things to read on the first run.
 
 Settings live in `~/Library/Application Support/DreamAVB/config.txt`, keys
 `clock_source`, `launch_at_login`, `auto_select_nic`. `avb-config` is
@@ -240,6 +274,20 @@ deliberately dependency-free and serde-free: the main workspace pins serde
 one major version cannot resolve together. Any writer of that file must
 load-then-mutate, never construct a fresh `Config` — doing the latter silently
 clobbered the other settings (fixed in `22dbef0`).
+
+## Verified at the duplex commit
+
+- `cargo fmt --all --check`: clean (exit 0).
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo test --workspace --locked`: 418 pass.
+- Companion app (its OWN cargo workspace): 30 tests, clippy `-D warnings`
+  clean, fmt clean. `node --check ui/main.js` OK; every element id main.js
+  reaches exists in index.html.
+- C++ host tests: 342 i210 checks pass.
+- `xcodebuild … AVBI210Driver`: BUILD SUCCEEDED, 0 compiler warnings.
+- `scripts/package.sh --adhoc`: packaged; the shipped `avb-daemon` has the
+  `duplex` subcommand.
+- `scripts/build-pkg.sh`: payload re-verified, `<relocate/>` empty.
 
 ## Verified at `22dbef0`
 

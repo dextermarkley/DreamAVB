@@ -22,6 +22,7 @@ mod clocksrc;
 mod dextio;
 mod exit;
 mod gptpsvc;
+mod listenerrx;
 mod log;
 mod pcap;
 #[cfg(test)]
@@ -147,6 +148,30 @@ enum Command {
         #[arg(long)]
         summary_out: Option<PathBuf>,
     },
+    /// Full stack, BOTH directions in one process: play audio OUT to the 16R
+    /// from the output ring AND receive audio IN from it into the input ring.
+    ///
+    /// This is the mode the companion app launches, and the only way to get
+    /// bidirectional audio: the dext allows ONE RingAttach per connection, so
+    /// `play` and `record` as two processes cannot both own the I210 — the
+    /// second gets `Owned` (exit 9). Runs until SIGINT unless `--seconds` is
+    /// given.
+    Duplex {
+        /// Stop after N seconds. Omit to run until SIGINT (the companion's
+        /// normal mode).
+        #[arg(long)]
+        seconds: Option<u64>,
+        /// The 16R entity id. Auto-discovered when omitted.
+        #[arg(long)]
+        listener: Option<String>,
+        /// Which of the 16R's STREAM_INPUT sinks to send to.
+        #[arg(long, default_value_t = 0)]
+        listener_uid: u16,
+        #[arg(long, default_value_t = 30)]
+        start_timeout: u64,
+        #[arg(long)]
+        summary_out: Option<PathBuf>,
+    },
 }
 
 fn run() -> Result<(), Exit> {
@@ -249,6 +274,32 @@ fn run() -> Result<(), Exit> {
                 listener,
                 listener_uid,
                 allow_partial,
+                start_timeout,
+                summary_out,
+            )
+        }
+        Command::Duplex {
+            seconds,
+            listener,
+            listener_uid,
+            start_timeout,
+            summary_out,
+        } => {
+            // `seconds` is optional here: the companion runs this until it
+            // stops the process. 0 means "no limit" to the loop.
+            if let Some(s) = seconds {
+                validate::validate_seconds(s)?;
+            }
+            validate::validate_timeout(start_timeout)?;
+            let listener = listener
+                .as_deref()
+                .map(validate::parse_talker)
+                .transpose()?;
+            stack::duplex(
+                &opts,
+                seconds.unwrap_or(0),
+                listener,
+                listener_uid,
                 start_timeout,
                 summary_out,
             )
