@@ -228,6 +228,118 @@ el("link").addEventListener("click", () => {
   invoke("open_project_page");
 });
 
+// --- Preferences: launch at login + auto-select NIC ------------------------
+
+/// The user has made a NIC choice this session (manually or via auto-select),
+/// so later polls and a re-run of auto-select must not override it.
+let nicChosen = false;
+
+// A manual pick counts as a choice: never let auto-select or a poll move it
+// afterwards.
+el("nic").addEventListener("change", () => {
+  nicChosen = true;
+});
+
+async function refreshLaunchAtLogin() {
+  try {
+    const info = await invoke("get_launch_at_login");
+    el("launchAtLogin").checked = !!info.enabled;
+    paintLaunchNote(info);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function paintLaunchNote(info) {
+  const sub = el("launchSub");
+  if (info && info.note) {
+    sub.textContent = info.note;
+    sub.style.color = "var(--warn)";
+  } else if (info && info.enabled && info.plist_present === false) {
+    sub.textContent = "Enabled, but the login item could not be installed";
+    sub.style.color = "var(--warn)";
+  } else {
+    sub.textContent = "Start DreamAVB automatically when you log in";
+    sub.style.color = "";
+  }
+}
+
+el("launchAtLogin").addEventListener("change", async (ev) => {
+  const want = ev.target.checked;
+  ev.target.disabled = true;
+  try {
+    const info = await invoke("set_launch_at_login", { enabled: want });
+    paintLaunchNote(info);
+    // Reflect what actually happened (e.g. a failed load leaves it enabled in
+    // config but with a note), not just the click.
+    el("launchAtLogin").checked = !!info.enabled;
+  } catch (e) {
+    el("launchSub").textContent = String(e);
+    el("launchSub").style.color = "#ef4444";
+    await refreshLaunchAtLogin();
+  } finally {
+    ev.target.disabled = false;
+  }
+});
+
+/// Apply an auto-select result to the dropdown. SELECTS ONLY — it sets the
+/// <select> value and never touches the power toggle / enable_driver. Respects
+/// a choice the user already made this session.
+function applyAutoSelect(info) {
+  if (!info || !info.enabled) {
+    el("autoSelectSub").textContent =
+      "Pick the supported NIC automatically on launch";
+    el("autoSelectSub").style.color = "";
+    return;
+  }
+  if (info.selected_bsd != null) {
+    // Only move the dropdown if the user hasn't already chosen, and the NIC is
+    // actually on offer (empty bsd = our dext owns it; match that too).
+    const sel = el("nic");
+    const has = Array.from(sel.options).some((o) => o.value === info.selected_bsd);
+    if (!nicChosen && has) {
+      sel.value = info.selected_bsd;
+      nicChosen = true;
+    }
+    el("autoSelectSub").textContent = "Pick the supported NIC automatically on launch";
+    el("autoSelectSub").style.color = "";
+  } else {
+    // Nothing selected: surface why (none / ambiguous), never guess.
+    el("autoSelectSub").textContent = info.reason || "No NIC auto-selected";
+    el("autoSelectSub").style.color = "var(--warn)";
+  }
+}
+
+async function refreshAutoSelectSetting() {
+  try {
+    el("autoSelectNic").checked = !!(await invoke("get_auto_select_nic"));
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+el("autoSelectNic").addEventListener("change", async (ev) => {
+  const want = ev.target.checked;
+  ev.target.disabled = true;
+  try {
+    const info = await invoke("set_auto_select_nic", { enabled: want });
+    // Turning it on now should pick immediately if unambiguous; turning it off
+    // leaves the current selection untouched.
+    if (want) applyAutoSelect(info);
+    else {
+      el("autoSelectSub").textContent =
+        "Pick the supported NIC automatically on launch";
+      el("autoSelectSub").style.color = "";
+    }
+  } catch (e) {
+    el("autoSelectSub").textContent = String(e);
+    el("autoSelectSub").style.color = "#ef4444";
+    await refreshAutoSelectSetting();
+  } finally {
+    ev.target.disabled = false;
+  }
+});
+
 // Boot.
 (async () => {
   // No separate loadNics() here: refreshStatus owns the NIC list, so the
@@ -235,6 +347,16 @@ el("link").addEventListener("click", () => {
   // that can disagree.
   await refreshStatus();
   await refreshClock();
+  await refreshLaunchAtLogin();
+  await refreshAutoSelectSetting();
+  // Auto-select runs ONCE at startup, after the first NIC list is populated.
+  // It only selects (never enables the driver) and only when unambiguous; it
+  // defers to a choice the user already made this session.
+  try {
+    applyAutoSelect(await invoke("eval_auto_select_nic"));
+  } catch (e) {
+    console.error(e);
+  }
   // One 2 s poll drives both the status and the clock line — the clock's
   // in-force value changes when the daemon starts or a stream locks, which is
   // the same cadence. Stats poll faster, but only while that panel is open.

@@ -170,6 +170,30 @@
       </div>
 
       <div class="card">
+        <div class="label">Preferences</div>
+        <div class="toggle-row">
+          <div class="state-text">
+            <span class="state-main">Launch at login</span>
+            <span class="state-sub" id="launchSub">Start DreamAVB automatically when you log in</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="launchAtLogin" />
+            <span class="track"></span>
+          </label>
+        </div>
+        <div class="toggle-row" style="margin-top: 12px;">
+          <div class="state-text">
+            <span class="state-main">Auto-select interface</span>
+            <span class="state-sub" id="autoSelectSub">Pick the supported NIC automatically on launch</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="autoSelectNic" />
+            <span class="track"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="toggle-row">
           <div class="state-text">
             <span class="state-main"><span class="status-dot" id="dot"></span> <span id="stateMain">Hands off</span></span>

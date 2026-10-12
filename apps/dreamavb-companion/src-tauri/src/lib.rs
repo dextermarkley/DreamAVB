@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use avb_config::{ClockSource, Config, EffectiveClock};
+use avb_config::{auto_select_nic, AutoSelectOutcome, ClockSource, Config, EffectiveClock};
 use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -100,6 +100,15 @@ fn helper_path(name: &str) -> PathBuf {
                     .join(name),
             );
         }
+    }
+    // Installed from the .pkg, DreamAVB.app and AVBInstaller.app are SIBLINGS
+    // in /Applications: the helpers are then neither beside our binary nor
+    // nested under it, so both candidates above miss and we used to fall
+    // through to a bare binary name resolved against PATH — which does not
+    // contain them. Ask installer_app() where the bundle actually is instead
+    // of hardcoding a second copy of that search.
+    if let Some(app) = installer_app() {
+        cands.push(app.join("Contents/MacOS").join(name));
     }
     // Dev run: this crate is apps/dreamavb-companion/src-tauri, so the
     // workspace root is three levels up.
@@ -722,15 +731,305 @@ async fn get_clock_source() -> ClockSourceInfo {
 async fn set_clock_source(value: String) -> Result<ClockSourceInfo, String> {
     let source =
         ClockSource::parse(&value).ok_or_else(|| format!("unknown clock source {value:?}"))?;
-    let cfg = Config {
-        clock_source: source,
-    };
+    // Load-then-mutate so changing the clock does not clobber the other
+    // settings (launch_at_login / auto_select_nic) that share this file.
+    let (mut cfg, _warnings) = Config::load();
+    cfg.clock_source = source;
     cfg.save()
         .map_err(|e| format!("could not save settings: {e}"))?;
     // Reload so any warnings about the on-disk file (and the canonical parse)
     // are reflected, not just this in-memory value.
     let (loaded, warnings) = Config::load();
     Ok(clock_source_info(loaded, warnings))
+}
+
+// ---------------------------------------------------------------------------
+// Launch at login (hand-rolled macOS LaunchAgent)
+//
+// We do NOT use tauri-plugin-autostart: its transitive deps float and break
+// this app's fragile Tauri pin. A LaunchAgent plist is four lines of XML and
+// two launchctl calls, so we own it directly.
+//
+// The agent points at the INSTALLED bundle binary, not this running process:
+// a dev/debug build lives under target/ and must never be what login launches.
+// `com.avbaudio.companion` is the app's bundle identifier (tauri.conf.json),
+// reused as the LaunchAgent label; `DreamAVB` is the productName / executable.
+
+/// The LaunchAgent label, matching the app's bundle identifier.
+const LAUNCH_AGENT_LABEL: &str = "com.avbaudio.companion";
+
+/// The installed binary the LaunchAgent launches. Deliberately the
+/// /Applications bundle, never `current_exe()`: login must start the installed
+/// app, not whatever debug binary happened to register the agent.
+const INSTALLED_BINARY: &str = "/Applications/DreamAVB.app/Contents/MacOS/DreamAVB";
+
+/// Path to the per-user LaunchAgent plist.
+fn launch_agent_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    let mut p = PathBuf::from(home);
+    p.push("Library/LaunchAgents");
+    p.push(format!("{LAUNCH_AGENT_LABEL}.plist"));
+    Some(p)
+}
+
+/// The LaunchAgent plist body. RunAtLoad starts the app at login; the program
+/// is the installed bundle binary.
+fn launch_agent_plist() -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \t<key>Label</key>\n\
+         \t<string>{LAUNCH_AGENT_LABEL}</string>\n\
+         \t<key>ProgramArguments</key>\n\
+         \t<array>\n\
+         \t\t<string>{INSTALLED_BINARY}</string>\n\
+         \t</array>\n\
+         \t<key>RunAtLoad</key>\n\
+         \t<true/>\n\
+         \t<key>ProcessType</key>\n\
+         \t<string>Interactive</string>\n\
+         </dict>\n\
+         </plist>\n"
+    )
+}
+
+/// `gui/<uid>` domain target for launchctl.
+fn gui_domain() -> String {
+    // getuid() is always available; no unsafe surprises in the value.
+    let uid = unsafe { libc_getuid() };
+    format!("gui/{uid}")
+}
+
+// We take the uid without pulling in the `libc` crate (avb-config stays
+// dependency-free, and the app's dep set is pinned): one extern declaration.
+extern "C" {
+    #[link_name = "getuid"]
+    fn libc_getuid() -> u32;
+}
+
+/// Load the agent into the running GUI session. Tries the modern
+/// `bootstrap` subcommand first and falls back to the legacy `load -w`, which
+/// older macOS releases need. Best-effort: a failure to load does not undo the
+/// plist (the user's choice is still persisted and the agent is in place for
+/// the next login), but it IS surfaced.
+fn launchctl_bootstrap(plist: &Path) -> Result<(), String> {
+    let domain = gui_domain();
+    let modern = Command::new("/bin/launchctl")
+        .args(["bootstrap", &domain])
+        .arg(plist)
+        .output();
+    if let Ok(o) = &modern {
+        if o.status.success() {
+            return Ok(());
+        }
+    }
+    // Legacy fallback.
+    let legacy = Command::new("/bin/launchctl")
+        .args(["load", "-w"])
+        .arg(plist)
+        .output()
+        .map_err(|e| format!("launchctl load failed to run: {e}"))?;
+    if legacy.status.success() {
+        Ok(())
+    } else {
+        let msg = String::from_utf8_lossy(&legacy.stderr).trim().to_string();
+        Err(if msg.is_empty() {
+            "launchctl could not load the LaunchAgent".to_string()
+        } else {
+            msg
+        })
+    }
+}
+
+/// Unload the agent from the running GUI session (modern `bootout`, legacy
+/// `unload -w` fallback). Best-effort: errors are tolerated because the real
+/// disable is DELETING the plist (done by the caller) — an unload that fails
+/// because the agent was never loaded is not an error we should surface.
+fn launchctl_bootout(plist: &Path) {
+    let domain = gui_domain();
+    let target = format!("{domain}/{LAUNCH_AGENT_LABEL}");
+    let modern = Command::new("/bin/launchctl")
+        .args(["bootout", &target])
+        .output();
+    if matches!(&modern, Ok(o) if o.status.success()) {
+        return;
+    }
+    let _ = Command::new("/bin/launchctl")
+        .args(["unload", "-w"])
+        .arg(plist)
+        .output();
+}
+
+/// Snapshot the launch-at-login state the UI renders.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaunchAtLoginInfo {
+    /// The user's persisted preference.
+    pub enabled: bool,
+    /// Whether the LaunchAgent plist actually exists on disk. The UI can show
+    /// a discrepancy (preference on, plist missing) rather than claiming it is
+    /// active when it could not be installed.
+    pub plist_present: bool,
+    /// A non-fatal note (e.g. "could not reach launchctl") so the UI never
+    /// silently claims success. Empty when all is well.
+    pub note: String,
+}
+
+/// Current launch-at-login setting (from config) plus whether the plist is
+/// actually present.
+#[tauri::command]
+async fn get_launch_at_login() -> LaunchAtLoginInfo {
+    let (cfg, _warnings) = Config::load();
+    let plist_present = launch_agent_path().map(|p| p.exists()).unwrap_or(false);
+    LaunchAtLoginInfo {
+        enabled: cfg.launch_at_login,
+        plist_present,
+        note: String::new(),
+    }
+}
+
+/// Turn launch-at-login on or off.
+///
+/// ON: write the plist and `bootstrap`/`load` it.
+/// OFF: `bootout`/`unload` it AND DELETE the plist — disabling without deleting
+/// would leave a dormant agent that a future `load` could resurrect, which is
+/// not what "off" means.
+///
+/// The preference is persisted either way. If launchctl itself fails (e.g. a
+/// sandbox blocks it), the plist is still written/removed correctly and the
+/// returned `note` says what could not be verified — we never claim the agent
+/// is live when we could not confirm it.
+#[tauri::command]
+async fn set_launch_at_login(enabled: bool) -> Result<LaunchAtLoginInfo, String> {
+    let path = launch_agent_path()
+        .ok_or_else(|| "HOME is unset; cannot locate ~/Library/LaunchAgents".to_string())?;
+
+    // Persist the preference first so the daemon/app agree regardless of what
+    // launchctl does next.
+    let (mut cfg, _warnings) = Config::load();
+    cfg.launch_at_login = enabled;
+    cfg.save()
+        .map_err(|e| format!("could not save settings: {e}"))?;
+
+    let mut note = String::new();
+    if enabled {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        }
+        std::fs::write(&path, launch_agent_plist())
+            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+        if let Err(e) = launchctl_bootstrap(&path) {
+            // Plist is in place for next login; just could not load it now.
+            note = format!(
+                "LaunchAgent written to {} but launchctl could not load it this session ({e}); \
+                 it will take effect at next login",
+                path.display()
+            );
+        }
+    } else {
+        // Unload first (best-effort), then DELETE the plist so "off" means gone.
+        launchctl_bootout(&path);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("could not delete {}: {e}", path.display())),
+        }
+    }
+
+    let plist_present = path.exists();
+    Ok(LaunchAtLoginInfo {
+        enabled,
+        plist_present,
+        note,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Auto-select NIC
+
+/// Snapshot the auto-select setting + the result of applying it right now.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AutoSelectInfo {
+    /// The user's persisted preference.
+    pub enabled: bool,
+    /// When enabled and unambiguous, the BSD name to select (may be empty when
+    /// our dext owns the device and no enX interface remains). `None` when
+    /// disabled or when no selection was made.
+    pub selected_bsd: Option<String>,
+    /// Human reason, shown when nothing was selected (none / ambiguous), or
+    /// empty on a clean single-NIC selection. Never guesses.
+    pub reason: String,
+}
+
+/// Build the auto-select snapshot from the current config and NIC list.
+///
+/// PURE given the NIC list, so it is testable without `system_profiler`. It
+/// SELECTS ONLY: it returns a BSD name for the UI to set in the dropdown and
+/// NOTHING else — it never activates the driver (that is `enable_driver`, an
+/// explicit user action), per the product rule.
+fn auto_select_info(cfg: Config, nics: &[Nic]) -> AutoSelectInfo {
+    if !cfg.auto_select_nic {
+        return AutoSelectInfo {
+            enabled: false,
+            selected_bsd: None,
+            reason: String::new(),
+        };
+    }
+    let supported: Vec<String> = nics
+        .iter()
+        .filter(|n| n.supported)
+        .map(|n| n.bsd_name.clone())
+        .collect();
+    match auto_select_nic(&supported) {
+        AutoSelectOutcome::Selected { bsd_name } => AutoSelectInfo {
+            enabled: true,
+            selected_bsd: Some(bsd_name),
+            reason: String::new(),
+        },
+        AutoSelectOutcome::NoneSupported => AutoSelectInfo {
+            enabled: true,
+            selected_bsd: None,
+            reason: "no supported NIC to select (only the Intel I210 is supported)".to_string(),
+        },
+        AutoSelectOutcome::Ambiguous { count } => AutoSelectInfo {
+            enabled: true,
+            selected_bsd: None,
+            reason: format!("{count} supported NICs found — pick one; auto-select won't guess"),
+        },
+    }
+}
+
+/// Current auto-select setting (from config).
+#[tauri::command]
+async fn get_auto_select_nic() -> bool {
+    Config::load().0.auto_select_nic
+}
+
+/// Change the auto-select setting, persisting it. Returns the snapshot of
+/// applying it to the CURRENT NIC list, so the UI can set the dropdown (or show
+/// why it could not) in one response. SELECTS ONLY — never activates anything.
+#[tauri::command]
+async fn set_auto_select_nic(enabled: bool) -> Result<AutoSelectInfo, String> {
+    let (mut cfg, _warnings) = Config::load();
+    cfg.auto_select_nic = enabled;
+    cfg.save()
+        .map_err(|e| format!("could not save settings: {e}"))?;
+    let nics = list_nics();
+    Ok(auto_select_info(cfg, &nics))
+}
+
+/// Evaluate auto-select against the current NIC list without changing the
+/// setting — the UI calls this once at startup to decide the initial NIC.
+#[tauri::command]
+async fn eval_auto_select_nic() -> AutoSelectInfo {
+    let (cfg, _warnings) = Config::load();
+    let nics = list_nics();
+    auto_select_info(cfg, &nics)
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -917,7 +1216,12 @@ pub fn run() {
             stats,
             open_project_page,
             get_clock_source,
-            set_clock_source
+            set_clock_source,
+            get_launch_at_login,
+            set_launch_at_login,
+            get_auto_select_nic,
+            set_auto_select_nic,
+            eval_auto_select_nic
         ])
         .setup(|app| {
             diag("--- DreamAVB starting ---");
@@ -1206,6 +1510,7 @@ mac            64:4b:f0:12:73:b8   timebase 125/3
     fn the_selection_is_reported_separately_from_what_is_in_force() {
         let cfg = Config {
             clock_source: ClockSource::MacInternal,
+            ..Default::default()
         };
         let info = clock_source_info(cfg, vec!["a warning".to_string()]);
         assert_eq!(info.selected, "mac");
@@ -1230,6 +1535,7 @@ mac            64:4b:f0:12:73:b8   timebase 125/3
         let info = clock_source_info(
             Config {
                 clock_source: ClockSource::NetworkGptp,
+                ..Default::default()
             },
             Vec::new(),
         );
@@ -1330,5 +1636,123 @@ mac            64:4b:f0:12:73:b8   timebase 125/3
     fn popover_without_a_monitor_uses_the_icon_position() {
         let (x, y) = popover_position(900.0, 24.0, 24.0, 360.0, 520.0, None, 8.0);
         assert_eq!((x, y), (732, 28));
+    }
+
+    // --- launch at login ---------------------------------------------------
+
+    fn nic(bsd: &str, supported: bool) -> Nic {
+        Nic {
+            bsd_name: bsd.into(),
+            display: if supported {
+                "Intel I210".into()
+            } else {
+                "Other".into()
+            },
+            pci_id: "—".into(),
+            supported,
+        }
+    }
+
+    /// The LaunchAgent must point at the INSTALLED bundle binary and run at
+    /// login under our bundle-id label. These are the product requirements,
+    /// asserted against literals — not a handler fed its own constant. A plist
+    /// that pointed at the dev binary, or omitted RunAtLoad, would launch the
+    /// wrong thing or nothing at all.
+    #[test]
+    fn launch_agent_plist_targets_the_installed_binary_and_runs_at_load() {
+        let p = launch_agent_plist();
+        assert!(
+            p.contains("<string>/Applications/DreamAVB.app/Contents/MacOS/DreamAVB</string>"),
+            "must launch the installed bundle binary, not a dev build:\n{p}"
+        );
+        assert!(
+            p.contains("<key>Label</key>") && p.contains("<string>com.avbaudio.companion</string>"),
+            "label must be the app's real bundle id:\n{p}"
+        );
+        // RunAtLoad present and true.
+        let run_at_load = p
+            .split("<key>RunAtLoad</key>")
+            .nth(1)
+            .map(|rest| rest.trim_start().starts_with("<true/>"))
+            .unwrap_or(false);
+        assert!(run_at_load, "RunAtLoad must be <true/>:\n{p}");
+        // It must be valid plist XML the loader will accept.
+        assert!(p.starts_with("<?xml"));
+        assert!(p.trim_end().ends_with("</plist>"));
+    }
+
+    /// The agent path is the per-user LaunchAgents directory with the bundle-id
+    /// filename — where launchctl looks for it.
+    #[test]
+    fn launch_agent_path_is_in_user_launchagents() {
+        // Only meaningful when HOME is set in the test env.
+        if let Some(p) = launch_agent_path() {
+            let s = p.to_string_lossy();
+            assert!(
+                s.ends_with("Library/LaunchAgents/com.avbaudio.companion.plist"),
+                "{s}"
+            );
+        }
+    }
+
+    // --- auto-select NIC ---------------------------------------------------
+
+    /// Disabled: no selection, no reason, no matter how many NICs exist.
+    #[test]
+    fn auto_select_disabled_selects_nothing() {
+        let cfg = Config {
+            auto_select_nic: false,
+            ..Default::default()
+        };
+        let info = auto_select_info(cfg, &[nic("en7", true)]);
+        assert!(!info.enabled);
+        assert_eq!(info.selected_bsd, None);
+        assert!(info.reason.is_empty());
+    }
+
+    /// Enabled + exactly one supported NIC -> select it. Unsupported NICs in
+    /// the list are ignored, so a lone I210 beside a Broadcom still selects.
+    #[test]
+    fn auto_select_enabled_picks_the_single_supported_nic() {
+        let cfg = Config {
+            auto_select_nic: true,
+            ..Default::default()
+        };
+        let info = auto_select_info(cfg, &[nic("en8", false), nic("en7", true)]);
+        assert!(info.enabled);
+        assert_eq!(info.selected_bsd, Some("en7".to_string()));
+        assert!(info.reason.is_empty());
+    }
+
+    /// Enabled + zero supported -> nothing selected, a reason given. Never
+    /// activates anything (there is no code path here that could).
+    #[test]
+    fn auto_select_enabled_with_no_supported_nic_explains_itself() {
+        let cfg = Config {
+            auto_select_nic: true,
+            ..Default::default()
+        };
+        let info = auto_select_info(cfg, &[nic("en8", false)]);
+        assert!(info.enabled);
+        assert_eq!(info.selected_bsd, None);
+        assert!(info.reason.contains("no supported NIC"), "{}", info.reason);
+    }
+
+    /// Enabled + two supported -> ambiguous, nothing selected, count surfaced.
+    /// The product rule: never guess which of several the user wants.
+    #[test]
+    fn auto_select_enabled_with_two_supported_is_ambiguous_and_selects_nothing() {
+        let cfg = Config {
+            auto_select_nic: true,
+            ..Default::default()
+        };
+        let info = auto_select_info(cfg, &[nic("en7", true), nic("en9", true)]);
+        assert!(info.enabled);
+        assert_eq!(info.selected_bsd, None);
+        assert!(
+            info.reason.contains('2'),
+            "count should be surfaced: {}",
+            info.reason
+        );
     }
 }

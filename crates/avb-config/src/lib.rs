@@ -237,10 +237,69 @@ pub fn resolve(sel: ClockSource, stream_locked: bool, gptp_locked: bool) -> Effe
     }
 }
 
+/// Parse a boolean config token, case-insensitively.
+///
+/// Accepts the obvious spellings a hand-editor might reach for. `None` for
+/// anything unrecognised — the caller keeps the previous value and warns,
+/// rather than guessing a boolean (which halves the odds of being right).
+pub fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" | "enabled" => Some(true),
+        "false" | "no" | "off" | "0" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
 /// The user-settable configuration.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Config {
     pub clock_source: ClockSource,
+    /// Start the companion app automatically at login. Default OFF: an audio
+    /// utility that installs itself into the user's login items uninvited is a
+    /// bad citizen. The companion app owns the system side of this (a macOS
+    /// LaunchAgent); this crate only remembers the user's choice so both the
+    /// app and the daemon can read it.
+    pub launch_at_login: bool,
+    /// Auto-select the supported NIC on app start instead of making the user
+    /// pick. Default OFF: SELECTS ONLY — it never enables/activates the driver
+    /// (that stays an explicit user action), and it only acts when the choice
+    /// is unambiguous (see [`auto_select_nic`]).
+    pub auto_select_nic: bool,
+}
+
+/// Why auto-select did not pick a NIC. Carries enough for the UI to explain
+/// itself without guessing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AutoSelectOutcome {
+    /// Exactly one supported NIC — selected, by this BSD name (which may be
+    /// empty when our own dext owns the device and its enX interface is gone).
+    Selected { bsd_name: String },
+    /// No supported NIC to select.
+    NoneSupported,
+    /// More than one supported NIC: refuse to guess which the user wants.
+    Ambiguous { count: usize },
+}
+
+/// Decide whether auto-select picks a NIC, as a PURE function over the
+/// supported-NIC identifiers.
+///
+/// `supported` is the BSD name of every NIC the driver supports, in list
+/// order. The rule, deliberately conservative because the wrong NIC is worse
+/// than no NIC:
+///   * exactly one  -> select it;
+///   * zero         -> select nothing, say none is supported;
+///   * two or more  -> select nothing, say it is ambiguous.
+///
+/// It SELECTS ONLY. Enabling/activating the driver is never part of this — the
+/// caller takes the returned BSD name and sets the dropdown, nothing more.
+pub fn auto_select_nic(supported: &[String]) -> AutoSelectOutcome {
+    match supported {
+        [one] => AutoSelectOutcome::Selected {
+            bsd_name: one.clone(),
+        },
+        [] => AutoSelectOutcome::NoneSupported,
+        many => AutoSelectOutcome::Ambiguous { count: many.len() },
+    }
 }
 
 /// The config file's path: `~/Library/Application Support/DreamAVB/config.txt`.
@@ -307,6 +366,24 @@ impl Config {
                         cfg.clock_source
                     )),
                 },
+                "launch_at_login" => match parse_bool(value) {
+                    Some(b) => cfg.launch_at_login = b,
+                    None => warnings.push(format!(
+                        "line {}: unknown launch_at_login {:?}; using {}",
+                        i + 1,
+                        value.trim(),
+                        cfg.launch_at_login
+                    )),
+                },
+                "auto_select_nic" => match parse_bool(value) {
+                    Some(b) => cfg.auto_select_nic = b,
+                    None => warnings.push(format!(
+                        "line {}: unknown auto_select_nic {:?}; using {}",
+                        i + 1,
+                        value.trim(),
+                        cfg.auto_select_nic
+                    )),
+                },
                 other => warnings.push(format!("line {}: unknown key {other:?}", i + 1)),
             }
         }
@@ -317,8 +394,10 @@ impl Config {
     pub fn to_text(&self) -> String {
         format!(
             "# DreamAVB settings. Written by the companion app; read by avb-daemon.\n\
-             clock_source={}\n",
-            self.clock_source
+             clock_source={}\n\
+             launch_at_login={}\n\
+             auto_select_nic={}\n",
+            self.clock_source, self.launch_at_login, self.auto_select_nic
         )
     }
 
@@ -366,11 +445,120 @@ mod tests {
     #[test]
     fn config_round_trips_through_text() {
         for s in ClockSource::ALL {
-            let c = Config { clock_source: s };
+            let c = Config {
+                clock_source: s,
+                ..Default::default()
+            };
             let (back, warnings) = Config::parse(&c.to_text());
             assert_eq!(back, c, "{s}");
             assert!(warnings.is_empty(), "{s}: {warnings:?}");
         }
+    }
+
+    /// Both boolean settings survive the round trip through the file, in every
+    /// combination, so a serialize/parse mismatch on either cannot slip by.
+    #[test]
+    fn bool_settings_round_trip_through_text() {
+        for launch in [true, false] {
+            for auto in [true, false] {
+                let c = Config {
+                    clock_source: ClockSource::NetworkGptp,
+                    launch_at_login: launch,
+                    auto_select_nic: auto,
+                };
+                let (back, warnings) = Config::parse(&c.to_text());
+                assert_eq!(back, c, "launch={launch} auto={auto}");
+                assert!(
+                    warnings.is_empty(),
+                    "launch={launch} auto={auto}: {warnings:?}"
+                );
+            }
+        }
+    }
+
+    /// The spellings a hand-editor might use all parse, and a bogus value is
+    /// rejected (not guessed) so the previous value stands and a warning is
+    /// raised.
+    #[test]
+    fn parse_bool_accepts_common_spellings_and_rejects_junk() {
+        for t in ["true", "yes", "on", "1", "ENABLED", "  On  "] {
+            assert_eq!(parse_bool(t), Some(true), "{t:?}");
+        }
+        for f in ["false", "no", "off", "0", "Disabled"] {
+            assert_eq!(parse_bool(f), Some(false), "{f:?}");
+        }
+        assert_eq!(parse_bool("maybe"), None);
+        assert_eq!(parse_bool(""), None);
+    }
+
+    /// A malformed boolean must warn and keep the default, never flip the
+    /// setting to a guessed value. Also exercises the two new keys appearing
+    /// alongside clock_source and an unknown key.
+    #[test]
+    fn malformed_bool_warns_but_keeps_default() {
+        let (cfg, warnings) = Config::parse(
+            "clock_source=mac\n\
+             launch_at_login=yes\n\
+             auto_select_nic=sometimes\n\
+             bogus_key=1\n",
+        );
+        assert_eq!(cfg.clock_source, ClockSource::MacInternal);
+        // The good bool applied.
+        assert!(cfg.launch_at_login);
+        // The malformed bool did NOT flip the default.
+        assert!(!cfg.auto_select_nic);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("unknown auto_select_nic")));
+        assert!(warnings.iter().any(|w| w.contains("unknown key")));
+    }
+
+    /// Both new settings default OFF, as required.
+    #[test]
+    fn bool_settings_default_off() {
+        let c = Config::default();
+        assert!(!c.launch_at_login);
+        assert!(!c.auto_select_nic);
+        // And an absent file yields those defaults with no complaint.
+        let (parsed, warnings) = Config::parse("");
+        assert!(!parsed.launch_at_login);
+        assert!(!parsed.auto_select_nic);
+        assert!(warnings.is_empty());
+    }
+
+    /// The auto-select DECISION as a pure function: exactly one supported NIC
+    /// selects it, zero selects nothing (none supported), two or more selects
+    /// nothing (ambiguous). Never guesses.
+    #[test]
+    fn auto_select_picks_only_when_unambiguous() {
+        // Exactly one -> select it, by its BSD name.
+        assert_eq!(
+            auto_select_nic(&["en7".to_string()]),
+            AutoSelectOutcome::Selected {
+                bsd_name: "en7".to_string()
+            }
+        );
+        // One supported NIC whose enX is gone (our dext owns it): still a
+        // selection, with an empty BSD name — the UI matches it by that.
+        assert_eq!(
+            auto_select_nic(&[String::new()]),
+            AutoSelectOutcome::Selected {
+                bsd_name: String::new()
+            }
+        );
+        // Zero -> none supported.
+        assert_eq!(auto_select_nic(&[]), AutoSelectOutcome::NoneSupported);
+        // Two -> ambiguous, with the count, and NOTHING selected.
+        assert_eq!(
+            auto_select_nic(&["en7".to_string(), "en8".to_string()]),
+            AutoSelectOutcome::Ambiguous { count: 2 }
+        );
+        // Three -> still ambiguous.
+        assert_eq!(
+            auto_select_nic(&["a".to_string(), "b".to_string(), "c".to_string()]),
+            AutoSelectOutcome::Ambiguous { count: 3 }
+        );
     }
 
     #[test]
