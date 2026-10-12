@@ -55,9 +55,18 @@ fn check(field: &'static str, expected: u64, found: u64) -> Result<(), LayoutMis
 /// Every constant header field against the compiled ABI, and `generation`
 /// against RingAttach's `scalarOut[0]` (design §5.2 step 5).
 pub fn validate_header(hdr: &ShmHeader, generation: u64) -> Result<(), LayoutMismatch> {
-    let fields: [(&'static str, u32, u32); 9] = [
+    // The ring LAYOUT is identical across the ABI range we drive, so the
+    // version is range-checked while every layout field below stays exact.
+    // A v3 dext writes 3 here and its rings are byte-identical to a v4's.
+    if !abi::abi_supported(hdr.abi_version) {
+        return Err(LayoutMismatch {
+            field: "abi_version",
+            expected: u64::from(abi::ABI_VERSION),
+            found: u64::from(hdr.abi_version),
+        });
+    }
+    let fields: [(&'static str, u32, u32); 8] = [
         ("magic", abi::SHM_MAGIC, hdr.magic),
-        ("abi_version", abi::ABI_VERSION, hdr.abi_version),
         ("header_size", abi::SHM_HEADER_SIZE, hdr.header_size),
         ("slot_size", abi::RX_SLOT_SIZE, hdr.slot_size),
         ("ctl_slots", abi::RX_CTL_SLOTS, hdr.ctl_slots),
@@ -764,8 +773,29 @@ mod tests {
             let e = RxRings::from_raw(rxp, abi::RX_MEM_SIZE as usize, cp.add(4), 16380);
             assert_eq!(e.err().unwrap().field, "consumer_mem_size");
             let r = RxRings::from_raw(rxp, abi::RX_MEM_SIZE as usize, cp, 16384).unwrap();
-            // Zeroed memory fails validation on the first field.
-            assert_eq!(r.validate(0).unwrap_err().field, "magic");
+            // Zeroed memory fails on the ABI version, which is checked BEFORE
+            // any layout field: a header whose ABI we do not drive tells us
+            // nothing by its magic or its offsets, and reporting a layout
+            // mismatch for it would send the reader after the wrong bug.
+            assert_eq!(r.validate(0).unwrap_err().field, "abi_version");
+        }
+    }
+
+    /// The layout fields are still checked, and `magic` is still the first of
+    /// them — a header that clears the version gate but is not ours must be
+    /// rejected as foreign memory rather than parsed.
+    #[test]
+    fn a_supported_version_with_a_foreign_header_fails_on_magic() {
+        let mut m = HeapRxMem::new(1);
+        for v in abi::ABI_VERSION_MIN..=abi::ABI_VERSION {
+            let h = m.header_mut();
+            *h = unsafe { core::mem::zeroed() };
+            h.abi_version = v;
+            assert_eq!(
+                validate_header(m.header_mut(), 0).unwrap_err().field,
+                "magic",
+                "ABI v{v} is driven, so its layout must be checked"
+            );
         }
     }
 

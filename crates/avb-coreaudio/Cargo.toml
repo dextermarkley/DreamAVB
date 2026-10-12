@@ -15,4 +15,5 @@ crate-type = ["cdylib"]
 [dependencies]
 # The recovered-audio ring ABI (mapped read-only from the daemon's shm).
 avb-audioring = { path = "../avb-audioring" }
+avb-config = { path = "../avb-config" }
 libc = "=0.2.190"

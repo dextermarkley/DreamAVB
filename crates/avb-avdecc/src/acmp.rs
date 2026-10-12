@@ -123,6 +123,81 @@ pub fn dest_mac() -> MacAddr {
     avb_core::AVDECC_MULTICAST
 }
 
+/// What our talker direction knows about the one stream it offers, so it can
+/// answer a listener's ACMP commands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TalkerStream {
+    /// Our own entity id.
+    pub our_id: Eui64,
+    /// Our STREAM_OUTPUT's `unique_id` — the listener names this when it
+    /// connects, so a command for any other id is TALKER_NO_STREAM_INDEX.
+    pub our_unique_id: u16,
+    pub stream_id: StreamId,
+    pub stream_dest_mac: MacAddr,
+    pub stream_vlan_id: u16,
+    /// How many listeners are currently bound (reported, not enforced).
+    pub connection_count: u16,
+}
+
+/// Answer an ACMP command addressed to us AS THE TALKER, or `None` when the
+/// PDU is not ours to answer (a response, a different entity, a listener-side
+/// command).
+///
+/// Without this a Milan listener cannot bind our stream at all. The sequence is
+/// controller -> `CONNECT_RX_COMMAND` -> listener, then **listener ->
+/// `CONNECT_TX_COMMAND` -> talker**, and only after the talker's
+/// `CONNECT_TX_RESPONSE` does the listener declare MSRP Listener Ready. We are
+/// both controller and talker here, so sending `CONNECT_RX_COMMAND` and never
+/// answering `CONNECT_TX_COMMAND` left the 16R waiting on us: it never
+/// declared Listener Ready and every PDU we sent was discarded, which on the
+/// wire is indistinguishable from a transmit fault.
+///
+/// A command naming an unknown talker id or stream index is REFUSED with the
+/// specific status rather than answered with our own stream, so a listener
+/// that asks for something we do not have is told so instead of being handed
+/// a stream it did not request.
+pub fn talker_response(cmd: &Acmpdu, s: TalkerStream) -> Option<Acmpdu> {
+    use crate::constants::acmp_msg as m;
+
+    // Only the three talker-side commands. Responses are someone else's
+    // answer and listener-side commands are not ours.
+    let reply_type = match cmd.message_type {
+        m::CONNECT_TX_COMMAND => m::CONNECT_TX_RESPONSE,
+        m::DISCONNECT_TX_COMMAND => m::DISCONNECT_TX_RESPONSE,
+        m::GET_TX_STATE_COMMAND => m::GET_TX_STATE_RESPONSE,
+        _ => return None,
+    };
+
+    // ACMP routes talker-side commands by talker_entity_id.
+    if cmd.talker_entity_id != s.our_id {
+        return None;
+    }
+
+    // Echo the command's own routing fields back — a listener matches a
+    // response to its command by (sequence_id, ids), so inventing any of them
+    // makes the response unmatchable.
+    let mut r = Acmpdu {
+        message_type: reply_type,
+        status: acmp_status::SUCCESS,
+        ..*cmd
+    };
+
+    if cmd.talker_unique_id != s.our_unique_id {
+        r.status = acmp_status::TALKER_NO_STREAM_INDEX;
+        return Some(r);
+    }
+
+    // The addressing the listener needs in order to receive us: our stream id,
+    // the destination MAC we actually transmit to, and the VLAN. These must be
+    // the same values our MSRP Talker Advertise declares, or the listener
+    // reserves one stream and listens for another.
+    r.stream_id = s.stream_id;
+    r.stream_dest_mac = s.stream_dest_mac;
+    r.stream_vlan_id = s.stream_vlan_id;
+    r.connection_count = s.connection_count;
+    Some(r)
+}
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {
@@ -184,5 +259,123 @@ mod tests {
         assert!(!is_a5_resource_status(acmp_status::LISTENER_EXCLUSIVE));
         assert!(!is_a5_resource_status(acmp_status::SUCCESS));
         assert!(!is_a5_resource_status(acmp_status::NOT_CONNECTED));
+    }
+
+    // --- Talker-side responder --------------------------------------------
+
+    const OUR_ID: u64 = 0x644b_f0ff_fe12_73b8;
+
+    fn our_stream() -> TalkerStream {
+        TalkerStream {
+            our_id: Eui64::from_u64(OUR_ID),
+            our_unique_id: 0,
+            stream_id: StreamId(0x644b_f012_73b8_0000),
+            stream_dest_mac: MacAddr([0x91, 0xE0, 0xF0, 0x01, 0x00, 0x01]),
+            stream_vlan_id: 2,
+            connection_count: 1,
+        }
+    }
+
+    /// The 16R's CONNECT_TX_COMMAND, as it arrives after our
+    /// CONNECT_RX_COMMAND: it names US as the talker and itself as listener.
+    fn connect_tx_from_16r() -> Acmpdu {
+        Acmpdu {
+            message_type: acmp_msg::CONNECT_TX_COMMAND,
+            status: acmp_status::SUCCESS,
+            stream_id: StreamId(0),
+            controller_entity_id: Eui64::from_u64(OUR_ID),
+            talker_entity_id: Eui64::from_u64(OUR_ID),
+            listener_entity_id: Eui64::from_u64(0x000a_92ff_fe03_3ba9),
+            talker_unique_id: 0,
+            listener_unique_id: 1,
+            stream_dest_mac: MacAddr([0; 6]),
+            connection_count: 0,
+            sequence_id: 0x4321,
+            flags: 0,
+            stream_vlan_id: 0,
+        }
+    }
+
+    /// The command this answers is the one the 16R was waiting on: without a
+    /// CONNECT_TX_RESPONSE it never declares MSRP Listener Ready.
+    #[test]
+    fn connect_tx_is_answered_with_our_stream_addressing() {
+        let r = talker_response(&connect_tx_from_16r(), our_stream()).expect("a response");
+        assert_eq!(r.message_type, acmp_msg::CONNECT_TX_RESPONSE);
+        assert_eq!(r.status, acmp_status::SUCCESS);
+        // The addressing the listener needs, which the command did not carry.
+        assert_eq!(r.stream_id, StreamId(0x644b_f012_73b8_0000));
+        assert_eq!(
+            r.stream_dest_mac,
+            MacAddr([0x91, 0xE0, 0xF0, 0x01, 0x00, 0x01])
+        );
+        assert_eq!(r.stream_vlan_id, 2);
+        // Routing fields echoed, or the listener cannot match the response.
+        assert_eq!(r.sequence_id, 0x4321);
+        assert_eq!(r.listener_unique_id, 1);
+        assert_eq!(r.listener_entity_id, Eui64::from_u64(0x000a_92ff_fe03_3ba9));
+        assert_eq!(r.talker_entity_id, Eui64::from_u64(OUR_ID));
+    }
+
+    #[test]
+    fn disconnect_and_get_state_are_answered_too() {
+        for (cmd_t, resp_t) in [
+            (
+                acmp_msg::DISCONNECT_TX_COMMAND,
+                acmp_msg::DISCONNECT_TX_RESPONSE,
+            ),
+            (
+                acmp_msg::GET_TX_STATE_COMMAND,
+                acmp_msg::GET_TX_STATE_RESPONSE,
+            ),
+        ] {
+            let mut c = connect_tx_from_16r();
+            c.message_type = cmd_t;
+            let r = talker_response(&c, our_stream()).expect("a response");
+            assert_eq!(r.message_type, resp_t);
+            assert_eq!(r.status, acmp_status::SUCCESS);
+            assert_eq!(r.stream_id, StreamId(0x644b_f012_73b8_0000));
+        }
+    }
+
+    /// A stream index we do not have is refused with the specific status, not
+    /// answered with our own stream.
+    #[test]
+    fn an_unknown_stream_index_is_refused_not_substituted() {
+        let mut c = connect_tx_from_16r();
+        c.talker_unique_id = 7;
+        let r = talker_response(&c, our_stream()).expect("a response");
+        assert_eq!(r.status, acmp_status::TALKER_NO_STREAM_INDEX);
+        assert_ne!(r.stream_id, StreamId(0x644b_f012_73b8_0000));
+        assert_eq!(r.talker_unique_id, 7);
+    }
+
+    /// Not ours to answer: a command for another talker, our own responses
+    /// coming back, and listener-side commands.
+    #[test]
+    fn pdus_that_are_not_ours_are_ignored() {
+        let mut other = connect_tx_from_16r();
+        other.talker_entity_id = Eui64::from_u64(0x000a_92ff_fe03_3ba9);
+        assert_eq!(talker_response(&other, our_stream()), None);
+
+        for t in [
+            acmp_msg::CONNECT_TX_RESPONSE,
+            acmp_msg::CONNECT_RX_COMMAND,
+            acmp_msg::CONNECT_RX_RESPONSE,
+            acmp_msg::GET_RX_STATE_COMMAND,
+            acmp_msg::DISCONNECT_RX_COMMAND,
+        ] {
+            let mut c = connect_tx_from_16r();
+            c.message_type = t;
+            assert_eq!(talker_response(&c, our_stream()), None, "type {t:#04x}");
+        }
+    }
+
+    /// The response must survive a wire round trip, since that is how the
+    /// listener actually reads it.
+    #[test]
+    fn the_response_round_trips_on_the_wire() {
+        let r = talker_response(&connect_tx_from_16r(), our_stream()).expect("a response");
+        assert_eq!(Acmpdu::decode(&r.encode()), Some(r));
     }
 }

@@ -314,8 +314,15 @@ pub const kAudioObjectPropertyElementMain: UInt32 = 0;
 // Values.
 pub const kAudioDeviceTransportTypeVirtual: UInt32 = u32::from_be_bytes(*b"virt");
 pub const kAudioStreamTerminalTypeMicrophone: UInt32 = u32::from_be_bytes(*b"micr");
-/// Output speaker terminal type (CoreAudioTypes.h: OUTPUT_SPEAKER = 0x0301).
-pub const kAudioStreamTerminalTypeSpeaker: UInt32 = 0x0301;
+/// Output speaker terminal type. FourCC 'spkr', per the
+/// `kAudioStreamTerminalType*` enum in <CoreAudioTypes/CoreAudioBaseTypes.h>,
+/// alongside 'micr' above.
+///
+/// This was 0x0301, which is the USB Audio Class output terminal type for a
+/// speaker — a different namespace entirely, and not a value CoreAudio ever
+/// matches. Found by auditing all 66 constants against the SDK headers after
+/// the WriteMix FourCC turned out to be guessed.
+pub const kAudioStreamTerminalTypeSpeaker: UInt32 = u32::from_be_bytes(*b"spkr");
 
 pub const kAudioHardwareNoError: OSStatus = 0;
 pub const kAudioHardwareBadObjectError: OSStatus = u32::from_be_bytes(*b"!obj") as OSStatus;
@@ -323,11 +330,27 @@ pub const kAudioHardwareUnknownPropertyError: OSStatus = u32::from_be_bytes(*b"w
 pub const kAudioHardwareIllegalOperationError: OSStatus = u32::from_be_bytes(*b"nope") as OSStatus;
 pub const kAudioHardwareBadPropertySizeError: OSStatus = u32::from_be_bytes(*b"!siz") as OSStatus;
 
-/// IO operation ids we care about (read-input).
+// IO operation ids, transcribed from the `AudioServerPlugInIOOperation` enum in
+// <CoreAudio/AudioServerPlugIn.h>. The FourCCs are Apple's and several are NOT
+// what the operation's name suggests — WriteMix in particular is 'rite', not
+// 'wmix'. A guessed code matches nothing: the HAL offers each operation by this
+// value in WillDoIOOperation, so a wrong constant silently declines the
+// operation and it is never dispatched (that is exactly how playback shipped
+// transmitting pure silence). Verify against the SDK header, never by analogy.
+pub const kAudioServerPlugInIOOperationThread: UInt32 = u32::from_be_bytes(*b"thrd");
+pub const kAudioServerPlugInIOOperationCycle: UInt32 = u32::from_be_bytes(*b"cycl");
 pub const kAudioServerPlugInIOOperationReadInput: UInt32 = u32::from_be_bytes(*b"read");
+pub const kAudioServerPlugInIOOperationConvertInput: UInt32 = u32::from_be_bytes(*b"cinp");
+pub const kAudioServerPlugInIOOperationProcessInput: UInt32 = u32::from_be_bytes(*b"pinp");
+pub const kAudioServerPlugInIOOperationProcessOutput: UInt32 = u32::from_be_bytes(*b"pout");
+pub const kAudioServerPlugInIOOperationMixOutput: UInt32 = u32::from_be_bytes(*b"mixo");
+pub const kAudioServerPlugInIOOperationProcessMix: UInt32 = u32::from_be_bytes(*b"pmix");
+pub const kAudioServerPlugInIOOperationConvertMix: UInt32 = u32::from_be_bytes(*b"cmix");
 /// WriteMix: the HAL hands the plug-in mixed output samples to transmit
-/// (Phase 1b-2 playback). FourCC 'wmix'.
-pub const kAudioServerPlugInIOOperationWriteMix: UInt32 = u32::from_be_bytes(*b"wmix");
+/// (Phase 1b-2 playback). FourCC 'rite' — Apple's abbreviation of "write",
+/// confirmed against the SDK header against a live HAL that offered exactly
+/// this value.
+pub const kAudioServerPlugInIOOperationWriteMix: UInt32 = u32::from_be_bytes(*b"rite");
 
 /// `AudioValueRange` (<CoreAudio/CoreAudioTypes.h>).
 #[repr(C)]

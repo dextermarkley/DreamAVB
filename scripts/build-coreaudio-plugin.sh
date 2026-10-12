@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # Assemble the AVB-Audio AudioServerPlugIn into an AVBAudio.driver bundle.
 #
-# Produces build/AVBAudio.driver. Install it by copying to
-# /Library/Audio/Plug-Ins/HAL/ and restarting coreaudiod:
+# Produces build/AVBAudio.driver. Install it by replacing the bundle in
+# /Library/Audio/Plug-Ins/HAL/ and reloading coreaudiod:
 #
+#   sudo rm -rf /Library/Audio/Plug-Ins/HAL/AVBAudio.driver
 #   sudo cp -R build/AVBAudio.driver /Library/Audio/Plug-Ins/HAL/
-#   sudo killall coreaudiod        # it respawns and loads the plug-in
+#   sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
 #
-# Then the device "AVB StudioLive 16R (Input)" appears in Audio MIDI Setup and
-# in Reaper's input-device list. (STATUS: scaffold — the device publishes but
-# the IO path is silence until the recovered-audio ring is wired, Phase 1b-1.)
+# Reload with launchctl kickstart, NOT `killall -9 coreaudiod`: the hard kill
+# strands every connected audio client (a DAW, system sound) silent and wedged
+# until each app is itself restarted, even though coreaudiod respawns fine.
+# Remove the old bundle before copying rather than copying over the top, so a
+# file dropped from a later build cannot survive inside it.
+#
+# Then the device "AVB StudioLive 16R" appears in Audio MIDI Setup, with an
+# input side fed by the daemon's recovered-audio ring and an output side that
+# writes into the talker's ring.
 #
 # Scratch/build rules per AGENTS.md: absolute paths, no cd, TMPDIR under
 # .agents/tmp.
@@ -56,5 +63,6 @@ fi
 echo "done: $BUNDLE"
 echo
 echo "install with:"
+echo "  sudo rm -rf /Library/Audio/Plug-Ins/HAL/AVBAudio.driver"
 echo "  sudo cp -R $BUNDLE /Library/Audio/Plug-Ins/HAL/"
-echo "  sudo killall coreaudiod"
+echo "  sudo launchctl kickstart -k system/com.apple.audio.coreaudiod"

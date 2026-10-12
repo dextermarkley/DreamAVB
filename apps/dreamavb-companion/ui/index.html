@@ -91,6 +91,12 @@
     .nic-badge.ok { background: var(--on-glow); color: var(--on); }
     .nic-badge.no { background: rgba(107,114,128,0.25); color: var(--off); }
 
+    .clock-eff { display: flex; align-items: center; gap: 7px; margin-top: 9px; font-size: 11.5px; color: var(--text-dim); }
+    .clock-eff .status-dot { background: var(--on); box-shadow: 0 0 8px var(--on-glow); }
+    /* Drift state: not disciplined to the network — warn, reusing warn colour. */
+    .clock-eff.warn { color: var(--warn); }
+    .clock-eff.warn .status-dot { background: var(--warn); box-shadow: none; animation: none; }
+
     .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .state-text { display: flex; flex-direction: column; }
     .state-main { font-weight: 600; font-size: 14px; }
@@ -155,6 +161,39 @@
       </div>
 
       <div class="card">
+        <div class="label">Clock source</div>
+        <select id="clockSource"></select>
+        <div class="clock-eff" id="clockEff">
+          <span class="status-dot" id="clockDot"></span>
+          <span id="clockEffText">—</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="label">Preferences</div>
+        <div class="toggle-row">
+          <div class="state-text">
+            <span class="state-main">Launch at login</span>
+            <span class="state-sub" id="launchSub">Start DreamAVB automatically when you log in</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="launchAtLogin" />
+            <span class="track"></span>
+          </label>
+        </div>
+        <div class="toggle-row" style="margin-top: 12px;">
+          <div class="state-text">
+            <span class="state-main">Auto-select interface</span>
+            <span class="state-sub" id="autoSelectSub">Pick the supported NIC automatically on launch</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="autoSelectNic" />
+            <span class="track"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="toggle-row">
           <div class="state-text">
             <span class="state-main"><span class="status-dot" id="dot"></span> <span id="stateMain">Hands off</span></span>
@@ -162,6 +201,19 @@
           </div>
           <label class="switch">
             <input type="checkbox" id="power" />
+            <span class="track"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="toggle-row">
+          <div class="state-text">
+            <span class="state-main"><span class="status-dot" id="audioDot"></span> <span id="audioMain">Audio stopped</span></span>
+            <span class="state-sub" id="audioSub">Start bidirectional audio with the 16R</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="audio" />
             <span class="track"></span>
           </label>
         </div>

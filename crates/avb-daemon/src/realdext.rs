@@ -13,7 +13,7 @@ use avb_dext::iokit::{io_return_of, is_device_removed, Device, MemMap};
 use avb_dext::shm::{Ring, RxRings};
 use avb_gptp::msg::ETHERTYPE_PTP;
 
-use crate::dextio::{DextPort, Health, RxSlot, SendResult, TxTsResult};
+use crate::dextio::{BatchResult, DextPort, Health, RxSlot, SendResult, TxTsResult};
 
 // kIOReturn codes we classify (design §5.2 / §13.1).
 const K_IO_RETURN_BUSY: u32 = 0xe00002e8;
@@ -38,10 +38,25 @@ pub struct RealDext {
     consumer_map: Option<MemMap>,
     /// Shm mapping generation, pinned at attach for slot validation.
     shm_generation: u64,
+    /// Whether the ATTACHED dext implements `SEND_FRAMES` (ABI >= v4).
+    ///
+    /// Read from the dext, never assumed from our own compiled version: a
+    /// PCI-matched dext does not terminate while it owns its device, so after
+    /// `avb-installer activate` the kernel keeps running the OLD build until
+    /// the next boot. Calling a selector it does not implement would fail
+    /// every send in that window.
+    send_frames: bool,
 }
 
 impl RealDext {
     pub fn new(dev: Device, timebase_numer: u32, timebase_denom: u32) -> Self {
+        // Ask the dext what it implements. A failed GetInfo here is not fatal:
+        // the stack reads info separately and exits on a real fault, so the
+        // safe reading is "no batched selector" and the per-frame path.
+        let send_frames = dev
+            .info()
+            .map(|i| avb_dext::abi::abi_has_send_frames(i.abi_version))
+            .unwrap_or(false);
         Self {
             dev,
             pending_ts: None,
@@ -52,6 +67,7 @@ impl RealDext {
             rx_map: None,
             consumer_map: None,
             shm_generation: 0,
+            send_frames,
         }
     }
 
@@ -132,6 +148,56 @@ impl DextPort for RealDext {
                 _ => SendResult::Fatal,
             },
         }
+    }
+
+    fn send_batch(&mut self, frames: &[&[u8]]) -> BatchResult {
+        if !self.send_frames || frames.len() < 2 {
+            // One frame gains nothing from a batch, and a v3 dext has no such
+            // selector: the per-frame path is correct.
+            let mut accepted = 0;
+            for f in frames {
+                match self.send(f, false, 0) {
+                    SendResult::Ok => accepted += 1,
+                    other => {
+                        return BatchResult {
+                            accepted,
+                            stopped_by: Some(other),
+                        }
+                    }
+                }
+            }
+            return BatchResult {
+                accepted,
+                stopped_by: None,
+            };
+        }
+        if let Ok(path) = std::env::var("AVB_TXCAP") {
+            for f in frames {
+                append_pcap(&path, f);
+            }
+        }
+        match self.dev.send_frames(frames) {
+            Ok((accepted, _)) => BatchResult {
+                accepted: accepted as usize,
+                stopped_by: None,
+            },
+            // A whole-batch refusal: classify it the way the per-frame path
+            // does, so a malformed batch or a device fault is reported as
+            // itself rather than as back-pressure.
+            Err(e) => BatchResult {
+                accepted: 0,
+                stopped_by: Some(match io_return_of(&e) {
+                    Some(K_IO_RETURN_BUSY) => SendResult::Busy,
+                    Some(K_IO_RETURN_NO_RESOURCES) => SendResult::NoResources,
+                    Some(K_IO_RETURN_BAD_ARGUMENT) => SendResult::BadArgument,
+                    _ => SendResult::Fatal,
+                }),
+            },
+        }
+    }
+
+    fn batched_send(&self) -> bool {
+        self.send_frames
     }
 
     fn poll_tx_ts(&mut self) -> TxTsResult {

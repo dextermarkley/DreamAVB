@@ -18,8 +18,11 @@
 #![allow(dead_code)]
 
 mod audio;
+mod clocksrc;
 mod dextio;
 mod exit;
+mod gptpsvc;
+mod listenerrx;
 mod log;
 mod pcap;
 #[cfg(test)]
@@ -30,6 +33,11 @@ mod stack;
 mod txsched;
 mod validate;
 mod wav;
+
+/// The `firmware_version` we report in our own ENTITY descriptor. A controller
+/// shows this to the user and keys cache invalidation on it alongside
+/// `entity_model_id`, so it must change when the build does.
+pub const FIRMWARE_VERSION: &str = concat!("phase1b-", env!("CARGO_PKG_VERSION"));
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -131,10 +139,53 @@ enum Command {
         #[arg(long)]
         listener: Option<String>,
         /// Which of the 16R's STREAM_INPUT sinks (listener_unique_id) to bind.
-        #[arg(long, default_value_t = 0)]
-        listener_uid: u16,
+        /// Omit to choose the first AAF audio sink from the 16R's own AEM —
+        /// its index 0 is `Return CRF`, the media-clock stream, which accepts
+        /// a reservation and carries no audio.
+        #[arg(long)]
+        listener_uid: Option<u16>,
         #[arg(long)]
         allow_partial: bool,
+        #[arg(long, default_value_t = 30)]
+        start_timeout: u64,
+        #[arg(long)]
+        summary_out: Option<PathBuf>,
+    },
+    /// Full stack, BOTH directions in one process: play audio OUT to the 16R
+    /// from the output ring AND receive audio IN from it into the input ring.
+    ///
+    /// This is the mode the companion app launches, and the only way to get
+    /// bidirectional audio: the dext allows ONE RingAttach per connection, so
+    /// `play` and `record` as two processes cannot both own the I210 — the
+    /// second gets `Owned` (exit 9). Runs until SIGINT unless `--seconds` is
+    /// given.
+    Duplex {
+        /// Stop after N seconds. Omit to run until SIGINT (the companion's
+        /// normal mode).
+        #[arg(long)]
+        seconds: Option<u64>,
+        /// The 16R entity id. Auto-discovered when omitted.
+        #[arg(long)]
+        listener: Option<String>,
+        /// Which of the 16R's STREAM_INPUT sinks to send to. Omit to choose
+        /// the first AAF audio sink from its AEM (index 0 is the CRF
+        /// media-clock stream, not audio).
+        #[arg(long)]
+        listener_uid: Option<u16>,
+        /// EXPERIMENTAL: bind EVERY one of the 16R's AAF audio sources, giving
+        /// a 64-channel input ring instead of 8.
+        ///
+        /// Off by default and deliberately so. The data path works — all eight
+        /// streams place, per-slot frame counts stay within ~20 frames of each
+        /// other and the channel map is deterministic — but the cross-stream
+        /// timestamp alignment still shows a residual defect (about 15% of
+        /// packets reporting an implausible forward offset) that has not been
+        /// root-caused, and the CoreAudio plug-in pins its device at 8
+        /// channels and REFUSES a ring that disagrees. Until both are
+        /// resolved, turning this on gives a 64-channel ring that CoreAudio
+        /// will not attach to.
+        #[arg(long)]
+        all_inbound_streams: bool,
         #[arg(long, default_value_t = 30)]
         start_timeout: u64,
         #[arg(long)]
@@ -242,6 +293,34 @@ fn run() -> Result<(), Exit> {
                 listener,
                 listener_uid,
                 allow_partial,
+                start_timeout,
+                summary_out,
+            )
+        }
+        Command::Duplex {
+            seconds,
+            listener,
+            listener_uid,
+            all_inbound_streams,
+            start_timeout,
+            summary_out,
+        } => {
+            // `seconds` is optional here: the companion runs this until it
+            // stops the process. 0 means "no limit" to the loop.
+            if let Some(s) = seconds {
+                validate::validate_seconds(s)?;
+            }
+            validate::validate_timeout(start_timeout)?;
+            let listener = listener
+                .as_deref()
+                .map(validate::parse_talker)
+                .transpose()?;
+            stack::duplex(
+                &opts,
+                seconds.unwrap_or(0),
+                listener,
+                listener_uid,
+                all_inbound_streams,
                 start_timeout,
                 summary_out,
             )

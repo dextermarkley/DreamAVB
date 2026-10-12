@@ -11,6 +11,12 @@ Read this file first, then `AGENTS.md` (rules) and the docs it points to.
 - Phase 1a (16R → Mac recording to WAV, listener only) is in progress on branch `phase1a-listener`.
   - The design is approved at rev 5: `.agents/tasks/phase1a-design.md`. Design review pass 5 is APPROVED.
   - The plan is `.agents/tasks/phase1a-plan.md`. It is split into FEAT files under `.agents/tasks/task-phase1a-listener/`.
+- Phase 1b (Mac → 16R playback, talker) is in progress on branch `feat/companion-app`.
+  See "Phase 1b: talker" below for the resume point. **Bidirectional audio now
+  works on the live 16R** (`1e88c37`): `avb-daemon duplex` gets Listener Ready
+  in both directions, with the outbound peak measured at -8.7 dBFS and ~48000
+  frames/s inbound. Remaining known gaps are the Mac-vs-16R media clock, one
+  stream per direction out of eight, and a talker-only AEM.
 
 | FEAT | Scope | Status | Commit |
 |---|---|---|---|
@@ -72,6 +78,393 @@ inversion (adp/aecp/acmp), READ_DESCRIPTOR missing reserved field.
 The ctl/audio/rec threads (§5.1) and the full `run`/`record` loops are wired
 during the hardware milestones; the daemon binary carries a documented
 crate-level `#![allow(dead_code)]` until then (see the FEAT-005 deviations).
+
+## Phase 1b: talker (Mac → 16R)
+
+Branch `feat/companion-app`. The playback path exists end to end — CoreAudio
+output device → shm ring → AAF PDUs on the wire — and is confirmed moving real
+audio into the ring on hardware. **Audio does not yet come out of the 16R.**
+
+Found on the live 16R, none of it caught by the unit suite (each is now
+covered by a test that would have):
+
+1. `kAudioServerPlugInIOOperationWriteMix` was guessed as `'wmix'`. Apple's
+   value is `'rite'`. The plug-in declined WriteMix, the HAL never dispatched
+   it, and every transmitted PDU was zero-fill. `31279be`. The one test
+   covering it was a tautology (our constant against itself). All 66 FourCCs
+   and terminal types are now pinned to literal SDK numbers, and
+   `scripts/audit-coreaudio-constants.py` re-checks them against the SDK
+   headers (exits non-zero on a mismatch).
+2. `kAudioStreamTerminalTypeSpeaker` was `0x0301`, the USB Audio Class value,
+   not CoreAudio's `'spkr'`. `e1e4d68`, found by that audit.
+3. The plug-in kept writing into a *deleted* ring after a daemon restart: the
+   daemon unlinks and recreates the ring file (new inode), the old mapping
+   stays valid, and `start_io` attached only `if guard.is_none()`. Silent until
+   coreaudiod restarted. Now re-attaches on an inode change. `7676de3`.
+4. No MSRP Talker Advertise was ever declared, so the 16R listed no input
+   device — a Milan listener accepts no stream it has not been advertised. The
+   talker loop also had to learn to RECEIVE, since MRP is two-way and Listener
+   Ready arrives via RX. `c00c4d8`. The TSpec is spec-derived, **not** copied
+   from a working talker: the 16R sent no Advertise of its own to compare
+   against. `talker_tspec` is pure and tested.
+5. `AVB_TX_RATE_PER_SEC` was 1000, shared across every frame the dext sends. A
+   class A talker needs 8000/s, so 7 of 8 audio PDUs never reached the wire and
+   the audio flood starved our own gPTP/MSRP/MVRP of tokens (measured: 382 553
+   of 441 373 dropped in 60 s). Now 20 000/s. The send site also discarded
+   `SendResult`, so the summary counted attempts as sends. `f7d81d0`.
+6. We answered no AECP at all, so the 16R could discover us over ADP and then
+   learn nothing: a Milan controller enumerates by walking ENTITY ->
+   CONFIGURATION 0 -> every descriptor in `descriptor_counts`, and we had no
+   CONFIGURATION descriptor and `talker_stream_sources = 0`. The responder had
+   existed in `avb-avdecc` since Phase 1a and was never connected to the
+   socket — the daemon only LOGGED inbound AECP. `entity::talker` now answers
+   the whole walk for the playback direction, and the daemon dispatches to it.
+   `04f7541`.
+7. The AVTP presentation timestamp was nanoseconds-since-loop-start, and the
+   talker loop never serviced gPTP, so the clock it would have read was
+   free-running anyway. `gptpsvc::GptpService` is the `gptp` command's loop
+   body, now shared; the talker pumps it, reads the disciplined clock, and
+   refuses to stream until the servo is LOCKED. `04f7541`.
+
+### Resume point
+
+**Bidirectional audio WORKS on the live 16R** (`1e88c37`). `avb-daemon duplex`
+reaches `listener_ready=true` in both directions with real audio measured on
+each. The verified 30 s / 60 s runs are under "Verified on hardware at
+`1e88c37`" below. Four hardware-only bugs had to be fixed to get there; all
+four are described in `54c5d92`'s commit message and summarised under
+"Hard-won lessons".
+
+**64 channels each way are bound and accepted by the 16R.** Eight inbound
+streams (`--all-inbound-streams`) and eight outbound talkers, all eight
+`Listener Ready` in both directions, with the 8-stream AEM (8 `STREAM_OUTPUT`s,
+64 `AUDIO_CLUSTER`s) the 16R needs in order to bind them.
+
+**The outbound frame rate is now SUSTAINED at the full width, and that is
+VERIFIED on hardware.** Eight class-A streams need 64000 frames/s. A single
+`SendFrame` user-client call measures ~27 us, so the per-frame path saturated
+at ~37000/s with `0 rate-limited` — the token bucket was never the constraint,
+the per-CALL cost was. ABI **v4** `sel::SEND_FRAMES` (selector 15) queues up to
+8 frames per call behind one doorbell. Measured on the live I210 with
+`284.21.58` attached:
+
+```
+                        per-frame      batched
+frames/s on the wire       37063         63008
+intervals missed           49272          1353   (23% -> 0.6%)
+rate-limited                   0             0
+outbound streams     8 of 8 accepted   8 of 8 accepted
+```
+
+63008 of 63992 nominal is 1.5% short, which is residual pacing jitter in a
+userspace loop, not a throughput ceiling. The C++ host test
+`batched full-width talker unthrottled (64000 frames/s)` covers the dext side.
+The daemon picks the path from the ABI the ATTACHED dext reports (never from
+our own compiled constant) and names the path it used, so a silent fallback
+cannot look like a batched run.
+
+### Replacing the dext: TWO independent traps, both now understood
+
+Getting `284.21.58` to actually load cost most an afternoon because two
+separate things were in the way. Check both.
+
+**1. The incumbent owns the PCI device, so the upgrade defers.** `activate`
+stages the new build and marks it `activated enabled` while the kernel keeps
+running the OLD one. Un-match it by removing the device: **unplug and replug
+the Thunderbolt adapter**, which takes seconds and is confirmed working here.
+Do NOT reboot for this — see the research note below for why no reboot-free
+API exists.
+
+**2. Adhoc and signed dexts are SEPARATE records that never replace each
+other.** macOS keys a system extension on (teamID, bundleID). An adhoc-signed
+dext shows teamID `-`, the Apple-Development one shows `8NG8NMGYVF`, and both
+can sit `activated enabled` at once with the adhoc one winning the match:
+
+```
+-            284.21.16  [activated enabled]   <- attached, shadowing
+8NG8NMGYVF   284.21.58  [activated enabled]   <- the build we wanted
+```
+
+`package.sh --adhoc` runs in the gate, so activating from `build/` afterwards
+creates that shadow line. The tell is in activate's own output: `replacing
+installed extension version 282.7.31 with 284.21.58` — it replaced the other
+SIGNED record and left the adhoc one running. Clear it with
+`systemextensionsctl uninstall - com.avbaudio.installer.i210` (prompts for auth
+even as root), then replug. **Always repackage SIGNED before activating.**
+
+**Trust only `avb-installer status`.** It compares the code-signing hash the
+kernel reports for the attached service against the staged copies — the one
+instrument that was never wrong, where the version list named a version as
+active that had never loaded three separate times:
+
+```
+attached in the kernel: code hash 91a1acd2... = staged version 284.21.58
+this bundle would install: code hash 91a1acd2... — ALREADY RUNNING
+```
+
+**Prefer a Thunderbolt REPLUG over a reboot.** Researched 2026-10-12: there is
+no documented reboot-free way to replace an always-matched dext, and the
+cheapest real option is to un-match it by removing its device.
+
+- An in-place `activationRequest` ALWAYS defers the incumbent's termination to
+  reboot for an always-matched dext. Someone with the identical problem (an
+  always-matched `SCSIControllerDriverKit` dext) reports exactly our symptom in
+  Apple Developer Forums thread 836344: "the new version reaches
+  `[activated enabled]` but never starts; the old process keeps running until
+  reboot". Karabiner-DriverKit-VirtualHIDDevice's own `DEVELOPMENT.md` says the
+  same: "submit does not restart your driverkit userspace process. The most
+  reliable way to restart your userspace process is reboot."
+- `IOService::Terminate()` is NOT a self-termination escape hatch. The
+  DriverKit 25.5 SDK header documents it for services the driver itself made:
+  "An IOService object created with `Create()` may be removed by calling
+  `Terminate()`." Do not ship a self-terminate selector on that basis — it
+  would be an undocumented use of the API on a matched driver.
+- A dext cannot un-match itself either: "There is no way for a DriverKit driver
+  to programmatically modify the DriverKit driver's matching rules."
+- `systemextensionsctl developer on` does NOT help here. It allows loading from
+  outside `/Applications` with SIP disabled; it does not replace a running
+  driver.
+- macOS has no software PCIe/Thunderbolt re-enumeration command, so the device
+  must actually go away.
+
+Since the I210 is behind Thunderbolt, **unplug and replug the adapter** instead
+of rebooting: that un-matches the dext, which is precisely what sysextd is
+waiting for, and it costs seconds instead of a full restart. Then `activate`
+and check hashes with `avb-installer status`.
+
+One UNTESTED alternative, worth a try only because its worst case is the reboot
+we would otherwise do: `avb-installer deactivate` then `activate`. If
+deactivation terminates the incumbent, the device is released and the new build
+loads. If it merely defers (`terminating for uninstall but still running` is a
+documented state) nothing is lost. The risk is that the device IS released,
+Apple's generic `AppleEthernetE1000` claims it, and the activate cannot win the
+match until a reboot — leaving no AVB driver in the meantime.
+
+Note also that most iteration does NOT need this: the dext ABI changes rarely,
+and daemon, plug-in and companion changes all reload without touching it.
+
+The HAL plug-in IS installed (`/Library/Audio/Plug-Ins/HAL/AVBAudio.driver`)
+and is at **64 channels** in and out; `avb_audioring::DEVICE_CHANNELS` is the
+single source of that width because the plug-in refuses a ring that disagrees.
+A duplex run with nothing playing shows `outbound peak 0` and output-ring
+underruns — that is no audio source, not a broken path.
+
+To re-verify the whole chain, nothing needs to be run by hand — use the
+companion app's **Audio** toggle. For a bounded CLI run instead:
+
+```
+/Users/dexter/AVB-Audio/build/AVBInstaller.app/Contents/MacOS/avb-daemon duplex --seconds 30 --log-level info
+```
+
+Read, in order: `selected 16R STREAM_INPUT 1 (Return 1-8)`,
+`output format derived`, `answered CONNECT_TX_COMMAND`,
+`16R declared Listener Ready`, `gPTP locked ... arming the talker`, then the
+two summary lines. The outbound peak distinguishes audio from
+correctly-formed silence; `frames placed into the input ring` must be ~48000/s.
+
+The output format is no longer hardcoded (`d01d534`). `duplex`/`play` discover
+the 16R, read its CONFIGURATION, every STREAM_INPUT/STREAM_OUTPUT and
+AUDIO_UNIT 0 over AECP, and derive both directions' formats from the streams
+actually bound. Any failure REFUSES to transmit rather than falling back.
+
+- `--listener-uid` is now OPTIONAL and defaults to **derived**, not 0. The
+  16R's STREAM_INPUT 0 is `Return CRF` and STREAM_OUTPUT 0 is `Send CRF` — its
+  media clock, not audio — so a fixed 0 reserved and connected a stream that
+  carries no audio. Its audio streams are 1..=8 (`Return 1-8` ..
+  `Return 57-64`, 8 ch each = 64 channels).
+- `--listener <id>` selects which entity to WAIT for rather than skipping
+  discovery, because a unicast AECP read needs the 16R's MAC and only an
+  observed ADPDU carries it.
+- RESOLVED (was an unverified risk): not advertising ourselves during the
+  discovery window is FINE. The 16R answers AECP from a controller it has not
+  yet discovered — `9 of 9 STREAM_INPUT sinks read` on every run. No bootstrap
+  advertisement is needed.
+
+Still unbuilt, and the next likely blockers:
+
+- **The 16R asks us for CONTROL (`0x001a`) index 0 and we answer
+  NO_SUCH_DESCRIPTOR** — five times per run. We never advertise CONTROL in our
+  `descriptor_counts`, so the refusal is spec-correct and it does NOT block
+  binding (`listener_ready=true` with the refusals present). Milan does
+  require an IDENTIFY control, so a third-party controller may want it. Not
+  urgent, and it must not be guessed: a CONTROL descriptor with an invented
+  `control_type` is exactly the unanchored-wire-field mistake `AGENTS.md`
+  forbids.
+- **Our AEM advertises a talker-only model.** The inbound data path works
+  without it (ACMP CONNECT_TX + MSRP Listener Ready do not need us to
+  advertise a STREAM_INPUT), but a third-party controller would not see our
+  input stream. Merging the listener and talker AEM models into one entity is
+  the fix, and is also what CLOCK_SOURCE needs below.
+- **GET_STREAM_INFO answers NOT_IMPLEMENTED on purpose.** Its 32-bit flags
+  word needs bit positions from 1722.1-2021 Table 7.206. The working group's
+  own clarification (Illouz, "AVDECC clarifications Part 2 — AEM commands",
+  rev 4, §6.2) confirms the field semantics but gives no numeric positions.
+  Every descriptor we DO encode is anchored — the same layouts decoded 21 real
+  16R descriptors in hw-avdecc — whereas this response originates a flags word
+  we have never parsed, so a wrong bit asserts something false about our
+  stream with nothing to catch it. Needs the standard, not a guess.
+- **No START_STREAMING / STOP_STREAMING.** The same clarification (§6.1.2)
+  says a controller sets a talker source active with START_STREAMING on its
+  STREAM_OUTPUT. We are our own controller here (we send CONNECT_RX_COMMAND to
+  the 16R), so it may not matter on this link, but a third-party AVDECC
+  controller would expect it.
+- **The media clock is the Mac's, not the 16R's.** CoreAudio produces on the
+  host clock while we transmit paced by gPTP, so the two drift. This is the
+  mirror image of the listener's ring problem and is why STREAM_OUTPUT does
+  not advertise CLOCK_SYNC_SOURCE. Unaddressed, and the most likely cause of
+  audible artefacts over a long outbound run.
+- **Only one stream per direction.** We bind STREAM_INPUT 1 / STREAM_OUTPUT 1,
+  so 8 channels each way out of the 16R's 64. Binding all eight is the next
+  capacity step.
+
+## Verified on hardware at `1e88c37` (duplex, live 16R over the I210)
+
+Two runs, `avb-daemon duplex --seconds 30` and `--seconds 60`, both exit 0:
+
+```
+selected 16R STREAM_INPUT 1 (Return 1-8) as our audio sink
+output format derived from 16R STREAM_INPUT 1: 0x0205022002006000
+  (48000 Hz, 8 ch, 6 spf, 32-bit)
+16R AEM: 9 of 9 STREAM_INPUT sinks read, AUDIO_UNIT rate 48000 Hz
+16R AEM: 9 of 9 STREAM_OUTPUT sources read
+selected 16R STREAM_OUTPUT 1 (Send 1-8) as our audio source
+answered CONNECT_TX_COMMAND from the 16R: type 0x00 -> 0x01 status 0
+16R declared Listener Ready for our stream — accepted
+gPTP locked (asCapable=true offset 85 ns, path delay 144 ns)
+
+talker done:   163007 PDUs on the wire, 0 rate-limited, 0 otherwise refused,
+               0 underruns over 30s; outbound peak 788886592 (-8.7 dBFS);
+               16R listener_ready=true; AEM answered=51 refused=5;
+               ACMP talker commands answered=1; gPTP servo=LOCKED offset 0 ns
+listener done: 239267 audio slots, 0 not decodable as AAF, 1435602 frames
+               placed into the input ring, 0 format mismatches;
+               Listener Ready declared for 1 stream(s), dext filter entries 1
+```
+
+- Inbound rate: 1435602 frames / 30 s = **47853/s**, and 2878416 / 60 s =
+  **47974/s** — 48 kHz within 0.06 %.
+- Outbound peak **-8.7 dBFS** proves the whole CoreAudio -> HAL plug-in ->
+  output ring -> AAF -> 16R chain carries real audio, not framed silence.
+- The 5 AEM refusals are all CONTROL `0x001a` index 0 (see above) and do not
+  prevent binding.
+
+## Product packaging and the companion app (at `22dbef0`)
+
+The five product goals the user set, and where each stands:
+
+1. **Install from a macOS package — DONE.** `scripts/build-pkg.sh` produces
+   `build/DreamAVB-<version>.pkg` installing `/Applications/DreamAVB.app`,
+   `/Applications/AVBInstaller.app` (which keeps the dext inside it) and
+   `/Library/Audio/Plug-Ins/HAL/AVBAudio.driver`. The dext deliberately stays
+   inside AVBInstaller.app: macOS only honours an `OSSystemExtensionRequest`
+   from the bundle that CONTAINS the extension, so relocating it into
+   DreamAVB.app would break the verified activation path. Payload staged with
+   `ditto` so the adhoc-signed plug-in stays byte-identical. Bundle relocation
+   is pinned OFF via a component plist — `pkgbuild` defaults app bundles to
+   relocatable, which would install over a stray copy found elsewhere instead
+   of `/Applications`. Verify with `pkgutil --expand`; `PackageInfo` must show
+   `<relocate/>` EMPTY.
+2. **Driver does nothing until told — DONE.** The postinstall only kickstarts
+   coreaudiod and fixes ownership. It must never contain the string
+   `activate`; that is worth grepping after any change to it. Taking control
+   of the device remains the companion's toggle, which calls
+   `avb-installer activate`.
+3. **Optional launch at login — DONE.** Hand-written LaunchAgent at
+   `~/Library/LaunchAgents/com.avbaudio.companion.plist`, default OFF. NOT
+   `tauri-plugin-autostart` — its transitive deps float and break this build.
+   Off DELETES the plist. Validated with `plutil -lint`; whether this
+   machine's session accepts `launchctl bootstrap` is only confirmed by
+   toggling it in the real app.
+4. **Optional auto-select NIC — DONE.** Default OFF. Exactly one supported NIC
+   is selected; zero or two-or-more selects nothing and says why. It SELECTS
+   ONLY — it never activates the driver, so (2) still holds.
+5. **Companion starts everything for full duplex — DONE.** `avb-daemon duplex`
+   runs BOTH directions in one process, and the companion supervises exactly
+   one of them (Audio toggle in the popover). It must be one process: the dext
+   permits one `RingAttach` per connection, so a second daemon is refused with
+   `kIOReturnExclusiveAccess` and exits `Owned` (9). Both directions also share
+   ONE control-ring drain and ONE `GptpService`, because the control ring is a
+   single queue — a slot read by one direction is gone for the other.
+
+   Implementation notes that matter if this is touched again:
+   - `duplex` is `talker_loop(.., duplex: true)`, not a second loop. The talker
+     loop already did every shared piece (drain routing, gPTP, SRP, ADP, AECP,
+     clock-source publish); duplex adds the inbound declaration side and the
+     audio drain. There is deliberately no second implementation of either
+     direction.
+   - The inbound data path is `crate::listenerrx`, extracted from
+     `streams_loop` and shared with it. `streams_loop` calls the same code, so
+     the two cannot drift. Two copies of a wire path is how the wrong
+     `WriteMix` FourCC survived five reviews: one copy was never exercised.
+   - The inbound drain runs BEFORE the TX readiness gate on purpose. That gate
+     waits for OUR servo to lock and `continue`s while waiting, but inbound
+     audio does not depend on our clock at all — the 16R stamps its own PDUs.
+     Draining first means audio flows IN during the lock wait.
+   - The companion stops the daemon with SIGTERM, never SIGKILL: the daemon
+     sends an ADP DEPARTING on clean shutdown, and without it the 16R holds a
+     stale entry for 2 × valid_time (20 s) that a restarted daemon collides
+     with. It escalates to kill only after ~2 s, so a wedged daemon cannot
+     leak and hold the rings.
+   - `start_audio` refuses unless the driver is Active, because starting
+     against the OS default driver fails in a way that reads like a daemon bug.
+   - The daemon's own output goes to `~/Library/Logs/DreamAVB-daemon.log`
+     (appended, not truncated — the previous run usually explains this one).
+     The app has no console to inherit, so without this a failed start is
+     silent.
+   - UNVERIFIED ON HARDWARE. The duplex loop has never run against the 16R.
+     The summary is built so a dead direction cannot look healthy: it reports
+     inbound frames PLACED, and warns separately when the 16R never advertised
+     a talker (so no Listener Ready was declared) and when Listener Ready was
+     declared but not one frame arrived. Those two warnings are the first
+     things to read on the first run.
+
+Settings live in `~/Library/Application Support/DreamAVB/config.txt`, keys
+`clock_source`, `launch_at_login`, `auto_select_nic`. `avb-config` is
+deliberately dependency-free and serde-free: the main workspace pins serde
+`=1.0.229` and the Tauri app pins `=1.0.210`, and two exact requirements on
+one major version cannot resolve together. Any writer of that file must
+load-then-mutate, never construct a fresh `Config` — doing the latter silently
+clobbered the other settings (fixed in `22dbef0`).
+
+## Verified at the duplex commit
+
+- `cargo fmt --all --check`: clean (exit 0).
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo test --workspace --locked`: 418 pass.
+- Companion app (its OWN cargo workspace): 30 tests, clippy `-D warnings`
+  clean, fmt clean. `node --check ui/main.js` OK; every element id main.js
+  reaches exists in index.html.
+- C++ host tests: 342 i210 checks pass.
+- `xcodebuild … AVBI210Driver`: BUILD SUCCEEDED, 0 compiler warnings.
+- `scripts/package.sh --adhoc`: packaged; the shipped `avb-daemon` has the
+  `duplex` subcommand.
+- `scripts/build-pkg.sh`: payload re-verified, `<relocate/>` empty.
+
+## Verified at `22dbef0`
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo test --workspace --locked`: 418 pass (avdecc 116 -> 123, daemon 44).
+- Companion app (its OWN cargo workspace): 25 tests, clippy `-D warnings`
+  clean, fmt clean. `node --check ui/main.js` OK.
+- `scripts/build-pkg.sh`: `DreamAVB-284.16.50.pkg`, payload verified by
+  `pkgutil --expand`, `<relocate/>` empty, postinstall free of `activate`.
+
+Note: `cargo` is NOT on the default subprocess `PATH` in this environment, and
+the rustup default-host is x86_64, so a bare `cargo` resolves the 1.99.0 pin
+to the wrong host. Prefix cargo commands with
+`PATH="/Users/dexter/.rustup/toolchains/1.99.0-aarch64-apple-darwin/bin:$PATH"`.
+
+## Verified at `04f7541` (Phase 1b)
+
+- `cargo fmt --all --check`: clean.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo test --workspace --locked`: 370 pass — avdecc 116, srp 31, gptp 59,
+  daemon 34, dext 28, mediaclock 26, core 22, avtp 16, probe 16, audioring 15,
+  coreaudio 7.
+- C++ host tests: 342 i210 checks and 97 tg3 checks pass.
+- `xcodebuild … AVBI210Driver`: BUILD SUCCEEDED, 0 compiler warnings.
+- `scripts/package.sh --adhoc`: dext `284.1.16`, all shipped binaries arm64.
 
 ## Verified at the FEAT-005 commit (`a631a82`)
 
@@ -141,6 +534,35 @@ TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ make -C /Users/dexter/AVB-Audio/driv
 - 16R / Milan streams are AAF PCM 32-bit, 8 ch per stream, 6 samples/frame at 48 kHz, class A. Rates and channel counts must come from the AEM, never be hardcoded.
 - GPL/LGPL references (Linux tg3/igb, igb_avb kernel part, L-Acoustics avdecc) may be used for behavior only. Never copy their code.
 - Distribution later needs a paid Apple Developer account plus a DriverKit PCI entitlement request for 8086:1533. The odds are better than for the Broadcom.
+- **`unique_id` 0 on a Milan device is not audio.** The 16R's STREAM_INPUT 0 is
+  `Return CRF` and STREAM_OUTPUT 0 is `Send CRF` — its media-clock stream.
+  Binding it succeeds at every protocol layer (reservation, ACMP, Listener
+  Ready) and moves no audio. Always derive the stream index from the AEM
+  (`derive::first_audio_stream`) and refuse when there is no AAF stream, rather
+  than defaulting to 0.
+- **A talker MUST answer the listener's `CONNECT_TX_COMMAND`.** Sending
+  `CONNECT_RX_COMMAND` as the controller is only half of ACMP: the listener
+  then asks the TALKER to connect, and only after `CONNECT_TX_RESPONSE` does it
+  declare MSRP Listener Ready. We never routed inbound ACMP in the talker loop,
+  so the 16R waited on us forever and discarded every PDU — which looks exactly
+  like a transmit fault. `avb-daemon`'s summary now reports
+  `ACMP talker commands answered`, so "never asked to connect" is
+  distinguishable from "asked and then withheld Ready".
+- **Descriptor `*_offset` fields are ABSOLUTE from the descriptor's first byte,
+  and the array does not follow the fixed part.** The 16R puts STREAM formats
+  at byte 132 (not 86) and AUDIO_UNIT `current_sampling_rate` at 136 (not 80 —
+  there are 14 `(number_of_*, base_*)` port pairs in between). Reading them
+  sequentially gave ten all-zero formats and a healthy 48 kHz unit decoded as
+  "0 Hz". Every unit test passed because our encoder wrote the same wrong
+  layout our decoder read — a **round-trip tautology**, the same class as the
+  wrong `WriteMix` FourCC. The fix is `aem::desc::hw_16r`: decode tests pinned
+  to hex captured off the wire by `avb-daemon aem-dump`, which cannot agree
+  with a bug in our own layout. Never accept `decode(encode(x)) == x` as
+  evidence of wire-format correctness.
+- **A protocol success is not an audio success.** A duplex run can report
+  Listener Ready, 8000 PDUs/s, zero underruns and zero rate-limited while
+  transmitting pure zeros. The talker now reports the outbound peak in dBFS, or
+  says "digital silence" outright.
 
 ## User decisions
 

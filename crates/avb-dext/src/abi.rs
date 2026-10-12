@@ -1,11 +1,43 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Rust mirror of `driver/AVBShared.h` (user-client ABI version 3).
+//! Rust mirror of `driver/AVBShared.h` (user-client ABI version 4).
 //!
 //! Keep in lock-step with the C header: the tests at the bottom assert the
 //! same sizes and field offsets the C++ side `static_assert`s (design §3.1).
 
-pub const ABI_VERSION: u32 = 3;
+/// The ABI this build is written against.
+///
+/// A client MUST NOT refuse an older dext: v4 only adds [`sel::SEND_FRAMES`],
+/// an optimisation of a path that already works per frame. A PCI-matched dext
+/// does not terminate while it owns its device, so between `avb-installer
+/// activate` and the reboot that loads the replacement the running dext is
+/// still the old one — a client that demanded v4 would be dead in that window.
+/// Compare against [`ABI_VERSION_SEND_FRAMES`] to pick the path instead.
+pub const ABI_VERSION: u32 = 4;
+
+/// First ABI version with [`sel::SEND_FRAMES`]; below this, batch by looping.
+pub const ABI_VERSION_SEND_FRAMES: u32 = 4;
+
+/// Oldest dext ABI this client can drive.
+///
+/// v3 and v4 differ only by the addition of [`sel::SEND_FRAMES`], and every
+/// v3 layout is unchanged, so a v4 client drives a v3 dext correctly as long
+/// as it does not call the new selector. Accepting the range is not laxity: a
+/// PCI-matched dext does not terminate while it owns its device, so a dext
+/// upgrade only takes effect at the next boot. Between `avb-installer
+/// activate` and that boot the kernel is still running the old build, and a
+/// client that insisted on an exact match would refuse to start at all.
+pub const ABI_VERSION_MIN: u32 = 3;
+
+/// Whether a dext reporting ABI `v` can be driven by this build.
+pub const fn abi_supported(v: u32) -> bool {
+    v >= ABI_VERSION_MIN && v <= ABI_VERSION
+}
+
+/// Whether a dext reporting ABI `v` implements [`sel::SEND_FRAMES`].
+pub const fn abi_has_send_frames(v: u32) -> bool {
+    v >= ABI_VERSION_SEND_FRAMES
+}
 
 /// `AvbInfo::nic_kind` values.
 pub const NIC_BCM57762: u32 = 1;
@@ -32,7 +64,9 @@ pub mod sel {
     /// in: flags (must be 0); out: generation, rx_mem_size, consumer_mem_size.
     pub const RING_ATTACH: u32 = 13;
     pub const RING_DETACH: u32 = 14;
-    pub const COUNT: u32 = 15;
+    /// in: packed `TxBatch` (see `super::tx_batch`); out: accepted, mach.
+    pub const SEND_FRAMES: u32 = 15;
+    pub const COUNT: u32 = 16;
     /// Selectors every NIC dext implements (the BCM dext: only these).
     /// 32..47 are reserved for the talker path.
     pub const BASE_COUNT: u32 = 10;
@@ -228,9 +262,140 @@ pub const CONSUMER_MEM_SIZE: u32 = 16384;
 /// S_max.
 pub const MAX_STREAMS: u32 = 16;
 pub const STEP_CLOCK_MAX_NS: i64 = 1_000_000_000;
-/// Dext TX token bucket (SAF-6).
-pub const TX_RATE_PER_SEC: u32 = 1000;
+/// The 16R's AAF audio streams per direction (8 channels each, 64 total). The
+/// TX ceiling has to clear all of them at once.
+pub const TX_MAX_CLASS_A_STREAMS: u32 = 8;
+/// Dext TX token bucket (SAF-6). Shared across ALL transmitted frames, audio
+/// and control alike, so it must clear every SR class A stream we talk at once
+/// (8000 frames/s each, one per 125 us observation interval) with headroom
+/// left for gPTP, MSRP, MVRP and AVDECC. See the derivation in
+/// `driver/AVBShared.h`.
+///
+/// Changing this requires REINSTALLING the dext: it is compiled into the
+/// driver, not supplied by the client.
+pub const TX_RATE_PER_SEC: u32 = 80000;
+// Compile-time, so the bound holds even if the test below is ever removed.
+// Mirrors the `static_assert`s in `driver/AVBShared.h` / `I210Logic.hpp`.
+const _: () = {
+    assert!(
+        TX_RATE_PER_SEC > TX_MAX_CLASS_A_STREAMS * 8000,
+        "the TX ceiling is shared across every frame we send, so it must clear \
+         EVERY class A stream we talk at once (8000 frames/s each) with room \
+         left for control traffic"
+    );
+    assert!(
+        1_000_000_000 % TX_RATE_PER_SEC == 0,
+        "the token period must be an integer number of nanoseconds"
+    );
+};
 pub const TX_BURST: u32 = 64;
+
+/// Packed encoder for [`sel::SEND_FRAMES`].
+///
+/// Mirrors `parseTxBatch` in `driver/AVBI210Driver/I210Logic.hpp`; the layout
+/// is documented on `AvbTxBatchHeader` in `driver/AVBShared.h`. Encoding and
+/// decoding live on opposite sides of the user-client boundary, so neither can
+/// be checked by round-tripping against itself — the tests here assert the
+/// byte layout against literals transcribed from the C header, which is the
+/// only form that disagrees with a mistake made on one side.
+pub mod tx_batch {
+    use super::{FRAME_MAX_LEN, TX_BURST, TX_MAX_CLASS_A_STREAMS};
+
+    /// Frames one call may carry.
+    pub const MAX: usize = 16;
+    /// Bytes of the fixed header: `count` then `total_bytes`.
+    pub const HEADER_LEN: usize = 8;
+    /// Bytes of each per-frame entry header: `len` then `reserved`.
+    pub const ENTRY_LEN: usize = 4;
+
+    const _: () = assert!(
+        MAX >= TX_MAX_CLASS_A_STREAMS as usize,
+        "a batch must hold one frame per class A stream, or the talker is back \
+         to several user-client calls per 125 us interval"
+    );
+    const _: () = assert!(
+        MAX <= TX_BURST as usize,
+        "a full batch must fit the token burst, so a correctly paced talker is \
+         never throttled part-way through an interval"
+    );
+
+    const fn round_up4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+
+    /// Worst case: every entry a maximum-length frame.
+    pub const BYTES_MAX: usize = HEADER_LEN + MAX * (ENTRY_LEN + round_up4(FRAME_MAX_LEN));
+
+    /// Bytes `count` frames of `len` each occupy.
+    pub const fn bytes_for(count: usize, len: usize) -> usize {
+        HEADER_LEN + count * (ENTRY_LEN + round_up4(len))
+    }
+
+    /// Why a batch could not be encoded. Each is a programming error on this
+    /// side, not a device condition.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum EncodeError {
+        /// No frames, or more than [`MAX`].
+        Count(usize),
+        /// A frame shorter than an Ethernet header or longer than the MTU.
+        FrameLen { index: usize, len: usize },
+    }
+
+    impl core::fmt::Display for EncodeError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::Count(n) => write!(f, "batch of {n} frames (must be 1..={MAX})"),
+                Self::FrameLen { index, len } => {
+                    write!(f, "frame {index} is {len} B (must be 14..={FRAME_MAX_LEN})")
+                }
+            }
+        }
+    }
+
+    impl core::error::Error for EncodeError {}
+
+    /// Encodes `frames` into `buf`, returning the used length.
+    ///
+    /// `buf` must be at least [`BYTES_MAX`]; the padding bytes between frames
+    /// are zeroed rather than left as whatever the caller's buffer held, so
+    /// the same frames always produce the same bytes.
+    pub fn encode(buf: &mut [u8], frames: &[&[u8]]) -> Result<usize, EncodeError> {
+        if frames.is_empty() || frames.len() > MAX {
+            return Err(EncodeError::Count(frames.len()));
+        }
+        for (index, f) in frames.iter().enumerate() {
+            if f.len() < 14 || f.len() > FRAME_MAX_LEN {
+                return Err(EncodeError::FrameLen {
+                    index,
+                    len: f.len(),
+                });
+            }
+        }
+        let total: usize = HEADER_LEN
+            + frames
+                .iter()
+                .map(|f| ENTRY_LEN + round_up4(f.len()))
+                .sum::<usize>();
+        assert!(
+            buf.len() >= total,
+            "batch buffer is {} B, need {total} B",
+            buf.len()
+        );
+        buf[..total].fill(0);
+        buf[0..4].copy_from_slice(&(frames.len() as u32).to_le_bytes());
+        buf[4..8].copy_from_slice(&(total as u32).to_le_bytes());
+        let mut at = HEADER_LEN;
+        for f in frames {
+            buf[at..at + 2].copy_from_slice(&(f.len() as u16).to_le_bytes());
+            buf[at + 2..at + 4].copy_from_slice(&0u16.to_le_bytes());
+            at += ENTRY_LEN;
+            buf[at..at + f.len()].copy_from_slice(f);
+            at += round_up4(f.len());
+        }
+        debug_assert_eq!(at, total);
+        Ok(total)
+    }
+}
 
 /// `AvbRxSlot.cls`.
 #[repr(u8)]
@@ -374,12 +539,18 @@ pub mod ctr {
     pub const LEGACY_SW_OVERRUN: usize = 32;
     /// Payload after the TS header > RX_SLOT_DATA_MAX: discarded.
     pub const RX_OVERSIZE: usize = 33;
+    /// `SEND_FRAMES` calls that queued at least one frame.
+    pub const TX_BATCHES: usize = 34;
+    /// Of those, calls where a later frame in the batch was refused.
+    pub const TX_BATCH_PARTIAL: usize = 35;
+    /// Calls refused whole: malformed batch, or a timestamp requested.
+    pub const TX_BATCH_REJECTED: usize = 36;
     pub const COUNT: usize = 64;
 }
 
 /// Every defined counter index with its stable name, ascending. Index 7 is
 /// reserved and has no name.
-pub const COUNTER_NAMES: [(usize, &str); 33] = [
+pub const COUNTER_NAMES: [(usize, &str); 36] = [
     (ctr::RX_FRAMES, "rx_frames"),
     (1, "rx_gptp"),
     (2, "rx_msrp"),
@@ -413,6 +584,9 @@ pub const COUNTER_NAMES: [(usize, &str); 33] = [
     (ctr::HARVEST_LATE_TICKS, "harvest_late_ticks"),
     (ctr::LEGACY_SW_OVERRUN, "legacy_sw_overrun"),
     (ctr::RX_OVERSIZE, "rx_oversize"),
+    (ctr::TX_BATCHES, "tx_batches"),
+    (ctr::TX_BATCH_PARTIAL, "tx_batch_partial"),
+    (ctr::TX_BATCH_REJECTED, "tx_batch_rejected"),
 ];
 
 pub fn counter_name(index: usize) -> Option<&'static str> {
@@ -435,7 +609,7 @@ const _: () = assert!(
     ctr::RX_CLASS_BASE + RX_CLASS_COUNT as usize == ctr::RX_DROP_OTHER,
     "class counters 1..7"
 );
-const _: () = assert!(ctr::RX_OVERSIZE < ctr::COUNT, "counter space");
+const _: () = assert!(ctr::TX_BATCH_REJECTED < ctr::COUNT, "counter space");
 const _: () = assert!(RX_MEM_SIZE == 17_842_176, "rx mem size");
 const _: () = assert!(
     RX_CTL_SLOTS.is_power_of_two() && RX_AUDIO_SLOTS.is_power_of_two(),
@@ -635,14 +809,16 @@ mod tests {
 
     #[test]
     fn selectors_match_header() {
-        assert_eq!(ABI_VERSION, 3);
+        assert_eq!(ABI_VERSION, 4);
+        assert_eq!(ABI_VERSION_SEND_FRAMES, 4);
         assert_eq!(sel::SHUTDOWN_DATAPATH, 9);
         assert_eq!(sel::STEP_CLOCK, 10);
         assert_eq!(sel::GET_COUNTERS, 11);
         assert_eq!(sel::SET_STREAM_FILTER, 12);
         assert_eq!(sel::RING_ATTACH, 13);
         assert_eq!(sel::RING_DETACH, 14);
-        assert_eq!(sel::COUNT, 15);
+        assert_eq!(sel::SEND_FRAMES, 15);
+        assert_eq!(sel::COUNT, 16);
         assert_eq!(sel::BASE_COUNT, 10);
         assert_eq!(mem::RX, 1);
         assert_eq!(mem::CONSUMER, 2);
@@ -666,7 +842,8 @@ mod tests {
         assert_eq!(CONSUMER_MEM_SIZE, 16384);
         assert_eq!(MAX_STREAMS, 16);
         assert_eq!(STEP_CLOCK_MAX_NS, 1_000_000_000);
-        assert_eq!(TX_RATE_PER_SEC, 1000);
+        assert_eq!(TX_RATE_PER_SEC, 80000);
+        assert_eq!(TX_MAX_CLASS_A_STREAMS, 8);
         assert_eq!(TX_BURST, 64);
         assert_eq!(RX_CLASS_COUNT, 7);
         assert_eq!(RXF_TS_HW, 1);
@@ -751,6 +928,9 @@ mod tests {
         assert_eq!(ctr::LINK_DOWN_EVENTS, 28);
         assert_eq!(ctr::LEGACY_SW_OVERRUN, 32);
         assert_eq!(ctr::RX_OVERSIZE, 33);
+        assert_eq!(ctr::TX_BATCHES, 34);
+        assert_eq!(ctr::TX_BATCH_PARTIAL, 35);
+        assert_eq!(ctr::TX_BATCH_REJECTED, 36);
         assert_eq!(ctr::COUNT, 64);
         assert_eq!(class_counter_index(RxClass::Gptp), 1);
         assert_eq!(class_counter_index(RxClass::Msrp), 2);
@@ -758,9 +938,9 @@ mod tests {
         assert_eq!(class_counter_index(RxClass::Avdecc), 4);
         assert_eq!(class_counter_index(RxClass::Maap), 5);
         assert_eq!(class_counter_index(RxClass::Stream), 6);
-        // Names: every index 0..=33 except the reserved 7, ascending, unique.
+        // Names: every index 0..=36 except the reserved 7, ascending, unique.
         let idx: Vec<usize> = COUNTER_NAMES.iter().map(|(i, _)| *i).collect();
-        let want: Vec<usize> = (0..=ctr::RX_OVERSIZE).filter(|i| *i != 7).collect();
+        let want: Vec<usize> = (0..=ctr::TX_BATCH_REJECTED).filter(|i| *i != 7).collect();
         assert_eq!(idx, want);
         let mut names: Vec<&str> = COUNTER_NAMES.iter().map(|(_, n)| *n).collect();
         names.sort_unstable();
@@ -777,6 +957,80 @@ mod tests {
         assert_eq!(counter_name(ctr::RX_OVERSIZE), Some("rx_oversize"));
         assert_eq!(RxClass::from_u8(7), None);
         assert_eq!(RxClass::from_u8(0), Some(RxClass::None));
+    }
+
+    /// The encoded bytes are checked against literals transcribed from
+    /// `AvbTxBatchHeader` / `AvbTxBatchEntry` in `driver/AVBShared.h`, NOT
+    /// against a decoder of our own. Encoder and decoder sit on opposite sides
+    /// of the user-client boundary, so a shared misunderstanding of the layout
+    /// would round-trip perfectly and still be refused by the dext — the same
+    /// tautology that let an inverted AVTP header and a guessed FourCC through.
+    #[test]
+    fn tx_batch_encodes_the_documented_layout() {
+        use tx_batch::{bytes_for, encode, EncodeError, BYTES_MAX, ENTRY_LEN, HEADER_LEN, MAX};
+
+        let mut buf = vec![0xAAu8; BYTES_MAX];
+        // Two frames, the first 15 B so its 4-byte padding is exercised.
+        let a: Vec<u8> = (0..15u8).collect();
+        let b: Vec<u8> = (100..116u8).collect();
+        let n = encode(&mut buf, &[&a, &b]).unwrap();
+
+        // header: count = 2, total_bytes = n, both little-endian u32.
+        assert_eq!(&buf[0..4], &2u32.to_le_bytes());
+        assert_eq!(&buf[4..8], &(n as u32).to_le_bytes());
+        // entry 0: len = 15, reserved = 0, then 15 bytes + one zero pad byte.
+        assert_eq!(&buf[8..10], &15u16.to_le_bytes());
+        assert_eq!(&buf[10..12], &0u16.to_le_bytes());
+        assert_eq!(&buf[12..27], &a[..]);
+        assert_eq!(
+            buf[27], 0,
+            "padding must be zeroed, not left as caller bytes"
+        );
+        // entry 1 starts on the next 4-byte boundary.
+        assert_eq!(&buf[28..30], &16u16.to_le_bytes());
+        assert_eq!(&buf[30..32], &0u16.to_le_bytes());
+        assert_eq!(&buf[32..48], &b[..]);
+        assert_eq!(n, 48);
+        assert_eq!(n, HEADER_LEN + (ENTRY_LEN + 16) + (ENTRY_LEN + 16));
+
+        // The real shape: one class A interval of the 16R's eight streams.
+        let frame = vec![0x5Au8; 234];
+        let frames: Vec<&[u8]> = (0..8).map(|_| frame.as_slice()).collect();
+        let n = encode(&mut buf, &frames).unwrap();
+        assert_eq!(n, bytes_for(8, 234));
+        assert_eq!(&buf[0..4], &8u32.to_le_bytes());
+        // Frame i begins past i whole (entry + padded frame) blocks.
+        for i in 0..8usize {
+            let at = HEADER_LEN + i * (ENTRY_LEN + 236);
+            assert_eq!(&buf[at..at + 2], &234u16.to_le_bytes());
+            assert_eq!(buf[at + ENTRY_LEN], 0x5A);
+            assert_eq!(buf[at + ENTRY_LEN + 234], 0, "frame {i} pad byte 0");
+            assert_eq!(buf[at + ENTRY_LEN + 235], 0, "frame {i} pad byte 1");
+        }
+
+        // A full batch of maximum-length frames is exactly the worst case the
+        // ABI reserves, so the dext's length guard and ours agree.
+        let big = vec![0u8; FRAME_MAX_LEN];
+        let frames: Vec<&[u8]> = (0..MAX).map(|_| big.as_slice()).collect();
+        assert_eq!(encode(&mut buf, &frames).unwrap(), BYTES_MAX);
+
+        // Refusals are our own programming errors, caught before any syscall.
+        assert_eq!(encode(&mut buf, &[]), Err(EncodeError::Count(0)));
+        let frames: Vec<&[u8]> = (0..MAX + 1).map(|_| frame.as_slice()).collect();
+        assert_eq!(encode(&mut buf, &frames), Err(EncodeError::Count(MAX + 1)));
+        let short = [0u8; 13];
+        assert_eq!(
+            encode(&mut buf, &[&short]),
+            Err(EncodeError::FrameLen { index: 0, len: 13 })
+        );
+        let long = vec![0u8; FRAME_MAX_LEN + 1];
+        assert_eq!(
+            encode(&mut buf, &[&frame, &long]),
+            Err(EncodeError::FrameLen {
+                index: 1,
+                len: FRAME_MAX_LEN + 1
+            })
+        );
     }
 
     #[test]

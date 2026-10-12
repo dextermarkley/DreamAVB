@@ -19,12 +19,14 @@
 
 pub mod constants;
 pub mod dll;
+pub mod gptpderived;
 pub mod placement;
 pub mod recovery;
 pub mod stats;
 
 pub use constants::RateConsts;
 pub use dll::Dll;
+pub use gptpderived::gptp_derived_rate_hz;
 pub use placement::{classify, early_bound_ns, frame_index, presentation_time_ns, Timing};
 pub use recovery::{LockEvent, LockSm, LockState};
 pub use stats::{evaluate_mcr5, Mcr5, Window, WindowStats};

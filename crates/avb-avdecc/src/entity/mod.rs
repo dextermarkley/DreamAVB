@@ -9,6 +9,8 @@
 //! counters.
 
 pub mod acmp_listener;
+pub mod control;
+pub mod talker;
 
 use avb_core::{Eui64, MacAddr};
 
@@ -19,17 +21,20 @@ use crate::constants::{
     adp_msg, aecp_msg, aecp_status, aem_cmd, controller_caps, entity_caps, listener_caps,
 };
 use crate::derive::ListenerModel;
+use crate::entity::control::ControlState;
 
 pub use acmp_listener::{AcmpResponse, Action, Effective, Event, ListenerSm, State};
+pub use talker::{talker_model, StreamInfo, TalkerEntity, TalkerModel};
 
 /// Advertisement `valid_time` (§9.3: 10 → 20 s validity).
 pub const VALID_TIME: u8 = 10;
 /// Re-advertise interval (§9.3: every 5 s).
 pub const ADVERTISE_INTERVAL_NS: u64 = 5_000_000_000;
-/// LOCK_ENTITY auto-release (§9.3: 60 s).
-pub const LOCK_TIMEOUT_NS: u64 = 60_000_000_000;
+/// LOCK_ENTITY auto-release (§9.3: 60 s). Re-exported from [`control`], which
+/// holds the rule both directions share.
+pub use control::LOCK_TIMEOUT_NS;
 /// Max registered unsolicited-notification controllers (§9.3: 16).
-pub const MAX_UNSOL_CONTROLLERS: usize = 16;
+pub use control::MAX_UNSOL_CONTROLLERS;
 
 /// ACQUIRE_ENTITY decision (AS-7, §9.3). Milan v1.2 §5.4.2.1 states that a
 /// PAAD-AE (Milan audio endpoint) does NOT implement ACQUIRE_ENTITY — Milan
@@ -53,22 +58,16 @@ pub struct GptpStatus {
     pub propagation_delay_ns: u32,
 }
 
-/// A registered unsolicited-notification controller (§9.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct UnsolController {
-    entity_id: Eui64,
-    mac: MacAddr,
-}
-
 /// The listener entity.
 #[derive(Clone, Debug)]
 pub struct ListenerEntity {
     model: ListenerModel,
     gptp: GptpStatus,
     available_index: u32,
-    /// Current controller holding the lock, with its deadline.
-    lock: Option<(Eui64, u64)>,
-    unsol: Vec<UnsolController>,
+    /// LOCK_ENTITY holder and the unsolicited-notification registrations,
+    /// shared with the talker entity so the 60 s release and the 16-controller
+    /// cap are written once.
+    control: ControlState,
     /// One ACMP listener SM per STREAM_INPUT.
     pub streams: Vec<ListenerSm>,
     /// Shared PROBE_TX sequence counter across all SMs (§9.4).
@@ -87,8 +86,7 @@ impl ListenerEntity {
             model,
             gptp: GptpStatus::default(),
             available_index: 0,
-            lock: None,
-            unsol: Vec::new(),
+            control: ControlState::new(),
             streams,
             probe_tx_seq: 0,
         }
@@ -162,25 +160,6 @@ impl ListenerEntity {
         }
     }
 
-    /// Register (or refresh) an unsolicited-notification controller (§9.3:
-    /// ≤ 16; NO_RESOURCES above that).
-    fn register_unsol(&mut self, entity_id: Eui64, mac: MacAddr) -> u8 {
-        if let Some(c) = self.unsol.iter_mut().find(|c| c.entity_id == entity_id) {
-            c.mac = mac;
-            return aecp_status::SUCCESS;
-        }
-        if self.unsol.len() >= MAX_UNSOL_CONTROLLERS {
-            return aecp_status::NO_RESOURCES;
-        }
-        self.unsol.push(UnsolController { entity_id, mac });
-        aecp_status::SUCCESS
-    }
-
-    fn deregister_unsol(&mut self, entity_id: Eui64) -> u8 {
-        self.unsol.retain(|c| c.entity_id != entity_id);
-        aecp_status::SUCCESS
-    }
-
     /// Is a STREAM_INPUT bound (any SM past UNBOUND)? Used to refuse SET_*
     /// with STREAM_IS_RUNNING (§9.3 ADC-12).
     fn any_stream_bound(&self) -> bool {
@@ -191,11 +170,7 @@ impl ListenerEntity {
     /// send back (unicast to the controller). `now_ns` ages the lock.
     pub fn handle_aecp(&mut self, cmd: &AemPdu, src_mac: MacAddr, now_ns: u64) -> AemPdu {
         // Expire a stale lock first (§9.3: 60 s auto-release).
-        if let Some((_, deadline)) = self.lock {
-            if now_ns >= deadline {
-                self.lock = None;
-            }
-        }
+        self.control.expire_lock(now_ns);
         if cmd.message_type != aecp_msg::AEM_COMMAND || cmd.target_entity_id != self.model.entity_id
         {
             return self.respond(cmd, aecp_status::NOT_IMPLEMENTED, cmd.payload.clone());
@@ -215,15 +190,7 @@ impl ListenerEntity {
                     (aecp_status::NOT_IMPLEMENTED, cmd.payload.clone())
                 }
             }
-            aem_cmd::LOCK_ENTITY => match self.lock {
-                Some((owner, _)) if owner != ctrl => {
-                    (aecp_status::ENTITY_LOCKED, cmd.payload.clone())
-                }
-                _ => {
-                    self.lock = Some((ctrl, now_ns.saturating_add(LOCK_TIMEOUT_NS)));
-                    (aecp_status::SUCCESS, cmd.payload.clone())
-                }
-            },
+            aem_cmd::LOCK_ENTITY => (self.control.lock(ctrl, now_ns), cmd.payload.clone()),
             aem_cmd::ENTITY_AVAILABLE | aem_cmd::CONTROLLER_AVAILABLE => {
                 (aecp_status::SUCCESS, cmd.payload.clone())
             }
@@ -241,11 +208,12 @@ impl ListenerEntity {
                 }
             }
             aem_cmd::READ_DESCRIPTOR => self.read_descriptor(cmd),
-            aem_cmd::REGISTER_UNSOLICITED_NOTIFICATION => {
-                (self.register_unsol(ctrl, src_mac), cmd.payload.clone())
-            }
+            aem_cmd::REGISTER_UNSOLICITED_NOTIFICATION => (
+                self.control.register_unsol(ctrl, src_mac),
+                cmd.payload.clone(),
+            ),
             aem_cmd::DEREGISTER_UNSOLICITED_NOTIFICATION => {
-                (self.deregister_unsol(ctrl), cmd.payload.clone())
+                (self.control.deregister_unsol(ctrl), cmd.payload.clone())
             }
             aem_cmd::SET_STREAM_FORMAT | aem_cmd::SET_SAMPLING_RATE => {
                 // Rate/format change is out of scope; refuse while bound.

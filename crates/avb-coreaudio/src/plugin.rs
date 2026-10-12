@@ -26,12 +26,28 @@ use crate::abi::*;
 
 // Device identity + format (overridden later from the daemon control API,
 // 1b-2). Never hardcode these downstream — read them from here.
-const DEVICE_CHANNELS: u32 = 8;
+//
+// The channel width comes from `avb_audioring`, which is the ONE place it is
+// defined: a HAL device's channel count is fixed when the device is published
+// and cannot follow a ring created later, so the plug-in and the daemon have
+// to agree on it without negotiating. The attach checks below refuse a ring of
+// any other width rather than reading past its end — correct, but silent, so
+// the constant must not be able to drift between the two crates.
+const DEVICE_CHANNELS: u32 = avb_audioring::DEVICE_CHANNELS;
 const DEVICE_RATE: f64 = 48_000.0;
 const DEVICE_BITS: u32 = 32;
 const DEVICE_UID: &str = "com.avbaudio.16r.input";
 const DEVICE_MODEL_UID: &str = "com.avbaudio.16r.model";
-const DEVICE_NAME: &str = "AVB StudioLive 16R (Input)";
+/// User-visible device name. NOT "… (Input)" any more: the device carries an
+/// input AND an output stream (Phase 1b-2), and the old name made it look
+/// input-only in System Settings → Sound → Output, where it is a valid output
+/// device offering 64 channels. The stale name actively misled a hardware test
+/// session into reading "(Input)" as a scope rather than a label.
+///
+/// `DEVICE_UID` deliberately keeps its `.input` suffix: macOS persists the
+/// user's default-device choice by UID, so changing it would silently reset
+/// their selection. It is an internal identifier and never shown.
+const DEVICE_NAME: &str = "AVB StudioLive 16R";
 const BOX_UID: &str = "com.avbaudio.16r.box";
 const BOX_NAME: &str = "AVB-Audio Box";
 const MANUFACTURER: &str = "AVB-Audio";
@@ -699,6 +715,32 @@ static IO: Mutex<Option<IoState>> = Mutex::new(None);
 struct OutIoState {
     prod: avb_audioring::ShmProducer,
     scratch: Vec<u8>,
+    /// Inode of the ring file this mapping came from, so a ring the daemon has
+    /// since replaced can be detected. See `out_ring_is_stale`.
+    ino: u64,
+}
+
+/// The inode of the output ring path right now, or `None` if it is absent.
+fn out_ring_ino() -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(avb_audioring::SHM_NAME_OUT)
+        .ok()
+        .map(|m| m.ino())
+}
+
+/// True if the mapping we hold is no longer the ring the daemon is using.
+///
+/// The daemon UNLINKS its output ring when `play` exits and creates a fresh
+/// file — a new inode — on the next run. Our mmap of the old inode stays
+/// perfectly valid, so without this check the plug-in keeps writing into a
+/// deleted ring nobody reads while the live ring's write frontier sits at 0
+/// forever. `start_io` only attached when it held nothing, and only `stop_io`
+/// cleared it, so a device whose IO never stopped (ours is the default output)
+/// never re-attached. Observed directly: a run begun after a previous daemon
+/// exited transmitted 191,489 PDUs and 191,489 underruns while the plug-in was
+/// writing happily to the orphaned mapping.
+fn out_ring_is_stale(state: &OutIoState) -> bool {
+    out_ring_ino().is_none_or(|ino| ino != state.ino)
 }
 
 /// Frames converted per inner step of `write_mix` (bounds the scratch buffer;
@@ -711,6 +753,9 @@ static OUT_IO: Mutex<Option<OutIoState>> = Mutex::new(None);
 /// `None` if the ring is absent or its geometry does not match this device.
 fn attach_out() -> Option<OutIoState> {
     let channels = DEVICE_CHANNELS as usize;
+    // Read the inode BEFORE mapping, so a ring swapped between the two reads
+    // is caught by the next staleness check rather than remembered wrongly.
+    let ino = out_ring_ino()?;
     let prod = avb_audioring::ShmProducer::attach_at(
         avb_audioring::SHM_NAME_OUT,
         &[(0, channels, 32)],
@@ -725,6 +770,7 @@ fn attach_out() -> Option<OutIoState> {
     Some(OutIoState {
         prod,
         scratch: vec![0u8; OUT_CHUNK_FRAMES * channels * 4],
+        ino,
     })
 }
 
@@ -755,7 +801,12 @@ pub extern "C" fn start_io(
     }
     // Attach the OUTPUT ring (playback). Absence is not an error — write_mix
     // retries the attach (throttled) until the daemon's `play` loop creates it.
+    // A mapping of a ring the daemon has already replaced is dropped first:
+    // `if guard.is_none()` alone meant a stale mapping was kept forever.
     if let Ok(mut guard) = OUT_IO.lock() {
+        if guard.as_ref().is_some_and(out_ring_is_stale) {
+            *guard = None;
+        }
         if guard.is_none() {
             *guard = attach_out();
             oslog(if guard.is_some() {
@@ -795,16 +846,90 @@ pub extern "C" fn stop_io(
 /// disciplined rate here lets `get_zero_time_stamp` run the device timeline at
 /// the true data rate.
 ///
-/// `None` when the ring is unattached or unlocked, so the caller falls back to
-/// the nominal-rate stand-in and the device stays alive.
+/// The disciplined rate most recently seen on the OUTPUT ring, as `f64::to_bits`
+/// (0 = none), plus the daemon's verdict code.
+///
+/// These are ATOMICS, not a mutex, because `GetZeroTimeStamp` reads them on
+/// every call from the HAL's timing thread while `write_mix` runs on the
+/// realtime IO thread. An earlier version of this read the rings directly and
+/// took the `OUT_IO` lock to do it — the same lock `write_mix` holds inside the
+/// audio callback. That put a mutex between the timing thread and the realtime
+/// path and sent coreaudiod's CPU spiking. A publish/subscribe pair of atomics
+/// has no such coupling: the IO paths store what they already have in hand,
+/// and the timing thread only loads.
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+static OUT_RATE_BITS: AtomicU64 = AtomicU64::new(0);
+static OUT_VERDICT: AtomicU32 = AtomicU32::new(0);
+/// The disciplined rate most recently seen on the INPUT ring (0 = none).
+static IN_RATE_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// A clock block's rate, if it is usable as a device timeline basis.
+fn usable_rate(cb: &avb_audioring::ClockBlock) -> Option<f64> {
+    (cb.locked && cb.rate_hz_vs_mach.is_finite() && cb.rate_hz_vs_mach > 0.0)
+        .then_some(cb.rate_hz_vs_mach)
+}
+
+fn store_rate(slot: &AtomicU64, rate: Option<f64>) {
+    slot.store(rate.unwrap_or(0.0).to_bits(), Ordering::Relaxed);
+}
+
+fn load_rate(slot: &AtomicU64) -> Option<f64> {
+    let r = f64::from_bits(slot.load(Ordering::Relaxed));
+    (r.is_finite() && r > 0.0).then_some(r)
+}
+
+/// Publish what the OUTPUT ring says. Called from the write path, which
+/// already holds the output ring.
+pub fn publish_out_clock(ring: &avb_audioring::AudioRing) {
+    OUT_VERDICT.store(ring.effective_clock(), Ordering::Relaxed);
+    store_rate(
+        &OUT_RATE_BITS,
+        ring.read_clock().as_ref().and_then(usable_rate),
+    );
+}
+
+/// Publish what the INPUT ring says. Called from the read path.
+pub fn publish_in_clock(ring: &avb_audioring::AudioRing) {
+    store_rate(
+        &IN_RATE_BITS,
+        ring.read_clock().as_ref().and_then(usable_rate),
+    );
+}
+
+/// Forget the output ring's basis when its mapping is dropped, so a stale rate
+/// cannot outlive the ring it came from.
+pub fn clear_out_clock() {
+    OUT_VERDICT.store(0, Ordering::Relaxed);
+    OUT_RATE_BITS.store(0, Ordering::Relaxed);
+}
+
+/// The rate the device timeline should run at, or `None` for nominal.
+///
+/// LOCK-FREE and safe to call from the HAL's timing path: it only loads
+/// atomics published by the IO paths.
+///
+/// THE DAEMON DECIDES, THIS FOLLOWS. The daemon is the only process that sees
+/// the user's selection, the gPTP servo and a recovered media clock at once,
+/// so it resolves them and publishes both a basis and a verdict. Deciding here
+/// would override the user: a session both recording and playing has a locked
+/// input-ring clock, so preferring it would put the device on the 16R's clock
+/// even when the user explicitly chose the Mac's.
+///
+/// A `MacInternal` verdict returns `None` and STOPS — it is a decision, not an
+/// absence, so we must not go looking for another clock. Verdict 0 means no
+/// clock-aware daemon has written one (or none is running), and only then does
+/// the input ring's recovered clock apply; that covers a record-only session
+/// and a daemon predating clock selection.
+///
+/// This device has ONE timeline for both directions (a single
+/// `GetZeroTimeStamp` serving the input and output streams), so whatever is
+/// returned here governs the rate CoreAudio both delivers and consumes at.
 pub fn ring_disciplined_rate_hz() -> Option<f64> {
-    let guard = IO.lock().ok()?;
-    let state = guard.as_ref()?;
-    let cb = state.shm.ring().read_clock()?;
-    if cb.locked && cb.rate_hz_vs_mach.is_finite() && cb.rate_hz_vs_mach > 0.0 {
-        Some(cb.rate_hz_vs_mach)
-    } else {
-        None
+    match avb_config::EffectiveClock::from_code(OUT_VERDICT.load(Ordering::Relaxed)) {
+        Some(avb_config::EffectiveClock::MacInternal(_)) => None,
+        Some(_) => load_rate(&OUT_RATE_BITS),
+        None => load_rate(&IN_RATE_BITS),
     }
 }
 
@@ -910,6 +1035,9 @@ pub extern "C" fn do_io_operation(
             }
             state.read_frame = consumer.read_frame();
             if log_now {
+                // Publish the recovered media clock for GetZeroTimeStamp,
+                // which must not take this lock itself (see IN_RATE_BITS).
+                publish_in_clock(state.shm.ring());
                 oslog(&format!(
                     "[avb-coreaudio] read got={got} want={want} avail={avail} write={} cursor={}",
                     consumer.write_frame(),
@@ -949,16 +1077,33 @@ fn write_mix(frames: UInt32, io_main_buffer: *mut c_void) -> OSStatus {
     // Lazy attach (review H2): coreaudiod usually starts IO before the daemon
     // creates the output ring, so retry here — throttled to once per second so
     // a missing ring costs one failed open() per second, not one per cycle.
-    if guard.is_none() {
+    // The same throttled tick drops a mapping whose ring the daemon has
+    // replaced, which is what makes a daemon RESTART recover instead of
+    // writing into an orphaned ring forever.
+    {
         static LAST_TRY: AtomicU64 = AtomicU64::new(0);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if LAST_TRY.swap(now, Ordering::Relaxed) != now {
-            *guard = attach_out();
-            if guard.is_some() {
-                oslog("[avb-coreaudio] IO: attached output ring (lazy retry in WriteMix)");
+            if guard.as_ref().is_some_and(out_ring_is_stale) {
+                oslog("[avb-coreaudio] IO: output ring replaced — reattaching");
+                *guard = None; // drop the old mapping before remapping
+                               // Forget its basis too: a rate must not outlive its ring.
+                clear_out_clock();
+            }
+            if guard.is_none() {
+                *guard = attach_out();
+                if guard.is_some() {
+                    oslog("[avb-coreaudio] IO: attached output ring (lazy retry in WriteMix)");
+                }
+            }
+            // Publish the daemon's basis and verdict for GetZeroTimeStamp,
+            // which must not take this lock itself (see OUT_RATE_BITS).
+            match guard.as_ref() {
+                Some(s) => publish_out_clock(s.prod.ring()),
+                None => clear_out_clock(),
             }
         }
     }
@@ -1014,5 +1159,118 @@ mod tests {
         let s = 123_456_789i32;
         let back = f32_to_s32(s as f32 / 2_147_483_648.0);
         assert!((i64::from(back) - i64::from(s)).abs() <= 64);
+    }
+
+    /// THE REGRESSION THIS EXISTS FOR.
+    ///
+    /// `GetZeroTimeStamp` calls `ring_disciplined_rate_hz` on every call from
+    /// the HAL's timing thread. An earlier version read the rings directly and
+    /// took the `OUT_IO` lock — the same lock `write_mix` holds inside the
+    /// realtime audio callback — which put a mutex between the timing thread
+    /// and the realtime path and sent coreaudiod's CPU spiking on hardware.
+    ///
+    /// So the contract is: it must be callable WHILE the IO locks are held.
+    /// Against the old lock-taking version this deadlocks; against the
+    /// lock-free one it returns at once. Bounded by a channel timeout so a
+    /// regression fails loudly instead of hanging the suite.
+    #[test]
+    fn the_timing_path_does_not_wait_on_the_io_locks() {
+        let out = OUT_IO.lock().expect("OUT_IO");
+        let inp = IO.lock().expect("IO");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let _ = tx.send(ring_disciplined_rate_hz());
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(
+            got.is_ok(),
+            "ring_disciplined_rate_hz blocked while the IO locks were held — \
+             the HAL's timing thread must never wait on the realtime path"
+        );
+        drop(out);
+        drop(inp);
+        h.join().expect("joined");
+    }
+
+    /// The daemon's verdict decides, and a Mac verdict is a DECISION: it must
+    /// stop the search rather than fall through to the input ring's clock.
+    /// Otherwise a session that both records and plays would be put on the
+    /// 16R's clock even when the user explicitly chose the Mac's.
+    #[test]
+    fn a_mac_verdict_overrides_a_locked_input_ring() {
+        use avb_config::{EffectiveClock, FallbackReason};
+        // Serialised against the other atomic-touching test by running the
+        // state changes in one test body.
+        store_rate(&IN_RATE_BITS, Some(47_994.0));
+
+        // No verdict (code 0: no clock-aware daemon) -> the input ring applies.
+        OUT_VERDICT.store(0, Ordering::Relaxed);
+        assert_eq!(ring_disciplined_rate_hz(), Some(47_994.0));
+
+        // A Mac verdict -> nominal, NOT the input ring's rate.
+        OUT_VERDICT.store(
+            EffectiveClock::MacInternal(FallbackReason::Selected).code(),
+            Ordering::Relaxed,
+        );
+        assert_eq!(
+            ring_disciplined_rate_hz(),
+            None,
+            "a Mac verdict must not fall through to the input ring"
+        );
+
+        // A network verdict -> the OUTPUT ring's basis, not the input's.
+        OUT_VERDICT.store(EffectiveClock::NetworkGptp.code(), Ordering::Relaxed);
+        store_rate(&OUT_RATE_BITS, Some(48_004.8));
+        assert_eq!(ring_disciplined_rate_hz(), Some(48_004.8));
+
+        // A network verdict with no basis published yet is nominal, not the
+        // input ring's: the daemon said which clock, we just have no rate.
+        store_rate(&OUT_RATE_BITS, None);
+        assert_eq!(ring_disciplined_rate_hz(), None);
+
+        // Clearing forgets both, so a rate cannot outlive its ring.
+        clear_out_clock();
+        store_rate(&IN_RATE_BITS, None);
+        assert_eq!(ring_disciplined_rate_hz(), None);
+    }
+
+    /// A zero, non-finite or negative rate is not a clock. These reach us from
+    /// shared memory a separate process writes, so they are not hypothetical.
+    #[test]
+    fn a_nonsense_rate_is_not_published_as_one() {
+        let slot = AtomicU64::new(0);
+        assert_eq!(load_rate(&slot), None, "0 bits means 'none'");
+        store_rate(&slot, Some(f64::NAN));
+        assert_eq!(load_rate(&slot), None);
+        store_rate(&slot, Some(f64::INFINITY));
+        assert_eq!(load_rate(&slot), None);
+        store_rate(&slot, Some(-48_000.0));
+        assert_eq!(load_rate(&slot), None);
+        store_rate(&slot, Some(0.0));
+        assert_eq!(load_rate(&slot), None);
+        // A real rate survives the round trip exactly.
+        store_rate(&slot, Some(47_994.123));
+        assert_eq!(load_rate(&slot), Some(47_994.123));
+    }
+
+    /// The device's width and the daemon's ring width MUST be the same number.
+    ///
+    /// A HAL device's channel count is fixed when the device is published, so
+    /// the two ends cannot negotiate: if they disagree the attach below
+    /// refuses the ring and the result is silence, not an error the user sees.
+    /// Asserted against the shared constant AND against the literal 64, so
+    /// changing either one alone fails here rather than on a hardware run.
+    #[test]
+    fn the_device_width_matches_the_rings_the_daemon_creates() {
+        assert_eq!(DEVICE_CHANNELS, avb_audioring::DEVICE_CHANNELS);
+        assert_eq!(DEVICE_CHANNELS, 64);
+        assert_eq!(avb_audioring::CHANNELS_PER_STREAM, 8);
+        assert_eq!(avb_audioring::STREAMS_PER_DIRECTION, 8);
+        // The ASBD the device publishes must describe that same width, or
+        // CoreAudio reads past the end of every frame we hand it.
+        let a = device_asbd(DEVICE_RATE);
+        assert_eq!(a.mChannelsPerFrame, DEVICE_CHANNELS);
+        assert_eq!(a.mBytesPerFrame, DEVICE_CHANNELS * 4);
+        assert_eq!(a.mBytesPerPacket, DEVICE_CHANNELS * 4);
     }
 }

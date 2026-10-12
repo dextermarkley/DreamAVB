@@ -21,10 +21,41 @@ pub mod ring;
 pub mod shm;
 
 pub use consumer::Consumer;
-pub use layout::{RingConfig, StreamSlot};
+pub use layout::{counter, RingConfig, StreamSlot};
 pub use producer::{Producer, SampleFormat};
 pub use ring::{AudioRing, RingError};
 pub use shm::{ShmProducer, ShmRing, SHM_NAME, SHM_NAME_OUT};
+
+/// The DreamAVB device's full channel width, in ONE place.
+///
+/// The 16R exposes eight 8-channel AAF streams in each direction ("Send 1-8"
+/// .. "Send 57-64" and the matching "Return" sinks), so the device is 64
+/// channels wide each way.
+///
+/// This is shared rather than defined per crate because the two ends MUST
+/// agree and cannot negotiate: a HAL device's channel count is fixed when the
+/// device is published, long before any ring exists, while the daemon creates
+/// its rings when it runs. The plug-in therefore refuses a ring whose width
+/// differs — which is the right failure, but it is silent audio, so the width
+/// must not be able to drift. The daemon always creates rings this wide
+/// regardless of how many streams are actually bound; the channels belonging
+/// to an unbound stream are simply never written and read as silence.
+pub const DEVICE_CHANNELS: u32 = 64;
+
+/// Channels carried by one AVB stream, and therefore by one ring slot.
+pub const CHANNELS_PER_STREAM: u32 = 8;
+
+/// How many AVB streams make up the device's width in one direction.
+pub const STREAMS_PER_DIRECTION: u32 = DEVICE_CHANNELS / CHANNELS_PER_STREAM;
+
+const _: () = {
+    assert!(
+        DEVICE_CHANNELS.is_multiple_of(CHANNELS_PER_STREAM),
+        "the device width must be a whole number of streams, or a slot's \
+         channel range would run past the end of a frame"
+    );
+    assert!(STREAMS_PER_DIRECTION == 8);
+};
 
 /// The media-clock model carried in the ring's clock block (§10.6). Mirrors
 /// `avb_mediaclock::ClockModel`; kept here so the ring crate does not depend

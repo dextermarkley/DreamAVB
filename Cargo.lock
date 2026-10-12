@@ -84,6 +84,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "avb-config"
+version = "0.1.0"
+
+[[package]]
 name = "avb-core"
 version = "0.1.0"
 
@@ -92,6 +96,7 @@ name = "avb-coreaudio"
 version = "0.1.0"
 dependencies = [
  "avb-audioring",
+ "avb-config",
  "libc",
 ]
 
@@ -103,6 +108,7 @@ dependencies = [
  "avb-audioring",
  "avb-avdecc",
  "avb-avtp",
+ "avb-config",
  "avb-core",
  "avb-dext",
  "avb-gptp",

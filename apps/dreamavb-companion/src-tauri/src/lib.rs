@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use avb_config::{auto_select_nic, AutoSelectOutcome, ClockSource, Config, EffectiveClock};
 use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -99,6 +100,15 @@ fn helper_path(name: &str) -> PathBuf {
                     .join(name),
             );
         }
+    }
+    // Installed from the .pkg, DreamAVB.app and AVBInstaller.app are SIBLINGS
+    // in /Applications: the helpers are then neither beside our binary nor
+    // nested under it, so both candidates above miss and we used to fall
+    // through to a bare binary name resolved against PATH — which does not
+    // contain them. Ask installer_app() where the bundle actually is instead
+    // of hardcoding a second copy of that search.
+    if let Some(app) = installer_app() {
+        cands.push(app.join("Contents/MacOS").join(name));
     }
     // Dev run: this crate is apps/dreamavb-companion/src-tauri, so the
     // workspace root is three levels up.
@@ -278,11 +288,22 @@ fn ethernet_ports() -> Vec<EthPort> {
 /// True if OUR dext is the registered driver for the I210 (so the device has
 /// no enX interface). Narrow `ioreg` query, not a whole-registry dump.
 fn dext_owns_i210() -> bool {
+    // `-rn <name>` only. Combining `-c IOUserService` with `-n AVBI210Driver`
+    // returns NOTHING even when the dext is attached and driving the device
+    // (verified against a live I210 whose dext answered avb-probe): ioreg does
+    // not intersect the two filters the way it reads like it should, so the
+    // class filter silently discarded the name match and this reported that the
+    // default driver owned the NIC while ours actually did.
     Command::new("/usr/sbin/ioreg")
-        .args(["-r", "-c", "IOUserService", "-n", "AVBI210Driver"])
+        .args(["-rn", "AVBI210Driver"])
         .output()
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("AVBI210Driver"))
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            // Require the bundle id too, so a stray name match elsewhere in the
+            // registry cannot be mistaken for our attached service.
+            s.contains("AVBI210Driver") && s.contains("com.avbaudio.installer.i210")
+        })
         .unwrap_or(false)
 }
 
@@ -424,8 +445,31 @@ fn status_for(state: DextSysextState, faulted: bool, nic: Option<Nic>) -> Status
     }
 }
 
-/// True if `avb-probe info` reports a dext fault (non-zero exit or a fault
-/// marker in its output). Read-only.
+/// Parse the dext fault CODE out of `avb-probe info` stdout.
+///
+/// The probe ALWAYS prints the word "fault", because `fault` is the field
+/// LABEL and the code is its value — a healthy I210 prints
+/// `stage          timesync   fault 0 (none)`. So a substring test for
+/// "fault" is true for every successful probe, which is exactly what this
+/// used to do: the UI reported a permanent fault on healthy hardware and
+/// could never show Active. Compare the CODE to zero instead.
+///
+/// `None` means no `fault <code>` field was found, which is UNKNOWN rather
+/// than healthy; the caller keeps the established policy of never asserting
+/// a fault without positive evidence.
+fn parse_fault_code(stdout: &str) -> Option<u32> {
+    stdout.lines().find_map(|line| {
+        line.split("fault ")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse::<u32>()
+            .ok()
+    })
+}
+
+/// True if `avb-probe info` reports a dext fault (non-zero exit, or a
+/// non-zero fault code in its output). Read-only.
 fn probe_fault() -> bool {
     match Command::new(helper_path("avb-probe")).arg("info").output() {
         Ok(o) => {
@@ -433,7 +477,9 @@ fn probe_fault() -> bool {
                 return true;
             }
             let s = String::from_utf8_lossy(&o.stdout);
-            s.to_lowercase().contains("fault")
+            // An absent field is unknown, not faulted — same policy as a
+            // probe we could not run at all.
+            parse_fault_code(&s).is_some_and(|code| code != 0)
         }
         // Can't run the probe → don't assert a fault; treat as not-faulted.
         Err(_) => false,
@@ -561,16 +607,805 @@ fn parse_stats(v: &serde_json::Value) -> Stats {
         abi_version: g("abi_version") as u32,
     }
 }
-/// Toggle the main popover window near the tray.
-fn toggle_window(app: &tauri::AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        if w.is_visible().unwrap_or(false) {
-            let _ = w.hide();
-        } else {
-            let _ = w.show();
-            let _ = w.set_focus();
+// ---------------------------------------------------------------------------
+// Clock source
+
+/// One selectable clock-source option, for the UI's `<select>`. Derived from
+/// `ClockSource::ALL` so the UI never hardcodes the list — adding a variant to
+/// the crate adds it here, and to the dropdown, with no UI change.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClockOption {
+    /// The stable token (`ClockSource::as_str`), stored in the config file and
+    /// passed back to `set_clock_source`.
+    pub value: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// The clock-source snapshot the UI renders: both what the user SELECTED and
+/// what is actually IN FORCE, so the UI never claims a clock that is not
+/// running the stream (see `avb_config::EffectiveClock`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClockSourceInfo {
+    /// The selected source's stable token.
+    pub selected: String,
+    /// Every option in UI order, derived from `ClockSource::ALL`.
+    pub options: Vec<ClockOption>,
+    /// Human label of the clock actually in force.
+    pub effective_label: String,
+    /// Why that clock is in force.
+    pub effective_reason: String,
+    /// False when the effective clock is undisciplined (the drift state) — the
+    /// UI warns on this.
+    pub network_disciplined: bool,
+    /// Complaints from `Config::load` (e.g. a malformed config line). Must not
+    /// be swallowed.
+    pub warnings: Vec<String>,
+}
+
+fn clock_options() -> Vec<ClockOption> {
+    ClockSource::ALL
+        .iter()
+        .map(|s| ClockOption {
+            value: s.as_str().to_string(),
+            label: s.label().to_string(),
+            description: s.description().to_string(),
+        })
+        .collect()
+}
+
+/// The effective clock the DAEMON published, read from a ring header.
+///
+/// This replaces an earlier attempt to re-derive the answer here with
+/// `avb_config::resolve`. That could not work: a gPTP servo lock is not
+/// observable from this process (the only read-only `avb-probe` facts,
+/// `info` and `counters`, carry no servo state, and the subcommands that
+/// touch gPTP actively drive the device and would disturb a live stream), so
+/// the gPTP input was hardcoded `false` and every `Network time` selection
+/// reported as the Mac clock even while gPTP was running the stream.
+///
+/// The daemon is the only process that sees the selection, the servo and a
+/// recovered media clock at once, so it resolves them and publishes the
+/// verdict. Reading one field it wrote cannot be wrong in that way.
+///
+/// Checks the OUTPUT ring first (the talker's, where the verdict is written),
+/// then the input ring. `None` means no daemon is running, or one too old to
+/// publish a verdict — which is NOT the same as "undisciplined" and must be
+/// reported differently.
+fn published_effective_clock() -> Option<EffectiveClock> {
+    for name in [avb_audioring::SHM_NAME_OUT, avb_audioring::SHM_NAME] {
+        if let Some(e) = avb_audioring::ShmRing::attach_ro_at(name)
+            .ok()
+            .and_then(|shm| EffectiveClock::from_code(shm.ring().effective_clock()))
+        {
+            return Some(e);
         }
     }
+    None
+}
+
+/// Build the UI snapshot: the user's selection from disk, and what is actually
+/// in force from the daemon.
+fn clock_source_info(cfg: Config, warnings: Vec<String>) -> ClockSourceInfo {
+    let (effective_label, effective_reason, network_disciplined) = match published_effective_clock()
+    {
+        Some(e) => (
+            e.label().to_string(),
+            e.reason().to_string(),
+            e.is_network_disciplined(),
+        ),
+        // No daemon, so nothing is sourcing audio at all. Saying "Mac
+        // internal" here would claim a clock is in use when no stream
+        // exists; say plainly that it is not running.
+        None => (
+            "—".to_string(),
+            "no daemon running; this takes effect when a stream starts".to_string(),
+            false,
+        ),
+    };
+    ClockSourceInfo {
+        selected: cfg.clock_source.as_str().to_string(),
+        options: clock_options(),
+        effective_label,
+        effective_reason,
+        network_disciplined,
+        warnings,
+    }
+}
+
+/// Current clock-source selection + the clock actually in force.
+///
+/// `async` so Tauri runs it off the main thread (review M3): `ring_clock_locked`
+/// touches the shared ring.
+#[tauri::command]
+async fn get_clock_source() -> ClockSourceInfo {
+    let (cfg, warnings) = Config::load();
+    clock_source_info(cfg, warnings)
+}
+
+/// Change the clock source. Unknown tokens are REJECTED, not silently
+/// defaulted — a bad token means a UI bug, and hiding it would leave the user
+/// on a clock they did not pick. On success the config is persisted and the
+/// same snapshot is returned so the UI re-renders from one response.
+#[tauri::command]
+async fn set_clock_source(value: String) -> Result<ClockSourceInfo, String> {
+    let source =
+        ClockSource::parse(&value).ok_or_else(|| format!("unknown clock source {value:?}"))?;
+    // Load-then-mutate so changing the clock does not clobber the other
+    // settings (launch_at_login / auto_select_nic) that share this file.
+    let (mut cfg, _warnings) = Config::load();
+    cfg.clock_source = source;
+    cfg.save()
+        .map_err(|e| format!("could not save settings: {e}"))?;
+    // Reload so any warnings about the on-disk file (and the canonical parse)
+    // are reflected, not just this in-memory value.
+    let (loaded, warnings) = Config::load();
+    Ok(clock_source_info(loaded, warnings))
+}
+
+// ---------------------------------------------------------------------------
+// Launch at login (hand-rolled macOS LaunchAgent)
+//
+// We do NOT use tauri-plugin-autostart: its transitive deps float and break
+// this app's fragile Tauri pin. A LaunchAgent plist is four lines of XML and
+// two launchctl calls, so we own it directly.
+//
+// The agent points at the INSTALLED bundle binary, not this running process:
+// a dev/debug build lives under target/ and must never be what login launches.
+// `com.avbaudio.companion` is the app's bundle identifier (tauri.conf.json),
+// reused as the LaunchAgent label; `DreamAVB` is the productName / executable.
+
+/// The LaunchAgent label, matching the app's bundle identifier.
+const LAUNCH_AGENT_LABEL: &str = "com.avbaudio.companion";
+
+/// The installed binary the LaunchAgent launches. Deliberately the
+/// /Applications bundle, never `current_exe()`: login must start the installed
+/// app, not whatever debug binary happened to register the agent.
+const INSTALLED_BINARY: &str = "/Applications/DreamAVB.app/Contents/MacOS/DreamAVB";
+
+/// Path to the per-user LaunchAgent plist.
+fn launch_agent_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    let mut p = PathBuf::from(home);
+    p.push("Library/LaunchAgents");
+    p.push(format!("{LAUNCH_AGENT_LABEL}.plist"));
+    Some(p)
+}
+
+/// The LaunchAgent plist body. RunAtLoad starts the app at login; the program
+/// is the installed bundle binary.
+fn launch_agent_plist() -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \t<key>Label</key>\n\
+         \t<string>{LAUNCH_AGENT_LABEL}</string>\n\
+         \t<key>ProgramArguments</key>\n\
+         \t<array>\n\
+         \t\t<string>{INSTALLED_BINARY}</string>\n\
+         \t</array>\n\
+         \t<key>RunAtLoad</key>\n\
+         \t<true/>\n\
+         \t<key>ProcessType</key>\n\
+         \t<string>Interactive</string>\n\
+         </dict>\n\
+         </plist>\n"
+    )
+}
+
+/// `gui/<uid>` domain target for launchctl.
+fn gui_domain() -> String {
+    // getuid() is always available; no unsafe surprises in the value.
+    let uid = unsafe { libc_getuid() };
+    format!("gui/{uid}")
+}
+
+// We take the uid without pulling in the `libc` crate (avb-config stays
+// dependency-free, and the app's dep set is pinned): one extern declaration.
+extern "C" {
+    #[link_name = "getuid"]
+    fn libc_getuid() -> u32;
+}
+
+/// Load the agent into the running GUI session. Tries the modern
+/// `bootstrap` subcommand first and falls back to the legacy `load -w`, which
+/// older macOS releases need. Best-effort: a failure to load does not undo the
+/// plist (the user's choice is still persisted and the agent is in place for
+/// the next login), but it IS surfaced.
+fn launchctl_bootstrap(plist: &Path) -> Result<(), String> {
+    let domain = gui_domain();
+    let modern = Command::new("/bin/launchctl")
+        .args(["bootstrap", &domain])
+        .arg(plist)
+        .output();
+    if let Ok(o) = &modern {
+        if o.status.success() {
+            return Ok(());
+        }
+    }
+    // Legacy fallback.
+    let legacy = Command::new("/bin/launchctl")
+        .args(["load", "-w"])
+        .arg(plist)
+        .output()
+        .map_err(|e| format!("launchctl load failed to run: {e}"))?;
+    if legacy.status.success() {
+        Ok(())
+    } else {
+        let msg = String::from_utf8_lossy(&legacy.stderr).trim().to_string();
+        Err(if msg.is_empty() {
+            "launchctl could not load the LaunchAgent".to_string()
+        } else {
+            msg
+        })
+    }
+}
+
+/// Unload the agent from the running GUI session (modern `bootout`, legacy
+/// `unload -w` fallback). Best-effort: errors are tolerated because the real
+/// disable is DELETING the plist (done by the caller) — an unload that fails
+/// because the agent was never loaded is not an error we should surface.
+fn launchctl_bootout(plist: &Path) {
+    let domain = gui_domain();
+    let target = format!("{domain}/{LAUNCH_AGENT_LABEL}");
+    let modern = Command::new("/bin/launchctl")
+        .args(["bootout", &target])
+        .output();
+    if matches!(&modern, Ok(o) if o.status.success()) {
+        return;
+    }
+    let _ = Command::new("/bin/launchctl")
+        .args(["unload", "-w"])
+        .arg(plist)
+        .output();
+}
+
+/// Snapshot the launch-at-login state the UI renders.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaunchAtLoginInfo {
+    /// The user's persisted preference.
+    pub enabled: bool,
+    /// Whether the LaunchAgent plist actually exists on disk. The UI can show
+    /// a discrepancy (preference on, plist missing) rather than claiming it is
+    /// active when it could not be installed.
+    pub plist_present: bool,
+    /// A non-fatal note (e.g. "could not reach launchctl") so the UI never
+    /// silently claims success. Empty when all is well.
+    pub note: String,
+}
+
+/// Current launch-at-login setting (from config) plus whether the plist is
+/// actually present.
+#[tauri::command]
+async fn get_launch_at_login() -> LaunchAtLoginInfo {
+    let (cfg, _warnings) = Config::load();
+    let plist_present = launch_agent_path().map(|p| p.exists()).unwrap_or(false);
+    LaunchAtLoginInfo {
+        enabled: cfg.launch_at_login,
+        plist_present,
+        note: String::new(),
+    }
+}
+
+/// Turn launch-at-login on or off.
+///
+/// ON: write the plist and `bootstrap`/`load` it.
+/// OFF: `bootout`/`unload` it AND DELETE the plist — disabling without deleting
+/// would leave a dormant agent that a future `load` could resurrect, which is
+/// not what "off" means.
+///
+/// The preference is persisted either way. If launchctl itself fails (e.g. a
+/// sandbox blocks it), the plist is still written/removed correctly and the
+/// returned `note` says what could not be verified — we never claim the agent
+/// is live when we could not confirm it.
+#[tauri::command]
+async fn set_launch_at_login(enabled: bool) -> Result<LaunchAtLoginInfo, String> {
+    let path = launch_agent_path()
+        .ok_or_else(|| "HOME is unset; cannot locate ~/Library/LaunchAgents".to_string())?;
+
+    // Persist the preference first so the daemon/app agree regardless of what
+    // launchctl does next.
+    let (mut cfg, _warnings) = Config::load();
+    cfg.launch_at_login = enabled;
+    cfg.save()
+        .map_err(|e| format!("could not save settings: {e}"))?;
+
+    let mut note = String::new();
+    if enabled {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        }
+        std::fs::write(&path, launch_agent_plist())
+            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+        if let Err(e) = launchctl_bootstrap(&path) {
+            // Plist is in place for next login; just could not load it now.
+            note = format!(
+                "LaunchAgent written to {} but launchctl could not load it this session ({e}); \
+                 it will take effect at next login",
+                path.display()
+            );
+        }
+    } else {
+        // Unload first (best-effort), then DELETE the plist so "off" means gone.
+        launchctl_bootout(&path);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("could not delete {}: {e}", path.display())),
+        }
+    }
+
+    let plist_present = path.exists();
+    Ok(LaunchAtLoginInfo {
+        enabled,
+        plist_present,
+        note,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Auto-select NIC
+
+/// Snapshot the auto-select setting + the result of applying it right now.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AutoSelectInfo {
+    /// The user's persisted preference.
+    pub enabled: bool,
+    /// When enabled and unambiguous, the BSD name to select (may be empty when
+    /// our dext owns the device and no enX interface remains). `None` when
+    /// disabled or when no selection was made.
+    pub selected_bsd: Option<String>,
+    /// Human reason, shown when nothing was selected (none / ambiguous), or
+    /// empty on a clean single-NIC selection. Never guesses.
+    pub reason: String,
+}
+
+/// Build the auto-select snapshot from the current config and NIC list.
+///
+/// PURE given the NIC list, so it is testable without `system_profiler`. It
+/// SELECTS ONLY: it returns a BSD name for the UI to set in the dropdown and
+/// NOTHING else — it never activates the driver (that is `enable_driver`, an
+/// explicit user action), per the product rule.
+fn auto_select_info(cfg: Config, nics: &[Nic]) -> AutoSelectInfo {
+    if !cfg.auto_select_nic {
+        return AutoSelectInfo {
+            enabled: false,
+            selected_bsd: None,
+            reason: String::new(),
+        };
+    }
+    let supported: Vec<String> = nics
+        .iter()
+        .filter(|n| n.supported)
+        .map(|n| n.bsd_name.clone())
+        .collect();
+    match auto_select_nic(&supported) {
+        AutoSelectOutcome::Selected { bsd_name } => AutoSelectInfo {
+            enabled: true,
+            selected_bsd: Some(bsd_name),
+            reason: String::new(),
+        },
+        AutoSelectOutcome::NoneSupported => AutoSelectInfo {
+            enabled: true,
+            selected_bsd: None,
+            reason: "no supported NIC to select (only the Intel I210 is supported)".to_string(),
+        },
+        AutoSelectOutcome::Ambiguous { count } => AutoSelectInfo {
+            enabled: true,
+            selected_bsd: None,
+            reason: format!("{count} supported NICs found — pick one; auto-select won't guess"),
+        },
+    }
+}
+
+/// Current auto-select setting (from config).
+#[tauri::command]
+async fn get_auto_select_nic() -> bool {
+    Config::load().0.auto_select_nic
+}
+
+/// Change the auto-select setting, persisting it. Returns the snapshot of
+/// applying it to the CURRENT NIC list, so the UI can set the dropdown (or show
+/// why it could not) in one response. SELECTS ONLY — never activates anything.
+#[tauri::command]
+async fn set_auto_select_nic(enabled: bool) -> Result<AutoSelectInfo, String> {
+    let (mut cfg, _warnings) = Config::load();
+    cfg.auto_select_nic = enabled;
+    cfg.save()
+        .map_err(|e| format!("could not save settings: {e}"))?;
+    let nics = list_nics();
+    Ok(auto_select_info(cfg, &nics))
+}
+
+/// Evaluate auto-select against the current NIC list without changing the
+/// setting — the UI calls this once at startup to decide the initial NIC.
+#[tauri::command]
+async fn eval_auto_select_nic() -> AutoSelectInfo {
+    let (cfg, _warnings) = Config::load();
+    let nics = list_nics();
+    auto_select_info(cfg, &nics)
+}
+
+// ---- The audio engine: one duplex daemon, both directions ------------------
+//
+// This is what makes the app able to deliver audio without the user running a
+// command. It supervises exactly ONE `avb-daemon duplex` process.
+//
+// One, not two, because the dext allows a single RingAttach per connection: a
+// second daemon attaching the same I210 is refused with
+// kIOReturnExclusiveAccess and exits Owned (9). So `play` + `record` side by
+// side cannot work, and `duplex` runs both directions in one loop.
+
+/// The running duplex daemon, if any.
+static AUDIO: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+/// Where the daemon's own output goes, so a failed start is diagnosable
+/// instead of silent. The app has no console to inherit.
+fn audio_log_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    let mut p = PathBuf::from(home);
+    p.push("Library/Logs/DreamAVB-daemon.log");
+    Some(p)
+}
+
+/// What the UI shows for the audio engine.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AudioStatus {
+    pub running: bool,
+    pub pid: Option<u32>,
+    /// Why it is not running, when it is not. Empty while running.
+    pub reason: String,
+    /// Where the daemon's log is, so the UI can point at it.
+    pub log_path: String,
+}
+
+/// Reap the child if it has exited, so `running` reflects reality rather than
+/// "we spawned something once". A daemon that exited on its own — no link, the
+/// rings owned by another client, gPTP never locked — must not read as
+/// running.
+fn audio_status_locked(slot: &mut Option<std::process::Child>) -> AudioStatus {
+    let log_path = audio_log_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let Some(child) = slot.as_mut() else {
+        return AudioStatus {
+            running: false,
+            pid: None,
+            reason: "not started".into(),
+            log_path,
+        };
+    };
+    match child.try_wait() {
+        // Still running.
+        Ok(None) => AudioStatus {
+            running: true,
+            pid: Some(child.id()),
+            reason: String::new(),
+            log_path,
+        },
+        // Exited by itself. Report the code: the daemon's exit codes are
+        // meaningful (9 = rings owned by another client, 6 = nothing
+        // discovered, 5 = no link), so passing it through is the difference
+        // between a usable message and "it stopped".
+        Ok(Some(st)) => {
+            let code = st.code().unwrap_or(-1);
+            *slot = None;
+            AudioStatus {
+                running: false,
+                pid: None,
+                reason: format!("the audio daemon exited with code {code} — see the log"),
+                log_path,
+            }
+        }
+        Err(e) => AudioStatus {
+            running: false,
+            pid: None,
+            reason: format!("could not read the audio daemon's state: {e}"),
+            log_path,
+        },
+    }
+}
+
+#[tauri::command]
+async fn audio_status() -> AudioStatus {
+    let mut guard = match AUDIO.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    audio_status_locked(&mut guard)
+}
+
+#[tauri::command]
+async fn start_audio() -> Result<AudioStatus, String> {
+    let mut guard = match AUDIO.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    // Idempotent: a second start must not spawn a second daemon, which the
+    // dext would refuse anyway — and the refusal would look like a fault.
+    let cur = audio_status_locked(&mut guard);
+    if cur.running {
+        return Ok(cur);
+    }
+
+    // The driver must own the NIC first. Starting the daemon against the OS
+    // default driver fails in a way that reads like a daemon bug, so say the
+    // real thing instead.
+    let st = current_status();
+    if st.state != DriverState::Active {
+        return Err(
+            "turn DreamAVB on for the network interface first — the audio daemon needs the \
+             driver to own the device"
+                .to_string(),
+        );
+    }
+
+    let bin = helper_path("avb-daemon");
+    let log = audio_log_path().ok_or_else(|| "HOME is not set".to_string())?;
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Append rather than truncate: the previous run's failure is usually what
+    // explains the current one.
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| format!("could not open {}: {e}", log.display()))?;
+    let err = out
+        .try_clone()
+        .map_err(|e| format!("could not open {}: {e}", log.display()))?;
+
+    // No --seconds: run until we stop it.
+    let child = Command::new(&bin)
+        .arg("duplex")
+        .arg("--log-level")
+        .arg("info")
+        .stdout(out)
+        .stderr(err)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", bin.display()))?;
+    *guard = Some(child);
+    Ok(audio_status_locked(&mut guard))
+}
+
+#[tauri::command]
+async fn stop_audio() -> Result<AudioStatus, String> {
+    let mut guard = match AUDIO.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    stop_audio_locked(&mut guard);
+    Ok(audio_status_locked(&mut guard))
+}
+
+/// Stop the daemon with SIGTERM, not SIGKILL.
+///
+/// The daemon installs signal handlers and shuts down deliberately: it sends an
+/// ADP DEPARTING so the 16R drops us from its entity table immediately. Killed
+/// with SIGKILL it cannot, and the 16R holds a stale entry for the full
+/// 2 × valid_time (20 s), which a restarted daemon then collides with.
+fn stop_audio_locked(slot: &mut Option<std::process::Child>) {
+    let Some(child) = slot.as_mut() else {
+        return;
+    };
+    let pid = child.id();
+    // SIGTERM, then give it a moment to depart cleanly.
+    unsafe { libc_kill(pid as i32, SIGTERM) };
+    for _ in 0..40 {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                *slot = None;
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    // It did not go. Escalate rather than leak a process holding the dext,
+    // which would block every later start.
+    let _ = child.kill();
+    let _ = child.wait();
+    *slot = None;
+}
+
+/// Stop the daemon on app exit. A daemon left running would keep the dext's
+/// rings attached with no UI to stop it.
+pub fn shutdown_audio() {
+    let mut guard = match AUDIO.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    stop_audio_locked(&mut guard);
+}
+
+const SIGTERM: i32 = 15;
+
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Has the popover taken focus since it was last shown?
+static POPOVER_FOCUSED: AtomicBool = AtomicBool::new(false);
+
+/// When the popover was last shown, for the blur grace period below.
+static POPOVER_SHOWN_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How long after `show()` a blur is ignored.
+///
+/// A focus guard alone is NOT enough, and assuming otherwise is why the tray
+/// icon still looked dead after the first fix: `toggle_window` asks for focus
+/// explicitly, so `Focused(true)` arrives at once and arms the guard, the
+/// status item then takes focus back, and the resulting `Focused(false)` hides
+/// the window in the same breath as opening it. A short window of time is the
+/// robust form, because it does not depend on the order macOS delivers focus
+/// events in.
+const BLUR_GRACE: Duration = Duration::from_millis(600);
+
+/// Should a `Focused(false)` event actually hide the popover?
+///
+/// Pure so the grace period is testable without a window: `visible_for` is how
+/// long the popover has been up, `None` when it was never shown.
+fn should_hide_on_blur(ever_focused: bool, visible_for: Option<Duration>) -> bool {
+    match visible_for {
+        Some(d) => ever_focused && d >= BLUR_GRACE,
+        None => false,
+    }
+}
+
+/// Append a line to `~/Library/Logs/DreamAVB.log`.
+///
+/// The tray click path cannot be observed from a test — whether macOS delivers
+/// the click as `Left`+`Up` at all, and what rectangle it reports, is only
+/// knowable from the running app. Two fixes were made from theory before this
+/// existed; this is the instrument.
+fn diag(msg: &str) {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let mut path = std::path::PathBuf::from(home);
+    path.push("Library/Logs");
+    let _ = std::fs::create_dir_all(&path);
+    path.push("DreamAVB.log");
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(f, "[{secs}] {msg}");
+}
+
+/// Show the popover under the tray icon, or hide it if it is already up.
+///
+/// `icon_rect` is the status item's screen rectangle from the click event.
+/// Without it the window keeps whatever position the OS last gave it, which is
+/// why this used to open nowhere near the menu bar — the function was
+/// documented as positioning "near the tray" but never set a position at all.
+fn toggle_window(app: &tauri::AppHandle, icon_rect: Option<tauri::Rect>) {
+    let Some(w) = app.get_webview_window("main") else {
+        diag("toggle: no window labelled 'main'");
+        return;
+    };
+    let visible = w.is_visible().unwrap_or(false);
+    diag(&format!(
+        "toggle: visible_before={visible} rect={icon_rect:?}"
+    ));
+    if visible {
+        let _ = w.hide();
+        *POPOVER_SHOWN_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return;
+    }
+    if let Some(rect) = icon_rect {
+        position_under(&w, rect);
+    }
+    POPOVER_FOCUSED.store(false, Ordering::SeqCst);
+    *POPOVER_SHOWN_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    let shown = w.show();
+    // An Accessory app has no Dock icon and is not "active", so the window
+    // will not come forward on its own: ask for the app AND the window.
+    #[cfg(target_os = "macos")]
+    let _ = w.set_focus();
+    let _ = w.set_always_on_top(true);
+    diag(&format!(
+        "toggle: show={:?} visible_after={:?} pos={:?} size={:?}",
+        shown.is_ok(),
+        w.is_visible(),
+        w.outer_position(),
+        w.outer_size()
+    ));
+}
+
+/// A monitor's physical bounds, for [`popover_position`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MonitorBox {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// Where to put the popover for a status item at `icon_x`/`icon_y`.
+///
+/// Pure so the clamping is testable. Both axes are bounded: clamping only `x`
+/// (as this first did) leaves a `y` from the click event free to put the window
+/// wholly off-screen, which is indistinguishable from a tray icon that does
+/// nothing. `mon` is `None` when the monitor cannot be read, in which case the
+/// icon position is used unclamped.
+fn popover_position(
+    icon_x: f64,
+    icon_y: f64,
+    icon_w: f64,
+    win_w: f64,
+    win_h: f64,
+    mon: Option<MonitorBox>,
+    margin: f64,
+) -> (i32, i32) {
+    // Centre on the icon; just below the menu bar, where the icon's rect ends.
+    let mut x = icon_x + icon_w / 2.0 - win_w / 2.0;
+    let mut y = icon_y + margin / 2.0;
+    if let Some(m) = mon {
+        // max() after min() so a window wider/taller than the screen still
+        // lands on it rather than being pushed off the near edge.
+        x = x.min(m.x + m.w - win_w - margin).max(m.x + margin);
+        y = y.min(m.y + m.h - win_h - margin).max(m.y + margin);
+    }
+    (x.round() as i32, y.round() as i32)
+}
+
+/// Place the popover centred under the status item, clamped onto the screen.
+fn position_under(w: &tauri::WebviewWindow, rect: tauri::Rect) {
+    use tauri::{PhysicalPosition, Position, Size};
+
+    let scale = w.scale_factor().unwrap_or(1.0);
+    let icon = match (rect.position, rect.size) {
+        (Position::Physical(p), Size::Physical(s)) => (p.x as f64, p.y as f64, s.width as f64),
+        (Position::Logical(p), Size::Logical(s)) => (p.x * scale, p.y * scale, s.width * scale),
+        // Mixed units: fall back to the position alone, width unknown.
+        (Position::Physical(p), _) => (p.x as f64, p.y as f64, 0.0),
+        (Position::Logical(p), _) => (p.x * scale, p.y * scale, 0.0),
+    };
+    let (icon_x, icon_y, icon_w) = icon;
+    let (win_w, win_h) = w
+        .outer_size()
+        .map(|s| (s.width as f64, s.height as f64))
+        .unwrap_or((360.0 * scale, 520.0 * scale));
+    let mon = w.current_monitor().ok().flatten().map(|m| {
+        let p = m.position();
+        let s = m.size();
+        MonitorBox {
+            x: f64::from(p.x),
+            y: f64::from(p.y),
+            w: f64::from(s.width),
+            h: f64::from(s.height),
+        }
+    });
+    let (x, y) = popover_position(icon_x, icon_y, icon_w, win_w, win_h, mon, 8.0 * scale);
+    diag(&format!(
+        "position: icon=({icon_x},{icon_y},w={icon_w}) win=({win_w}x{win_h}) mon={mon:?} -> ({x},{y})"
+    ));
+    let _ = w.set_position(Position::Physical(PhysicalPosition { x, y }));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -583,15 +1418,31 @@ pub fn run() {
             disable_driver,
             status,
             stats,
-            open_project_page
+            open_project_page,
+            get_clock_source,
+            set_clock_source,
+            get_launch_at_login,
+            set_launch_at_login,
+            get_auto_select_nic,
+            set_auto_select_nic,
+            eval_auto_select_nic,
+            audio_status,
+            start_audio,
+            stop_audio
         ])
         .setup(|app| {
+            diag("--- DreamAVB starting ---");
             // Menu-bar app: no dock icon.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // "Open" as well as the icon click: a left-click toggle depends on
+            // the tray event arriving as Left+Up, and if anything about that
+            // differs the app looks dead with no other way in. A menu item is
+            // a deterministic path — right-click the icon and pick it.
+            let open = MenuItem::with_id(app, "open", "Open DreamAVB", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit DreamAVB", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&quit])?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
 
             // No unwrap on the icon (review L9): a missing bundle icon used to
             // panic during setup and take the whole app down at launch. A tray
@@ -601,39 +1452,76 @@ pub fn run() {
                 .show_menu_on_left_click(false);
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
+                diag("tray: icon loaded from bundle");
+            } else {
+                diag("tray: NO icon (not running from an .app bundle)");
             }
             let _tray = tray
-                .on_menu_event(|app, event| {
-                    if event.id.as_ref() == "quit" {
-                        app.exit(0);
-                    }
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => app.exit(0),
+                    // No icon rect from a menu item, so the popover keeps its
+                    // last position rather than moving.
+                    "open" => toggle_window(app, None),
+                    _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
+                    // Log EVERY event, not just the one we act on: whether
+                    // macOS delivers the click as Left+Up at all is exactly
+                    // what we could not previously tell.
+                    diag(&format!("tray event: {event:?}"));
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
+                        rect,
                         ..
                     } = event
                     {
-                        toggle_window(tray.app_handle());
+                        toggle_window(tray.app_handle(), Some(rect));
                     }
                 })
                 .build(app)?;
 
             // Menu-bar popover behaviour: close when it loses focus, the way
-            // every other menu-bar app behaves (review L11).
+            // every other menu-bar app behaves (review L11) — but not in the
+            // first moments after being shown. See `BLUR_GRACE`: we ask for
+            // focus ourselves, so a focus-only guard is armed instantly and
+            // the following blur closed the window as fast as it opened.
             if let Some(w) = app.get_webview_window("main") {
                 let hide = w.clone();
-                w.on_window_event(move |ev| {
-                    if let tauri::WindowEvent::Focused(false) = ev {
-                        let _ = hide.hide();
+                w.on_window_event(move |ev| match ev {
+                    tauri::WindowEvent::Focused(true) => {
+                        POPOVER_FOCUSED.store(true, Ordering::SeqCst);
+                        diag("window: focused");
                     }
+                    tauri::WindowEvent::Focused(false) => {
+                        let visible_for = POPOVER_SHOWN_AT
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|t| t.elapsed());
+                        let ever = POPOVER_FOCUSED.load(Ordering::SeqCst);
+                        let hiding = should_hide_on_blur(ever, visible_for);
+                        diag(&format!(
+                            "window: blur ever_focused={ever} visible_for={visible_for:?} hiding={hiding}"
+                        ));
+                        if hiding {
+                            let _ = hide.hide();
+                        }
+                    }
+                    _ => {}
                 });
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running DreamAVB companion");
+        .build(tauri::generate_context!())
+        .expect("error while building DreamAVB companion")
+        .run(|_app, ev| {
+            // Never leave the audio daemon running with no UI to stop it: it
+            // holds the dext's rings attached, so the next start would be
+            // refused with Owned and look like a fault.
+            if let tauri::RunEvent::Exit = ev {
+                shutdown_audio();
+            }
+        });
 }
 
 #[cfg(test)]
@@ -672,6 +1560,50 @@ mod tests {
             status_for(DextSysextState::Enabled, true, Some(nic_i210())).state,
             DriverState::Fault
         );
+    }
+
+    /// Verbatim `avb-probe info` output from the live I210 on 2026-10-12,
+    /// with the dext attached and the link up. The device is HEALTHY: the
+    /// fault code is 0.
+    const HEALTHY_PROBE: &str = "\
+nic            Intel I210 (nic_kind 2, service AVBI210Driver)
+vendor:device  0x15338086   subsystem 0x02141ab6
+hw_rev         0x00000003   (PCI revision ID)
+CTRL           0x081c0241   STATUS 0x00380783   TIMINCA 0x00000000
+stage          timesync   fault 0 (none)
+flags          0x0  link_up=false 1000FD=false
+STATUS link    up=true speed=1000 Mb/s full
+mac            64:4b:f0:12:73:b8   timebase 125/3
+";
+
+    /// Regression: the probe always PRINTS the word "fault" because it is a
+    /// field label, so the old `contains("fault")` test reported a fault on
+    /// every healthy device and the UI could never leave the Fault state.
+    /// This asserts against real captured output, not a constructed string,
+    /// so it cannot pass by restating the parser's own assumption.
+    #[test]
+    fn healthy_probe_output_is_not_a_fault() {
+        assert_eq!(parse_fault_code(HEALTHY_PROBE), Some(0));
+        // The bug, stated directly: the label is present, the fault is not.
+        assert!(HEALTHY_PROBE.contains("fault"));
+        assert!(!parse_fault_code(HEALTHY_PROBE).is_some_and(|c| c != 0));
+    }
+
+    #[test]
+    fn nonzero_fault_code_is_a_fault() {
+        let faulted = HEALTHY_PROBE.replace("fault 0 (none)", "fault 3 (tx_hang)");
+        assert_eq!(parse_fault_code(&faulted), Some(3));
+        assert!(parse_fault_code(&faulted).is_some_and(|c| c != 0));
+    }
+
+    /// An absent field is UNKNOWN, not healthy and not faulted — the caller
+    /// must not assert a fault without positive evidence.
+    #[test]
+    fn missing_fault_field_is_unknown() {
+        assert_eq!(parse_fault_code("nic   Intel I210\nflags 0x0\n"), None);
+        assert_eq!(parse_fault_code(""), None);
+        // A label with no parseable code must not read as a fault either.
+        assert_eq!(parse_fault_code("stage timesync   fault\n"), None);
     }
 
     /// Regression (review M4): a stale enabled record must not report Active
@@ -767,5 +1699,357 @@ mod tests {
             "{s} is in the shared temp dir"
         );
         assert!(s.contains(&std::process::id().to_string()));
+    }
+
+    /// The dropdown options are DERIVED from the crate's `ClockSource::ALL`,
+    /// not hardcoded here or in the UI: same count, same order, and every
+    /// emitted token parses back to the variant it came from (so a value the UI
+    /// sends to `set_clock_source` is always one `ClockSource::parse` accepts).
+    #[test]
+    fn clock_options_are_derived_from_the_crate() {
+        let opts = clock_options();
+        assert_eq!(opts.len(), ClockSource::ALL.len());
+        for (opt, src) in opts.iter().zip(ClockSource::ALL.iter()) {
+            assert_eq!(opt.value, src.as_str());
+            assert_eq!(ClockSource::parse(&opt.value), Some(*src));
+            assert!(!opt.label.is_empty());
+            assert!(!opt.description.is_empty());
+        }
+    }
+
+    /// The snapshot reports the SELECTION from disk and the EFFECTIVE clock
+    /// from the daemon — two different facts, deliberately not conflated. With
+    /// no daemon running the selection is still shown (so the control reflects
+    /// what is saved) while nothing is claimed to be in force.
+    #[test]
+    fn the_selection_is_reported_separately_from_what_is_in_force() {
+        let cfg = Config {
+            clock_source: ClockSource::MacInternal,
+            ..Default::default()
+        };
+        let info = clock_source_info(cfg, vec!["a warning".to_string()]);
+        assert_eq!(info.selected, "mac");
+        // No ring in a unit test, so no verdict is published.
+        assert!(!info.network_disciplined);
+        assert!(
+            info.effective_reason.contains("no daemon"),
+            "got {:?}",
+            info.effective_reason
+        );
+        // Warnings must survive into the snapshot, not be swallowed.
+        assert_eq!(info.warnings, vec!["a warning".to_string()]);
+    }
+
+    /// With no daemon running there is no published verdict, and the snapshot
+    /// must say so rather than naming a clock. Reporting "Mac internal" here
+    /// would claim a clock is sourcing audio when no stream exists at all.
+    #[test]
+    fn no_daemon_reports_no_effective_clock_rather_than_the_mac() {
+        // No ring is attached in a unit test, so this exercises the None arm.
+        assert!(published_effective_clock().is_none());
+        let info = clock_source_info(
+            Config {
+                clock_source: ClockSource::NetworkGptp,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        // The SELECTION is still reported, so the control shows what is saved.
+        assert_eq!(info.selected, "gptp");
+        // But nothing is claimed to be in force.
+        assert!(!info.network_disciplined);
+        assert!(
+            info.effective_reason.contains("no daemon"),
+            "reason should say why there is no effective clock, got {:?}",
+            info.effective_reason
+        );
+        assert_ne!(
+            info.effective_label, "Mac internal",
+            "must not name a clock when none is sourcing audio"
+        );
+    }
+
+    // --- popover show/hide behaviour ---------------------------------------
+
+    #[test]
+    fn blur_is_ignored_before_the_grace_period() {
+        // The regression that made the tray icon look dead: we ask for focus
+        // ourselves, so `Focused(true)` arrives at once and a focus-only guard
+        // is armed. The blur that immediately follows must NOT hide the window.
+        assert!(
+            !should_hide_on_blur(true, Some(Duration::from_millis(5))),
+            "a blur milliseconds after show() must not close the popover"
+        );
+    }
+
+    #[test]
+    fn blur_hides_once_the_popover_has_settled() {
+        assert!(should_hide_on_blur(
+            true,
+            Some(BLUR_GRACE + Duration::from_millis(1))
+        ));
+    }
+
+    #[test]
+    fn blur_does_nothing_when_never_focused_or_never_shown() {
+        assert!(!should_hide_on_blur(false, Some(Duration::from_secs(10))));
+        assert!(!should_hide_on_blur(true, None));
+    }
+
+    const SCREEN: MonitorBox = MonitorBox {
+        x: 0.0,
+        y: 0.0,
+        w: 1920.0,
+        h: 1080.0,
+    };
+
+    #[test]
+    fn popover_centres_under_the_icon() {
+        let (x, y) = popover_position(900.0, 24.0, 24.0, 360.0, 520.0, Some(SCREEN), 8.0);
+        assert_eq!(x, 732, "centred: 900 + 12 - 180");
+        assert_eq!(y, 28, "just below the icon's rect");
+    }
+
+    #[test]
+    fn popover_stays_on_screen_for_a_corner_icon() {
+        // An icon at the far right would otherwise put most of the window past
+        // the screen edge.
+        let (x, _) = popover_position(1900.0, 24.0, 24.0, 360.0, 520.0, Some(SCREEN), 8.0);
+        assert!(
+            x + 360 <= 1920 - 8 + 1,
+            "right edge must stay on screen, got x={x}"
+        );
+    }
+
+    #[test]
+    fn popover_y_is_clamped_too() {
+        // Clamping only x (the first version of this) let a bogus or
+        // flipped-coordinate y put the window wholly off-screen — which looks
+        // exactly like a tray icon that does nothing.
+        let (_, y) = popover_position(900.0, 5000.0, 24.0, 360.0, 520.0, Some(SCREEN), 8.0);
+        assert!(
+            y + 520 <= 1080 - 8 + 1,
+            "bottom edge must stay on screen, got y={y}"
+        );
+    }
+
+    #[test]
+    fn popover_lands_on_screen_when_larger_than_it() {
+        // A window taller than the display must still touch the near edge
+        // rather than be pushed off it by the clamp order.
+        let small = MonitorBox {
+            x: 0.0,
+            y: 0.0,
+            w: 300.0,
+            h: 400.0,
+        };
+        let (x, y) = popover_position(100.0, 24.0, 24.0, 360.0, 520.0, Some(small), 8.0);
+        assert_eq!((x, y), (8, 8), "clamped to the top-left margin");
+    }
+
+    #[test]
+    fn popover_without_a_monitor_uses_the_icon_position() {
+        let (x, y) = popover_position(900.0, 24.0, 24.0, 360.0, 520.0, None, 8.0);
+        assert_eq!((x, y), (732, 28));
+    }
+
+    // --- launch at login ---------------------------------------------------
+
+    fn nic(bsd: &str, supported: bool) -> Nic {
+        Nic {
+            bsd_name: bsd.into(),
+            display: if supported {
+                "Intel I210".into()
+            } else {
+                "Other".into()
+            },
+            pci_id: "—".into(),
+            supported,
+        }
+    }
+
+    /// The LaunchAgent must point at the INSTALLED bundle binary and run at
+    /// login under our bundle-id label. These are the product requirements,
+    /// asserted against literals — not a handler fed its own constant. A plist
+    /// that pointed at the dev binary, or omitted RunAtLoad, would launch the
+    /// wrong thing or nothing at all.
+    #[test]
+    fn launch_agent_plist_targets_the_installed_binary_and_runs_at_load() {
+        let p = launch_agent_plist();
+        assert!(
+            p.contains("<string>/Applications/DreamAVB.app/Contents/MacOS/DreamAVB</string>"),
+            "must launch the installed bundle binary, not a dev build:\n{p}"
+        );
+        assert!(
+            p.contains("<key>Label</key>") && p.contains("<string>com.avbaudio.companion</string>"),
+            "label must be the app's real bundle id:\n{p}"
+        );
+        // RunAtLoad present and true.
+        let run_at_load = p
+            .split("<key>RunAtLoad</key>")
+            .nth(1)
+            .map(|rest| rest.trim_start().starts_with("<true/>"))
+            .unwrap_or(false);
+        assert!(run_at_load, "RunAtLoad must be <true/>:\n{p}");
+        // It must be valid plist XML the loader will accept.
+        assert!(p.starts_with("<?xml"));
+        assert!(p.trim_end().ends_with("</plist>"));
+    }
+
+    /// The agent path is the per-user LaunchAgents directory with the bundle-id
+    /// filename — where launchctl looks for it.
+    #[test]
+    fn launch_agent_path_is_in_user_launchagents() {
+        // Only meaningful when HOME is set in the test env.
+        if let Some(p) = launch_agent_path() {
+            let s = p.to_string_lossy();
+            assert!(
+                s.ends_with("Library/LaunchAgents/com.avbaudio.companion.plist"),
+                "{s}"
+            );
+        }
+    }
+
+    // --- auto-select NIC ---------------------------------------------------
+
+    /// Disabled: no selection, no reason, no matter how many NICs exist.
+    #[test]
+    fn auto_select_disabled_selects_nothing() {
+        let cfg = Config {
+            auto_select_nic: false,
+            ..Default::default()
+        };
+        let info = auto_select_info(cfg, &[nic("en7", true)]);
+        assert!(!info.enabled);
+        assert_eq!(info.selected_bsd, None);
+        assert!(info.reason.is_empty());
+    }
+
+    /// Enabled + exactly one supported NIC -> select it. Unsupported NICs in
+    /// the list are ignored, so a lone I210 beside a Broadcom still selects.
+    #[test]
+    fn auto_select_enabled_picks_the_single_supported_nic() {
+        let cfg = Config {
+            auto_select_nic: true,
+            ..Default::default()
+        };
+        let info = auto_select_info(cfg, &[nic("en8", false), nic("en7", true)]);
+        assert!(info.enabled);
+        assert_eq!(info.selected_bsd, Some("en7".to_string()));
+        assert!(info.reason.is_empty());
+    }
+
+    /// Enabled + zero supported -> nothing selected, a reason given. Never
+    /// activates anything (there is no code path here that could).
+    #[test]
+    fn auto_select_enabled_with_no_supported_nic_explains_itself() {
+        let cfg = Config {
+            auto_select_nic: true,
+            ..Default::default()
+        };
+        let info = auto_select_info(cfg, &[nic("en8", false)]);
+        assert!(info.enabled);
+        assert_eq!(info.selected_bsd, None);
+        assert!(info.reason.contains("no supported NIC"), "{}", info.reason);
+    }
+
+    /// Enabled + two supported -> ambiguous, nothing selected, count surfaced.
+    /// The product rule: never guess which of several the user wants.
+    #[test]
+    fn auto_select_enabled_with_two_supported_is_ambiguous_and_selects_nothing() {
+        let cfg = Config {
+            auto_select_nic: true,
+            ..Default::default()
+        };
+        let info = auto_select_info(cfg, &[nic("en7", true), nic("en9", true)]);
+        assert!(info.enabled);
+        assert_eq!(info.selected_bsd, None);
+        assert!(
+            info.reason.contains('2'),
+            "count should be surfaced: {}",
+            info.reason
+        );
+    }
+
+    // --- the audio engine -------------------------------------------------
+    //
+    // The supervisor's one job that can silently lie is `running`: a daemon
+    // that exited by itself must not keep reading as running, or the UI shows
+    // audio flowing when the process is gone. These drive real child
+    // processes rather than asserting our own constants back at us.
+
+    #[test]
+    fn audio_status_with_nothing_started_is_not_running() {
+        let mut slot = None;
+        let st = audio_status_locked(&mut slot);
+        assert!(!st.running);
+        assert_eq!(st.pid, None);
+        assert_eq!(st.reason, "not started");
+    }
+
+    #[test]
+    fn a_daemon_that_exited_stops_reading_as_running_and_reports_its_code() {
+        // `false` exits 1 immediately — stands in for the daemon exiting on
+        // its own (no link, rings owned, gPTP never locked).
+        let child = Command::new("/usr/bin/false")
+            .spawn()
+            .expect("spawn /usr/bin/false");
+        let mut slot = Some(child);
+        // Give it a moment to actually exit, then poll until reaped.
+        let mut st = audio_status_locked(&mut slot);
+        for _ in 0..100 {
+            if !st.running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            st = audio_status_locked(&mut slot);
+        }
+        assert!(!st.running, "an exited daemon must not read as running");
+        assert!(
+            st.reason.contains("exited with code 1"),
+            "the exit code is how the user learns WHY: {}",
+            st.reason
+        );
+        // Reaped, so the slot is cleared and a restart is possible.
+        assert!(slot.is_none(), "the exited child must be cleared");
+    }
+
+    #[test]
+    fn a_live_daemon_reads_as_running_with_its_pid() {
+        // `sleep` stands in for a daemon that is up and staying up.
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let expected = child.id();
+        let mut slot = Some(child);
+        let st = audio_status_locked(&mut slot);
+        assert!(st.running);
+        assert_eq!(st.pid, Some(expected));
+        assert!(st.reason.is_empty(), "no reason while running");
+        // stop_audio_locked must actually reap it, not leak a process that
+        // would hold the driver's rings and block every later start.
+        stop_audio_locked(&mut slot);
+        assert!(slot.is_none(), "stop must clear the slot");
+    }
+
+    #[test]
+    fn stop_is_safe_when_nothing_is_running() {
+        let mut slot = None;
+        stop_audio_locked(&mut slot);
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn the_daemon_log_lives_under_the_users_logs_folder() {
+        if std::env::var_os("HOME").is_none() {
+            return;
+        }
+        let p = audio_log_path().expect("HOME is set");
+        let s = p.display().to_string();
+        assert!(
+            s.ends_with("/Library/Logs/DreamAVB-daemon.log"),
+            "unexpected log path: {s}"
+        );
     }
 }

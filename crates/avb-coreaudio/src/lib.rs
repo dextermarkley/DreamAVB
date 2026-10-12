@@ -402,12 +402,68 @@ mod io_op_tests {
         assert_eq!(c.anchor_ns, 0.0, "tiny jitter must not re-anchor");
     }
 
+    /// The FourCCs MUST equal the values in <CoreAudio/AudioServerPlugIn.h>,
+    /// pinned here as literals.
+    ///
+    /// The previous version of this test asserted
+    /// `op_is_handled(kAudioServerPlugInIOOperationWriteMix)` and rejected a
+    /// list of INVENTED codes ("cvtm", "cvti", "proc"). That is a tautology: it
+    /// compares our constant against itself, so it passed while WriteMix was
+    /// declared 'wmix' instead of Apple's 'rite'. The HAL offered 'rite',
+    /// nothing matched, the plug-in declined WriteMix, and playback transmitted
+    /// pure silence — 1,437,707 PDUs, 1,437,707 underruns on real hardware —
+    /// with the whole suite green. Pin the numbers, not our own symbols.
+    #[test]
+    fn io_operation_fourccs_match_the_sdk() {
+        assert_eq!(kAudioServerPlugInIOOperationThread, 0x7468_7264); // 'thrd'
+        assert_eq!(kAudioServerPlugInIOOperationCycle, 0x6379_636c); // 'cycl'
+        assert_eq!(kAudioServerPlugInIOOperationReadInput, 0x7265_6164); // 'read'
+        assert_eq!(kAudioServerPlugInIOOperationConvertInput, 0x6369_6e70); // 'cinp'
+        assert_eq!(kAudioServerPlugInIOOperationProcessInput, 0x7069_6e70); // 'pinp'
+        assert_eq!(kAudioServerPlugInIOOperationProcessOutput, 0x706f_7574); // 'pout'
+        assert_eq!(kAudioServerPlugInIOOperationMixOutput, 0x6d69_786f); // 'mixo'
+        assert_eq!(kAudioServerPlugInIOOperationProcessMix, 0x706d_6978); // 'pmix'
+        assert_eq!(kAudioServerPlugInIOOperationConvertMix, 0x636d_6978); // 'cmix'
+                                                                          // The one that was wrong. 'rite', NOT 'wmix'.
+        assert_eq!(kAudioServerPlugInIOOperationWriteMix, 0x7269_7465);
+        assert_ne!(
+            kAudioServerPlugInIOOperationWriteMix,
+            u32::from_be_bytes(*b"wmix"),
+            "WriteMix must not regress to the guessed FourCC"
+        );
+    }
+
+    /// Stream terminal types, also pinned to the SDK. Speaker was 0x0301 — the
+    /// USB Audio Class terminal type, a different namespace that CoreAudio
+    /// never matches — while its sibling Microphone was a correct FourCC.
+    #[test]
+    fn terminal_type_fourccs_match_the_sdk() {
+        assert_eq!(kAudioStreamTerminalTypeMicrophone, 0x6d69_6372); // 'micr'
+        assert_eq!(kAudioStreamTerminalTypeSpeaker, 0x7370_6b72); // 'spkr'
+        assert_ne!(
+            kAudioStreamTerminalTypeSpeaker, 0x0301,
+            "Speaker must not regress to the USB Audio Class value"
+        );
+    }
+
     #[test]
     fn only_read_input_and_write_mix_are_claimed() {
         assert!(op_is_handled(kAudioServerPlugInIOOperationReadInput));
         assert!(op_is_handled(kAudioServerPlugInIOOperationWriteMix));
-        for other in [b"thrd", b"cycl", b"proc", b"mixo", b"cvtm", b"cvti"] {
-            assert!(!op_is_handled(u32::from_be_bytes(*other)));
+        // Every OTHER real operation the HAL offers must be declined — these
+        // are the SDK's own constants, not invented codes, so this actually
+        // exercises the comparison.
+        for other in [
+            kAudioServerPlugInIOOperationThread,
+            kAudioServerPlugInIOOperationCycle,
+            kAudioServerPlugInIOOperationConvertInput,
+            kAudioServerPlugInIOOperationProcessInput,
+            kAudioServerPlugInIOOperationProcessOutput,
+            kAudioServerPlugInIOOperationMixOutput,
+            kAudioServerPlugInIOOperationProcessMix,
+            kAudioServerPlugInIOOperationConvertMix,
+        ] {
+            assert!(!op_is_handled(other), "claimed {other:#x}");
         }
     }
 }
