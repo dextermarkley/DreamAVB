@@ -20,6 +20,16 @@ use crate::aem::desc;
 use crate::constants::{
     adp_msg, aecp_msg, aecp_status, aem_cmd, controller_caps, entity_caps, listener_caps,
 };
+
+/// Smallest `buffer_length` a Milan `STREAM_INPUT` descriptor may advertise,
+/// in nanoseconds.
+///
+/// Milan v1.3 §5.3.3.4: *"In a STREAM_INPUT descriptor, the buffer_length
+/// field shall contain a valid value and this value shall be greater than or
+/// equal to 2126000 ns (2.126 ms), as per [AVTP, Clause 4.3.3, Equation
+/// (2)]."* §4.4.2.1 derives the figure as 2 ms maximum presentation offset
+/// + 125 us timing uncertainty + 1 us gPTP accuracy.
+pub const MILAN_MIN_STREAM_INPUT_BUFFER_NS: u32 = 2_126_000;
 use crate::derive::ListenerModel;
 use crate::entity::control::ControlState;
 
@@ -48,14 +58,69 @@ pub const ACQUIRE_ENTITY_IMPLEMENTED: bool = false;
 /// Recorded in phase1a-impl-verification.md.
 pub const ENTITY_GET_COUNTERS_IMPLEMENTED: bool = false;
 
+/// Selected gPTP grandmaster dataset for the IEEE 1722.1-2021
+/// GET_PTP_INSTANCE_GRANDMASTER_INFO response.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GrandmasterStatus {
+    pub identity: u64,
+    pub priority1: u8,
+    pub priority2: u8,
+    pub clock_class: u8,
+    pub clock_accuracy: u8,
+    pub offset_scaled_log_variance: u16,
+    pub domain_number: u8,
+    pub time_source: u8,
+    pub master_port_identity: u64,
+    pub master_port_number: u16,
+    pub steps_removed: u16,
+}
 /// gPTP data the entity needs for ADP and GET_AVB_INFO (§9.3). Plain data; the
 /// daemon fills it from `avb_gptp::status`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GptpStatus {
     pub grandmaster_id: u64,
+    pub grandmaster: Option<GrandmasterStatus>,
     pub domain_number: u8,
     pub as_capable: bool,
     pub propagation_delay_ns: u32,
+    /// The dataset our gPTP port ANNOUNCES, carried here so the AVB_INTERFACE
+    /// descriptor reports the same clock a controller sees on the wire.
+    ///
+    /// These were hardcoded in the descriptor until the grandmaster work, and
+    /// had drifted: the descriptor claimed clockAccuracy 0xFE while the port
+    /// announces 0x20. A controller comparing the two would read our model as
+    /// describing a different clock than the one announcing. avb-avdecc
+    /// cannot depend on avb-gptp (the AVDECC layer must not require the gPTP
+    /// layer), so the daemon -- which sees both -- is the single source.
+    pub priority1: u8,
+    pub priority2: u8,
+    pub clock_class: u8,
+    pub clock_accuracy: u8,
+    pub offset_scaled_log_variance: u16,
+    /// Whether this port can be a gPTP grandmaster, i.e. whether
+    /// `GPTP_GRANDMASTER_SUPPORTED` belongs in `interface_flags`.
+    pub grandmaster_capable: bool,
+}
+
+impl Default for GptpStatus {
+    /// Defaults describe a port that is NOT grandmaster-capable, so a caller
+    /// that forgets to fill these in under-claims rather than advertising a
+    /// capability the gPTP layer may not have.
+    fn default() -> Self {
+        Self {
+            grandmaster_id: 0,
+            grandmaster: None,
+            domain_number: 0,
+            as_capable: false,
+            propagation_delay_ns: 0,
+            priority1: 255,
+            priority2: 248,
+            clock_class: 248,
+            clock_accuracy: 0xFE,
+            offset_scaled_log_variance: 0x436A,
+            grandmaster_capable: false,
+        }
+    }
 }
 
 /// The listener entity.
@@ -345,7 +410,18 @@ impl ListenerEntity {
                         current_format: s.current_format,
                         formats: s.formats.clone(),
                         avb_interface_index: 0,
-                        buffer_length: 2_000_000,
+                        // Milan v1.3 §5.3.3.4: "In a STREAM_INPUT descriptor,
+                        // the buffer_length field shall contain a valid value
+                        // and this value shall be greater than or equal to
+                        // 2126000 ns (2.126 ms)". 2_000_000 was BELOW that
+                        // floor -- latent, because this entity is not yet
+                        // advertised, and a violation the moment it is.
+                        //
+                        // The figure is not arbitrary: §4.4.2.1 derives it as
+                        // 2 ms maximum presentation offset + 125 us timing
+                        // uncertainty + 1 us gPTP accuracy, which is the same
+                        // arithmetic behind our listener accept bound.
+                        buffer_length: MILAN_MIN_STREAM_INPUT_BUFFER_NS,
                     },
                     true,
                 ))
@@ -436,6 +512,40 @@ mod tests {
     use crate::constants::stream_flags;
     use crate::derive::{listener_model, ListenerModel};
     use avb_avtp::stream_format::{AafFormat, StreamFormat};
+
+    /// Milan v1.3 §5.3.3.4 floor, asserted on the descriptor as a controller
+    /// actually receives it rather than on the constant, so the check survives
+    /// the field being set from somewhere else later. `buffer_length` is the 4
+    /// bytes at offset 128 of a STREAM_INPUT descriptor (spec table row
+    /// "128  4  buffer_length"), and a READ_DESCRIPTOR response prefixes the
+    /// descriptor with configuration_index + reserved, hence +4.
+    ///
+    /// 2_000_000 was the value here before, which is below the floor.
+    #[test]
+    fn stream_input_buffer_length_meets_the_milan_floor() {
+        assert!(
+            MILAN_MIN_STREAM_INPUT_BUFFER_NS >= 2_126_000,
+            "5.3.3.4 requires >= 2126000 ns"
+        );
+        let mut e = ListenerEntity::new(model());
+        let id = e.entity_id();
+        let mut p = vec![0, 0, 0, 0];
+        p.extend_from_slice(&crate::constants::desc::STREAM_INPUT.to_be_bytes());
+        p.extend_from_slice(&0u16.to_be_bytes());
+        let r = e.handle_aecp(&cmd(aem_cmd::READ_DESCRIPTOR, p, id), MacAddr::BROADCAST, 0);
+        assert_eq!(r.status, aecp_status::SUCCESS);
+        let got = u32::from_be_bytes(
+            r.payload
+                .get(132..136)
+                .expect("buffer_length at descriptor offset 128, +4 for the prefix")
+                .try_into()
+                .expect("4 bytes"),
+        );
+        assert!(
+            got >= 2_126_000,
+            "STREAM_INPUT buffer_length {got} ns is below the Milan floor of 2126000 ns"
+        );
+    }
 
     fn model() -> ListenerModel {
         use crate::aem::model::*;

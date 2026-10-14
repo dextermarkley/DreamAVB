@@ -93,6 +93,40 @@ pub struct AvbInterfaceDesc {
     pub port_number: u16,
 }
 
+/// CONTROL descriptor (§7.2.22).
+///
+/// Layout transcribed from a REAL one read off a PreSonus StudioLive 16R
+/// (`.agents/tmp/16r-aem-full.json`, type `0x001a` index 0, 113 bytes): the
+/// fixed fields end at 104 and the device's own `values_offset` reads `0x68`
+/// = 104, so the field order below is confirmed by the hardware's
+/// self-description rather than by our reading of the spec.
+///
+/// `values` is kept as raw bytes because its shape depends on
+/// `control_value_type`: a `CONTROL_LINEAR_UINT8` carries the 9-byte
+/// `minimum/maximum/step/default/current/unit/string` block the 16R sends,
+/// while other value types carry different blocks entirely. Decoding it into
+/// a typed enum would mean originating layouts for value types we have never
+/// seen on the wire.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ControlDesc {
+    pub object_name: String,
+    pub localized_description: u16,
+    pub block_latency: u32,
+    pub control_latency: u32,
+    pub control_domain: u16,
+    pub control_value_type: u16,
+    /// `0x90e0f000_00000001` for IDENTIFY — the AVB OUI-24 `90:e0:f0` plus
+    /// the control's own index within it.
+    pub control_type: u64,
+    pub reset_time: u32,
+    pub number_of_values: u16,
+    pub signal_type: u16,
+    pub signal_index: u16,
+    pub signal_output: u16,
+    /// Raw `values` block, placed at `values_offset` on the wire.
+    pub values: Vec<u8>,
+}
+
 /// CLOCK_SOURCE descriptor (§7.2.9).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClockSourceDesc {
@@ -111,6 +145,37 @@ pub struct ClockDomainDesc {
     pub clock_source_index: u16,
     /// CLOCK_SOURCE indices this domain may use.
     pub clock_sources: Vec<u16>,
+}
+
+/// TIMING descriptor (IEEE 1722.1-2021 §7.2.34).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimingDesc {
+    pub object_name: String,
+    pub algorithm: u16,
+    pub ptp_instances: Vec<u16>,
+}
+
+/// PTP_INSTANCE descriptor (IEEE 1722.1-2021 §7.2.35).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PtpInstanceDesc {
+    pub object_name: String,
+    pub clock_identity: Eui64,
+    pub flags: u32,
+    pub number_of_controls: u16,
+    pub base_control: u16,
+    pub number_of_ptp_ports: u16,
+    pub base_ptp_port: u16,
+}
+
+/// PTP_PORT descriptor (IEEE 1722.1-2021 §7.2.36).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PtpPortDesc {
+    pub object_name: String,
+    pub port_number: u16,
+    pub port_type: u16,
+    pub flags: u32,
+    pub avb_interface_index: u16,
+    pub profile_identifier: MacAddr,
 }
 
 /// STREAM_PORT_INPUT / OUTPUT descriptor (§7.2.13).

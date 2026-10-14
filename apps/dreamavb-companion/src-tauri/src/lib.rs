@@ -685,10 +685,14 @@ fn published_effective_clock() -> Option<EffectiveClock> {
 }
 
 /// Build the UI snapshot: the user's selection from disk, and what is actually
-/// in force from the daemon.
-fn clock_source_info(cfg: Config, warnings: Vec<String>) -> ClockSourceInfo {
-    let (effective_label, effective_reason, network_disciplined) = match published_effective_clock()
-    {
+/// in force from the supervised daemon. The verdict is injected so unit tests
+/// never inspect a live or stale machine-wide ring.
+fn clock_source_info(
+    cfg: Config,
+    warnings: Vec<String>,
+    effective: Option<EffectiveClock>,
+) -> ClockSourceInfo {
+    let (effective_label, effective_reason, network_disciplined) = match effective {
         Some(e) => (
             e.label().to_string(),
             e.reason().to_string(),
@@ -713,14 +717,29 @@ fn clock_source_info(cfg: Config, warnings: Vec<String>) -> ClockSourceInfo {
     }
 }
 
+/// Read the daemon's verdict only while the child this companion supervises is
+/// actually alive. A crashed or force-killed daemon can leave its backing file
+/// behind, and treating that stale file as a live publisher makes the UI claim
+/// a clock is in force when no audio engine exists.
+fn live_published_effective_clock() -> Option<EffectiveClock> {
+    let mut guard = match AUDIO.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if !audio_status_locked(&mut guard).running {
+        return None;
+    }
+    published_effective_clock()
+}
+
 /// Current clock-source selection + the clock actually in force.
 ///
-/// `async` so Tauri runs it off the main thread (review M3): `ring_clock_locked`
-/// touches the shared ring.
+/// `async` so Tauri runs it off the main thread: reading the shared ring and
+/// reaping the supervised child are both process-level operations.
 #[tauri::command]
 async fn get_clock_source() -> ClockSourceInfo {
     let (cfg, warnings) = Config::load();
-    clock_source_info(cfg, warnings)
+    clock_source_info(cfg, warnings, live_published_effective_clock())
 }
 
 /// Change the clock source. Unknown tokens are REJECTED, not silently
@@ -740,7 +759,11 @@ async fn set_clock_source(value: String) -> Result<ClockSourceInfo, String> {
     // Reload so any warnings about the on-disk file (and the canonical parse)
     // are reflected, not just this in-memory value.
     let (loaded, warnings) = Config::load();
-    Ok(clock_source_info(loaded, warnings))
+    Ok(clock_source_info(
+        loaded,
+        warnings,
+        live_published_effective_clock(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,7 +1199,181 @@ async fn start_audio() -> Result<AudioStatus, String> {
         .spawn()
         .map_err(|e| format!("could not start {}: {e}", bin.display()))?;
     *guard = Some(child);
+    // The user asked for audio ON. Record that, so the supervisor restarts the
+    // daemon if it dies on its own but NOT if they turn it off.
+    AUDIO_WANTED.store(true, Ordering::SeqCst);
+    SUPERVISOR_BACKOFF_MS.store(SUPERVISOR_BACKOFF_MIN_MS, Ordering::SeqCst);
+    SUPERVISOR_FAILURES.store(0, Ordering::SeqCst);
+    start_supervisor();
     Ok(audio_status_locked(&mut guard))
+}
+
+// ---- Supervisor: keep audio alive across a transient device fault ---------
+//
+// A live run died with "SendFrame fatal — device gone" / "dext fault latched,
+// or device removed (exit 7)" while the 16R had all seven of its sinks bound
+// and audio was flowing. The hardware was healthy seconds later -- dext still
+// attached, `fault 0 (none)`, link up at 1000FD -- but nothing restarted the
+// daemon, so audio stayed dead until a human noticed and toggled it.
+//
+// That is a worse failure than any of the conformance gaps: a real audio
+// interface comes back from a cable glitch by itself.
+//
+// Restarting a FRESH daemon is deliberately the recovery, rather than teaching
+// the daemon to re-initialise its datapath in place. A new process starts from
+// known state; in-place recovery would have to unwind a half-torn-down ring,
+// talker and gPTP port in the middle of the audio path, which is a much larger
+// risk for the same outcome.
+
+/// Whether the user wants audio on. Set by `start_audio`, cleared by
+/// `stop_audio` -- so a deliberate stop is never fought by the supervisor.
+static AUDIO_WANTED: AtomicBool = AtomicBool::new(false);
+/// Backoff before the next restart attempt, doubling on each consecutive
+/// failure so a genuinely absent device is not hammered (AGENTS.md: back off
+/// if the device faults).
+static SUPERVISOR_BACKOFF_MS: AtomicU64 = AtomicU64::new(SUPERVISOR_BACKOFF_MIN_MS);
+/// Consecutive failed restarts, to stop entirely rather than spin forever.
+static SUPERVISOR_FAILURES: AtomicU32 = AtomicU32::new(0);
+static SUPERVISOR_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+const SUPERVISOR_BACKOFF_MIN_MS: u64 = 1_000;
+const SUPERVISOR_BACKOFF_MAX_MS: u64 = 30_000;
+/// Give up after this many consecutive failures. The device is then genuinely
+/// gone (unplugged adapter, driver turned off) and a human has to act.
+const SUPERVISOR_MAX_FAILURES: u32 = 8;
+/// A run that lasted at least this long counts as healthy, so the backoff
+/// resets. Without it, a daemon that dies every few minutes would creep to the
+/// 30 s ceiling and stay there.
+const SUPERVISOR_HEALTHY_RUN_MS: u128 = 60_000;
+
+/// Start the single supervisor thread, at most once per process.
+fn start_supervisor() {
+    SUPERVISOR_STARTED.get_or_init(|| {
+        std::thread::spawn(supervisor_loop);
+    });
+}
+
+/// Whether to spawn a replacement, given the three facts that decide it.
+///
+/// Pure, and separate from the loop, so the policy can be tested without
+/// spawning processes or sleeping. The `wanted` term is the one that matters
+/// most: a daemon the user switched off has exited for a GOOD reason, and
+/// restarting it would fight them.
+fn should_restart(wanted: bool, exited: bool, failures: u32) -> bool {
+    wanted && exited && failures < SUPERVISOR_MAX_FAILURES
+}
+
+/// Backoff after a failed restart: double, clamped to the configured band.
+fn next_backoff_ms(current: u64) -> u64 {
+    current
+        .saturating_mul(2)
+        .clamp(SUPERVISOR_BACKOFF_MIN_MS, SUPERVISOR_BACKOFF_MAX_MS)
+}
+
+fn supervisor_loop() {
+    let mut running_since: Option<std::time::Instant> = None;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(1_000));
+        if !AUDIO_WANTED.load(Ordering::SeqCst) {
+            running_since = None;
+            continue;
+        }
+        let exited = {
+            let mut guard = match AUDIO.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            match guard.as_mut() {
+                // Nothing spawned: `stop_audio` clears the slot, and it also
+                // clears AUDIO_WANTED, so reaching here means the slot was
+                // emptied by a reaped exit.
+                None => true,
+                Some(child) => match child.try_wait() {
+                    Ok(None) => {
+                        if running_since.is_none() {
+                            running_since = Some(std::time::Instant::now());
+                        }
+                        false
+                    }
+                    // Exited, or unreadable -- treat both as gone.
+                    Ok(Some(_)) | Err(_) => true,
+                },
+            }
+        };
+        if !exited {
+            continue;
+        }
+        // A long healthy run earns a clean slate, so an occasional glitch
+        // hours apart does not inherit a long backoff.
+        if running_since.is_some_and(|t| t.elapsed().as_millis() >= SUPERVISOR_HEALTHY_RUN_MS) {
+            SUPERVISOR_BACKOFF_MS.store(SUPERVISOR_BACKOFF_MIN_MS, Ordering::SeqCst);
+            SUPERVISOR_FAILURES.store(0, Ordering::SeqCst);
+        }
+        running_since = None;
+
+        if SUPERVISOR_FAILURES.load(Ordering::SeqCst) >= SUPERVISOR_MAX_FAILURES {
+            // Stop trying, and stop claiming we will: the UI reads the slot.
+            AUDIO_WANTED.store(false, Ordering::SeqCst);
+            continue;
+        }
+        let wait = SUPERVISOR_BACKOFF_MS.load(Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(wait));
+        // Re-check through the same policy the tests pin: the user may have
+        // turned audio off while we waited out the backoff.
+        if !should_restart(
+            AUDIO_WANTED.load(Ordering::SeqCst),
+            true,
+            SUPERVISOR_FAILURES.load(Ordering::SeqCst),
+        ) {
+            continue;
+        }
+        match respawn_daemon() {
+            Ok(()) => {
+                SUPERVISOR_BACKOFF_MS.store(SUPERVISOR_BACKOFF_MIN_MS, Ordering::SeqCst);
+                SUPERVISOR_FAILURES.store(0, Ordering::SeqCst);
+            }
+            Err(_) => {
+                SUPERVISOR_FAILURES.fetch_add(1, Ordering::SeqCst);
+                SUPERVISOR_BACKOFF_MS.store(next_backoff_ms(wait), Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// Spawn a replacement daemon. Shares `start_audio`'s preconditions: the
+/// driver must still own the NIC, or there is nothing to stream through.
+fn respawn_daemon() -> Result<(), String> {
+    if current_status().state != DriverState::Active {
+        return Err("the driver no longer owns the interface".into());
+    }
+    let bin = helper_path("avb-daemon");
+    let log = audio_log_path().ok_or_else(|| "HOME is not set".to_string())?;
+    if let Some(dir) = log.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| format!("could not open {}: {e}", log.display()))?;
+    let err = out
+        .try_clone()
+        .map_err(|e| format!("could not open {}: {e}", log.display()))?;
+    let child = Command::new(&bin)
+        .arg("duplex")
+        .arg("--log-level")
+        .arg("info")
+        .stdout(out)
+        .stderr(err)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", bin.display()))?;
+    let mut guard = match AUDIO.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    *guard = Some(child);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1185,6 +1382,10 @@ async fn stop_audio() -> Result<AudioStatus, String> {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
+    // Clear the intent BEFORE killing the child, or the supervisor sees an
+    // exited daemon that is still "wanted" and restarts the thing the user
+    // just switched off.
+    AUDIO_WANTED.store(false, Ordering::SeqCst);
     stop_audio_locked(&mut guard);
     Ok(audio_status_locked(&mut guard))
 }
@@ -1236,7 +1437,7 @@ extern "C" {
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -1528,6 +1729,73 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    /// A daemon the user switched OFF has exited for a good reason. Restarting
+    /// it would fight them -- and `stop_audio` clears the intent BEFORE it
+    /// kills the child precisely so this case is reached, not raced.
+    #[test]
+    fn supervisor_never_fights_a_deliberate_stop() {
+        assert!(!should_restart(false, true, 0), "user turned audio off");
+        assert!(!should_restart(false, true, 3), "still off, mid-backoff");
+    }
+
+    /// A healthy running daemon is left alone, however much the user wants
+    /// audio on -- `exited` is the trigger, not `wanted`.
+    #[test]
+    fn supervisor_leaves_a_live_daemon_alone() {
+        assert!(!should_restart(true, false, 0));
+    }
+
+    /// The case this exists for: audio wanted, daemon died on its own.
+    #[test]
+    fn supervisor_restarts_an_unexpected_exit() {
+        assert!(should_restart(true, true, 0));
+        assert!(should_restart(true, true, SUPERVISOR_MAX_FAILURES - 1));
+    }
+
+    /// It gives up rather than spinning forever against a device that is
+    /// genuinely gone (adapter unplugged, driver switched off).
+    #[test]
+    fn supervisor_gives_up_after_the_failure_cap() {
+        assert!(!should_restart(true, true, SUPERVISOR_MAX_FAILURES));
+        assert!(!should_restart(true, true, SUPERVISOR_MAX_FAILURES + 50));
+    }
+
+    /// Backoff doubles from the floor to the ceiling and then stays there, so
+    /// a faulted device is not hammered (AGENTS.md: back off if it faults).
+    #[test]
+    fn supervisor_backoff_doubles_then_caps() {
+        let mut ms = SUPERVISOR_BACKOFF_MIN_MS;
+        let mut seen = vec![ms];
+        for _ in 0..12 {
+            ms = next_backoff_ms(ms);
+            seen.push(ms);
+        }
+        assert_eq!(seen[0], 1_000);
+        assert_eq!(seen[1], 2_000);
+        assert_eq!(seen[2], 4_000);
+        assert!(
+            seen.iter().all(|&v| v <= SUPERVISOR_BACKOFF_MAX_MS),
+            "never exceeds the ceiling: {seen:?}"
+        );
+        assert_eq!(
+            *seen.last().expect("non-empty"),
+            SUPERVISOR_BACKOFF_MAX_MS,
+            "reaches the ceiling and stays"
+        );
+        // Monotonic: a later attempt never waits LESS than an earlier one.
+        assert!(seen.windows(2).all(|w| w[1] >= w[0]));
+    }
+
+    /// Guard the constants themselves: a zero floor would make the backoff a
+    /// busy loop, and a cap below the floor would invert the policy.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn supervisor_constants_are_sane() {
+        assert!(SUPERVISOR_BACKOFF_MIN_MS > 0, "a zero floor spins");
+        assert!(SUPERVISOR_BACKOFF_MAX_MS >= SUPERVISOR_BACKOFF_MIN_MS);
+        assert!(SUPERVISOR_MAX_FAILURES > 0, "zero would never even try");
+    }
+
     fn nic_i210() -> Nic {
         Nic {
             bsd_name: "en7".into(),
@@ -1727,7 +1995,7 @@ mac            64:4b:f0:12:73:b8   timebase 125/3
             clock_source: ClockSource::MacInternal,
             ..Default::default()
         };
-        let info = clock_source_info(cfg, vec!["a warning".to_string()]);
+        let info = clock_source_info(cfg, vec!["a warning".to_string()], None);
         assert_eq!(info.selected, "mac");
         // No ring in a unit test, so no verdict is published.
         assert!(!info.network_disciplined);
@@ -1745,14 +2013,13 @@ mac            64:4b:f0:12:73:b8   timebase 125/3
     /// would claim a clock is sourcing audio when no stream exists at all.
     #[test]
     fn no_daemon_reports_no_effective_clock_rather_than_the_mac() {
-        // No ring is attached in a unit test, so this exercises the None arm.
-        assert!(published_effective_clock().is_none());
         let info = clock_source_info(
             Config {
                 clock_source: ClockSource::NetworkGptp,
                 ..Default::default()
             },
             Vec::new(),
+            None,
         );
         // The SELECTION is still reported, so the control shows what is saved.
         assert_eq!(info.selected, "gptp");

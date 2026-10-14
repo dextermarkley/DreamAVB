@@ -116,12 +116,39 @@ pub fn announce_frame(
     gm: ClockIdentity,
     path: &[ClockIdentity],
 ) -> Vec<u8> {
+    // priority1 246 beats our 255 at BTCA's first rung, so a port fed these
+    // frames stays Slave. That is what every servo and pdelay test wants.
+    announce_frame_with(
+        seq,
+        log,
+        source,
+        gm,
+        path,
+        [246, 248, 0xFE, 0x41, 0x00, 248],
+    )
+}
+
+/// `announce_frame` with the six announced-dataset octets spelled out:
+/// `[priority1, clockClass, clockAccuracy, varianceHi, varianceLo,
+/// priority2]`.
+///
+/// Exists so a test can present a clock WORSE than ours and drive the port
+/// into the master role. With the hardcoded values above, our 255 always
+/// loses and `PortState::Master` is unreachable.
+pub fn announce_frame_with(
+    seq: u16,
+    log: i8,
+    source: PortIdentity,
+    gm: ClockIdentity,
+    path: &[ClockIdentity],
+    dataset: [u8; 6],
+) -> Vec<u8> {
     let len = 64 + 4 + 8 * path.len();
     let mut v = header(MessageType::Announce, len, source, seq, log, 0x0008, 0);
     v.extend_from_slice(&[0; 10]);
     v.extend_from_slice(&37i16.to_be_bytes());
     v.push(0);
-    v.extend_from_slice(&[246, 248, 0xFE, 0x41, 0x00, 248]);
+    v.extend_from_slice(&dataset);
     v.extend_from_slice(&gm.0);
     v.extend_from_slice(&[0, 0, 0xA0]);
     v.extend_from_slice(&0x0008u16.to_be_bytes());

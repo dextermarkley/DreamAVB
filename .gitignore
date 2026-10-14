@@ -21,3 +21,9 @@ xcuserdata/
 
 # Local agent/editor settings (never committed)
 .kiro/settings/
+
+# Provisioning profiles: device-scoped and account-specific, never committed
+packaging/profiles/
+
+# Avnu Milan spec: licensed PDF, fetched per-user from avnu.org. Not ours to redistribute.
+Milan_Specification_Consolidated_v*.pdf

@@ -24,7 +24,7 @@
 use avb_core::rx::{Now, RxMeta};
 use avb_core::time::{MachTicks, Timebase};
 use avb_core::{MacAddr, Outbox};
-use avb_gptp::{Action, Port, PortConfig, ServoState, TxTsResult as GTxTs};
+use avb_gptp::{Action, Port, PortConfig, TxTsResult as GTxTs};
 
 use crate::dextio::{DextPort, SendResult, TxTsResult};
 use crate::exit::Exit;
@@ -129,12 +129,18 @@ impl GptpService {
     }
 
     /// Is the clock fit to timestamp a stream with? Both conditions matter:
-    /// `as_capable` means the peer is exchanging gPTP with us, and a locked
-    /// servo means SYSTIM actually tracks the grandmaster. A reading taken
-    /// while the servo is still acquiring can be arbitrarily far out.
+    /// `as_capable` means the peer is exchanging gPTP with us, and a usable
+    /// servo means SYSTIM is either tracking the grandmaster or IS one. A
+    /// reading taken while the servo is still acquiring can be arbitrarily
+    /// far out.
+    ///
+    /// TIMESOURCE counts as usable: when we hold the grandmaster role our
+    /// clock defines the domain's time, so it is trivially synchronised to
+    /// the reference. Gating on `Locked` alone would stop audio at the
+    /// instant we won BTCA, which is the opposite of what winning means.
     pub fn is_locked(&self) -> bool {
         let st = self.port.status();
-        st.as_capable && st.servo_state == ServoState::Locked
+        st.as_capable && st.servo_state.is_usable_clock()
     }
 
     /// gPTP time now, in ns, interpolated from the last clock read.

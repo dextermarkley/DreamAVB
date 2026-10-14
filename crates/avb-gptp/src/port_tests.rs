@@ -230,6 +230,241 @@ fn gm_change_after_setclock_seeds_single_generation_nrr() {
 
 // --- port state machine edges ---
 
+/// BTCA grants the master role, and the master transmit path produces a
+/// correctly paired Announce / Sync / Follow_Up.
+///
+/// The peer here announces a WORSE clock than ours — clockClass 255 against
+/// our 248 — so our dataset wins at BTCA's second rung. Every other test in
+/// this file feeds `announce_frame`, whose priority1 of 246 beats our 255 at
+/// the FIRST rung, which is why `no_master_messages` holds throughout them
+/// and why reaching this state at all needs a deliberately weak peer.
+#[test]
+fn btca_win_enters_master_and_emits_a_paired_sync_and_follow_up() {
+    let mut s = Sim::new(SimCfg::default());
+    assert_eq!(s.port.state(), PortState::Listening);
+    // Silence the sim's own grandmaster: its announce_frame carries
+    // priority1 246, which would beat us at the first rung.
+    s.announces_on = false;
+    // Let the Pdelay exchange establish asCapable first. 802.1AS forbids
+    // transmitting Announce or Sync without it, and the master path honours
+    // that -- so without this the port reaches Master and correctly sends
+    // nothing.
+    assert!(
+        s.run_until(5 * S, |s| s.port.as_capable()),
+        "pdelay must make us asCapable"
+    );
+
+    // priority1 equal to ours (255), but a worse clockClass.
+    let weak = [255u8, 255, 0xFE, 0xFF, 0xFF, 255];
+    let at = s.tau;
+    s.inject(
+        at,
+        announce_frame_with(1, 0, PEER_PORT, GM_ID, &[GM_ID], weak),
+        None,
+    );
+    assert!(
+        s.run_until(2 * S, |s| s.port.state() == PortState::Master),
+        "our clockClass 248 must beat 255"
+    );
+    assert_eq!(s.port.counters().btca_we_won, 1);
+    assert_eq!(s.port.counters().btca_we_lost, 0);
+    // As grandmaster we advertise OUR identity, not the peer's.
+    assert_eq!(s.adp.last(), Some(&s.port.identity().clock));
+
+    // Let the transmit timers run: Announce at 1 s, Sync at 125 ms.
+    s.run_for(S);
+    let c = s.port.counters();
+    assert!(c.announce_tx >= 1, "an Announce must go out");
+    assert!(c.sync_tx >= 2, "Sync is 125 ms, so >= 2 in a second");
+    assert!(
+        c.follow_up_tx >= 1,
+        "each timestamped Sync must be followed up"
+    );
+    assert_eq!(c.sync_tx_ts_lost, 0, "every Sync got its TX timestamp");
+
+    // The pairing: a Follow_Up must carry the sequenceId of a Sync we sent.
+    let sync_seqs: Vec<u16> = s.sent_of(MessageType::Sync).map(|m| m.seq).collect();
+    let fu_seqs: Vec<u16> = s.sent_of(MessageType::FollowUp).map(|m| m.seq).collect();
+    assert!(!fu_seqs.is_empty());
+    for fu in &fu_seqs {
+        assert!(
+            sync_seqs.contains(fu),
+            "Follow_Up seq {fu} matches no Sync we sent: {sync_seqs:?}"
+        );
+    }
+
+    // Our Announce must carry our own dataset, and the intervals the
+    // capture pinned.
+    let ann = s
+        .sent_of(MessageType::Announce)
+        .next()
+        .expect("an Announce");
+    let m = msg::decode_frame(&ann.bytes).expect("our own Announce must decode");
+    assert_eq!(m.header.log_interval, msg::LOG_ANNOUNCE_INTERVAL);
+    let Body::Announce(body) = m.body else {
+        panic!("not an Announce body")
+    };
+    assert_eq!(body.gm_identity, s.port.identity().clock);
+    assert_eq!(body.gm_priority1, crate::PRIORITY1);
+    assert_eq!(body.gm_clock_quality, crate::our_clock_quality());
+    assert_eq!(body.steps_removed, 0, "we are the source");
+    let sync = s.sent_of(MessageType::Sync).next().expect("a Sync");
+    let ms = msg::decode_frame(&sync.bytes).expect("our own Sync must decode");
+    assert_eq!(ms.header.log_interval, msg::LOG_SYNC_INTERVAL);
+}
+
+/// A better clock appearing takes the role back. Without this the port would
+/// keep announcing against a superior grandmaster and the domain would have
+/// two masters while audio is running.
+#[test]
+fn a_better_announce_demotes_us_out_of_master() {
+    let mut s = Sim::new(SimCfg::default());
+    s.announces_on = false;
+    let weak = [255u8, 255, 0xFE, 0xFF, 0xFF, 255];
+    let at = s.tau;
+    s.inject(
+        at,
+        announce_frame_with(1, 0, PEER_PORT, GM_ID, &[GM_ID], weak),
+        None,
+    );
+    assert!(s.run_until(2 * S, |s| s.port.state() == PortState::Master));
+
+    // Now the real 16R-grade clock: priority1 246 beats our 255.
+    let at = s.tau;
+    s.inject(at, announce_frame(2, 0, PEER_PORT, GM_ID, &[GM_ID]), None);
+    assert!(
+        s.run_until(2 * S, |s| s.port.state() != PortState::Master),
+        "a better clock must take the role back"
+    );
+    assert!(s.port.counters().btca_we_lost >= 1);
+    let before = s.port.counters().announce_tx;
+    s.run_for(2 * S);
+    assert_eq!(
+        s.port.counters().announce_tx,
+        before,
+        "we must stop announcing once demoted"
+    );
+}
+
+/// Winning BTCA must not disturb the clock rate the domain is already
+/// running at, and must not stop audio.
+///
+/// Both are load-bearing. The servo is holding a frequency correction that
+/// matched the old grandmaster; reverting to the raw oscillator rate would be
+/// a frequency STEP on the clock the media clock and every listener are tuned
+/// to. And `is_usable_clock` gates whether the daemon will timestamp a
+/// stream at all, so a grandmaster whose servo left `Locked` would silence
+/// itself at the moment it won.
+#[test]
+fn becoming_grandmaster_holds_the_rate_and_keeps_the_clock_usable() {
+    let mut s = locked(SimCfg::default());
+    s.run_for(5 * S);
+    assert_eq!(s.port.servo_state(), ServoState::Locked);
+    let f_slaved = s.port.applied_ppb();
+    assert!(
+        f_slaved.abs() > 1.0,
+        "the sim GM is offset, so a real correction must be applied: {f_slaved}"
+    );
+
+    // Silence the strong GM and present a clock worse than ours.
+    s.announces_on = false;
+    let weak = [255u8, 255, 0xFE, 0xFF, 0xFF, 255];
+    let at = s.tau;
+    s.inject(
+        at,
+        announce_frame_with(9, 0, PEER_PORT, GM_ID, &[GM_ID], weak),
+        None,
+    );
+    assert!(s.run_until(2 * S, |s| s.port.state() == PortState::Master));
+
+    assert_eq!(s.port.servo_state(), ServoState::TimeSource);
+    assert!(
+        ServoState::TimeSource.is_usable_clock(),
+        "a grandmaster's own clock must be fit to timestamp a stream"
+    );
+    assert!(
+        (s.port.applied_ppb() - f_slaved).abs() < 1e-9,
+        "the frequency must be held, not reverted: {} vs {f_slaved}",
+        s.port.applied_ppb()
+    );
+
+    // And it must STAY held: no corrections while we are the reference.
+    s.run_for(3 * S);
+    assert_eq!(s.port.servo_state(), ServoState::TimeSource);
+    assert!((s.port.applied_ppb() - f_slaved).abs() < 1e-9);
+    // We advertise ourselves, not the clock we beat.
+    assert_eq!(s.port.gm_identity(), s.port.identity().clock);
+}
+
+/// Holdover and TimeSource both freeze the servo, but only one of them is a
+/// fit clock. Pinning them apart stops a later refactor from collapsing the
+/// two states because they look alike.
+#[test]
+fn holdover_is_not_a_usable_clock_but_time_source_is() {
+    assert!(!ServoState::Holdover.is_usable_clock());
+    assert!(!ServoState::Acquire.is_usable_clock());
+    assert!(!ServoState::Tracking.is_usable_clock());
+    assert!(ServoState::Locked.is_usable_clock());
+    assert!(ServoState::TimeSource.is_usable_clock());
+}
+
+/// Losing the role must re-acquire, not coast. Our clock was free-running
+/// while master, so it has no valid tracking state against the new
+/// grandmaster -- and holdover() deliberately refuses to demote a TimeSource,
+/// so without an explicit acquire the servo would stay frozen forever.
+#[test]
+fn demotion_from_master_reacquires_rather_than_holding_over() {
+    let mut s = Sim::new(SimCfg::default());
+    s.announces_on = false;
+    let weak = [255u8, 255, 0xFE, 0xFF, 0xFF, 255];
+    let at = s.tau;
+    s.inject(
+        at,
+        announce_frame_with(1, 0, PEER_PORT, GM_ID, &[GM_ID], weak),
+        None,
+    );
+    assert!(s.run_until(2 * S, |s| s.port.state() == PortState::Master));
+    assert_eq!(s.port.servo_state(), ServoState::TimeSource);
+
+    s.announces_on = true;
+    assert!(
+        s.run_until(3 * S, |s| s.port.servo_state() != ServoState::TimeSource),
+        "a better grandmaster must put the servo back to work"
+    );
+    assert_ne!(
+        s.port.servo_state(),
+        ServoState::Holdover,
+        "coasting would keep a free-run rate while a real GM is available"
+    );
+    assert!(s.run_until(10 * S, |s| s.port.servo_state() == ServoState::Locked));
+    assert_eq!(s.port.state(), PortState::Slave);
+    assert_eq!(s.port.gm_identity(), GM_ID);
+}
+
+/// A master that is not asCapable must stay silent.
+///
+/// Without a completed Pdelay exchange the peer has no link delay for us, so
+/// our timestamps are uncorrectable at the far end -- announcing a grandmaster
+/// whose time cannot be used is worse than announcing nothing.
+#[test]
+fn master_without_ascapable_transmits_nothing() {
+    let mut s = Sim::new(SimCfg::default());
+    s.announces_on = false;
+    s.peer_responds = false;
+    let weak = [255u8, 255, 0xFE, 0xFF, 0xFF, 255];
+    let at = s.tau;
+    s.inject(
+        at,
+        announce_frame_with(1, 0, PEER_PORT, GM_ID, &[GM_ID], weak),
+        None,
+    );
+    assert!(s.run_until(2 * S, |s| s.port.state() == PortState::Master));
+    assert!(!s.port.as_capable());
+    s.run_for(3 * S);
+    let c = s.port.counters();
+    assert_eq!((c.announce_tx, c.sync_tx, c.follow_up_tx), (0, 0, 0));
+}
+
 #[test]
 fn listening_to_slave_first_gm_acquire() {
     let mut s = Sim::new(SimCfg::default());
@@ -807,7 +1042,8 @@ fn status_serializes() {
     assert_eq!(st.gm_identity, GM_ID);
     assert!(st.responder_turnaround_max_ns.unwrap() > 0.0);
     assert!(st.counters.pdelay_resp_fu_tx > 0);
-    assert_eq!(crate::PRIORITY1, 255);
+    // 248 as Milan v1.3 4.2.6.2.1 requires of a grandmaster-capable PAAD.
+    assert_eq!(crate::PRIORITY1, 248);
     // serde: the derive must cover every field (compile-time); spot-check
     // a few names through a minimal serializer-free check.
     fn is_serialize<T: serde::Serialize>(_: &T) {}

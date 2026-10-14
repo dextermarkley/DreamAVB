@@ -22,9 +22,12 @@ use crate::constants::{clock_source, desc, stream_flags};
 pub const S_MAX: usize = 16;
 
 /// Our entity_model_id prefix bytes (§9.1): `0x02_41_56` ("AV", locally
-/// administered, no OUI) ‖ `0x01` (model schema revision). The low 32 bits
-/// are `fnv1a32(canonical model)`.
-pub const MODEL_ID_PREFIX: u32 = 0x0241_5601;
+/// administered, no OUI) ‖ `0x04` (model schema revision). Revision 2 fixed
+/// repeated descriptor indices; revision 3 fixed absolute offsets and dangling
+/// localized-string references; revision 4 adds the Milan gPTP media-clock
+/// descriptor chain. A controller cache under an older id is incomplete or
+/// malformed. The low 32 bits are `fnv1a32(canonical model)`.
+pub const MODEL_ID_PREFIX: u32 = 0x0241_5604;
 
 /// Why a listener model could not be derived (§9.3). The daemon maps these to
 /// exit codes.
@@ -304,7 +307,7 @@ pub fn listener_model(
     Ok(model)
 }
 
-/// `0x02415601 || fnv1a32(canonical model)` (§9.1). The canonical form is the
+/// `MODEL_ID_PREFIX || fnv1a32(canonical model)` (§9.1). The canonical form is the
 /// sorted (listener_index, formats[], current_format), the rates, and the
 /// per-stream channel counts — so the id changes iff the derived model does
 /// and is stable across runs against the same 16R (ADC-9).

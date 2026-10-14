@@ -75,6 +75,9 @@ pub enum Event {
         talker_in_adp: bool,
         /// `last_available_index` seed from the ADP table, if present.
         talker_available_index: Option<u32>,
+        /// STREAMING_WAIT as the binding controller set it. Saved verbatim
+        /// and reported back by GET_RX_STATE (§5.5.3.6.3 step 2, Table 5.44).
+        streaming_wait: bool,
     },
     /// DISCONNECT_RX_COMMAND.
     UnbindRx,
@@ -163,6 +166,18 @@ struct Binding {
     last_available_index: Option<u32>,
 }
 
+/// The binding a sink is holding, for GET_RX_STATE to report.
+///
+/// Milan §5.5.3.6.3 step 2 requires the binding parameters to be SAVED, and
+/// §5.5.3.6.44 Table 5.44 requires GET_RX_STATE to report them back, so they
+/// have to be readable from outside the state machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundTo {
+    pub talker_entity_id: Eui64,
+    pub talker_unique_id: u16,
+    pub controller_entity_id: Eui64,
+}
+
 /// The Milan ACMP listener SM for one STREAM_INPUT (§9.4).
 #[derive(Clone, Debug)]
 pub struct ListenerSm {
@@ -180,6 +195,14 @@ pub struct ListenerSm {
     talker_failed_registered: bool,
     timer_deadline_ns: Option<u64>,
     a5_classified: bool,
+    /// STREAMING_WAIT from the binding command, saved verbatim.
+    streaming_wait: bool,
+    /// Whether this Stream Input is STARTED (Milan §5.4.2.19-20).
+    ///
+    /// A bind with STREAMING_WAIT set leaves the sink bound but stopped --
+    /// that is what the flag is for -- so START_STREAMING is what starts it.
+    /// A bind without the flag is started immediately.
+    started: bool,
     pub counters: SmCounters,
 }
 
@@ -197,8 +220,53 @@ impl ListenerSm {
             talker_failed_registered: false,
             timer_deadline_ns: None,
             a5_classified: false,
+            streaming_wait: false,
+            started: false,
             counters: SmCounters::default(),
         }
+    }
+
+    /// Who this sink is bound to, or `None` while UNBOUND.
+    pub fn bound_to(&self) -> Option<BoundTo> {
+        self.binding.as_ref().map(|b| BoundTo {
+            talker_entity_id: b.talker_entity_id,
+            talker_unique_id: b.talker_unique_id,
+            controller_entity_id: b.controller_entity_id,
+        })
+    }
+
+    /// STREAMING_WAIT as the binding controller set it (§5.5.3.6.3 step 2:
+    /// "Update the binding parameters with ... STREAMING_WAIT ... then save
+    /// them"). Reported back verbatim by GET_RX_STATE, Table 5.44.
+    pub fn streaming_wait(&self) -> bool {
+        self.streaming_wait
+    }
+
+    /// Whether this Stream Input is started.
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
+    /// START_STREAMING (§5.4.2.19). Returns whether the state CHANGED.
+    ///
+    /// "This command has no effect on a Stream Input that is not already
+    /// bound or already started" -- so an unbound or already-started sink is
+    /// a no-op, not an error.
+    pub fn start_streaming(&mut self) -> bool {
+        if self.binding.is_none() || self.started {
+            return false;
+        }
+        self.started = true;
+        true
+    }
+
+    /// STOP_STREAMING (§5.4.2.20). Returns whether the state CHANGED.
+    pub fn stop_streaming(&mut self) -> bool {
+        if self.binding.is_none() || !self.started {
+            return false;
+        }
+        self.started = false;
+        true
     }
 
     pub fn state(&self) -> State {
@@ -416,6 +484,7 @@ impl ListenerSm {
                     controller_entity_id,
                     talker_in_adp,
                     talker_available_index,
+                    streaming_wait: _,
                 },
             ) if self.is_bound_state() => {
                 let same = self.binding.is_some_and(|b| {
@@ -455,6 +524,11 @@ impl ListenerSm {
                 out.push(Action::RemoveStreamEntry);
                 self.declaration = Declaration::None;
                 self.binding = None;
+                // An unbound sink cannot be started: §5.4.2.19 makes being
+                // bound a precondition, so leaving this set would let a later
+                // GET_RX_STATE report a started stream with no talker.
+                self.started = false;
+                self.streaming_wait = false;
                 self.ta_registered = false;
                 self.state = State::Unbound;
                 self.timer_deadline_ns = None;
@@ -558,6 +632,7 @@ impl ListenerSm {
             talker_unique_id,
             controller_entity_id,
             talker_available_index,
+            streaming_wait,
             ..
         } = ev
         {
@@ -567,6 +642,10 @@ impl ListenerSm {
                 controller_entity_id,
                 last_available_index: talker_available_index,
             });
+            self.streaming_wait = streaming_wait;
+            // STREAMING_WAIT means "bound, but do not start yet", so it is
+            // the one case where a fresh binding is not already started.
+            self.started = !streaming_wait;
         }
     }
 
@@ -672,6 +751,7 @@ mod tests {
             controller_entity_id: CTRL,
             talker_in_adp,
             talker_available_index: avail,
+            streaming_wait: false,
         }
     }
 
@@ -1054,6 +1134,7 @@ mod tests {
             controller_entity_id: CTRL,
             talker_in_adp: false,
             talker_available_index: None,
+            streaming_wait: false,
         };
         let (resp, acts) = s.on_event(ev, 900_000_000, 0);
         assert_eq!(resp, Some(AcmpResponse::Success));

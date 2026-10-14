@@ -1,22 +1,173 @@
-# AVB-Audio: context handoff (2026-10-10)
+# AVB-Audio: context handoff (2026-10-13)
 
 Native macOS AVB audio bridge. Our own NIC driver plus a Rust stack exposes a PreSonus StudioLive 16R (Milan firmware 3.3.0.109659) to DAWs (Pro Tools, Reaper) as a Core Audio device. Apple's AVB stack is bypassed entirely.
 
 Read this file first, then `AGENTS.md` (rules) and the docs it points to.
 
+## Authoritative resume point (2026-10-14)
+
+Phase 1a is complete on real hardware. Phase 1b is active on branch
+`feat/companion-app`: 64 channels each way, gPTP, MAAP, MSRP/MVRP, ACMP, AEM,
+AAF and an optional CRF talker all work against the live 16R. A user-authorized
+signed `duplex` daemon currently owns the I210; it locks gPTP and the 16R reports
+all eight audio STREAM_INPUT sinks bound to our exact stream IDs, MAAP addresses,
+VLAN 2, formats, and `CONNECTED|SAVED_STATE|FAST_CONNECT` state.
+
+The unresolved product symptom is narrower: UC Surface still does not offer us as
+a live selectable source in `Network > AVB Inputs`. Its `avb_src_*` entries retain
+our raw entity IDs marked `(offline)`, and `mixerlist` contains only the console,
+even while the live daemon proves every audio route is connected. A known-good
+Apple/Broadcom session appeared by name and was selectable. Its wire traffic is
+captured in `.agents/tmp/apple-avdecc.pcap` and `.agents/tmp/apple-enum.pcap`.
+
+The latest live ACMP diagnostic resolves a suspected index failure. Audio talker
+UIDs 0–7 bind the 16R's Return sinks 1–8. The repeated UID 8 request targets Return
+CRF sink 0, a persisted CRF route from an older model; the current product model
+intentionally has no CRF output, so `TALKER_UNKNOWN_ID` is the correct response.
+Do not reindex audio streams or add a synthetic ninth output.
+
+Do **not** resume from the older MAAP, grandmaster, talker-only entity, missing
+CRF or inert-unsolicited notes below: all are implemented and hardware-tested.
+CRF, `MEDIA_CLOCK_SOURCE`, full enumeration, sink symmetry, entity lifetime,
+available-index reset, state notifications, Apple's per-stream GET_COUNTERS
+heartbeat, controller capability, corrected descriptor indices and offsets,
+static PTP descriptors, PTP grandmaster notifications, model-ID prefix, and
+initial `CONNECT_RX.stream_id=0` have each been tested and did not change UC
+Surface's decision.
+
+Suggested next steps, in order:
+1. Capture the current live ADP/ACMP transaction and compare controller identity,
+   timing, and command sequencing byte-for-byte with the known-good Apple capture.
+2. Derive the 16R's remaining online-classification rule from that captured
+   difference; do not add protocol surface without a hardware-anchored mismatch.
+3. Before returning control to DreamAVB, stop the user-authorized unmanaged daemon
+   cleanly so the companion can again own the I210 exclusively.
+
+Validation for the staged batch is green: workspace fmt, warning-denied clippy,
+576 Rust tests, 97 tg3 host checks, 390 I210 host checks, and `scripts/package.sh`
+with both DriverKit builds and signing.
+
+**Historical notes below are retained as an implementation record. When they
+conflict with this section or the current code, this section wins.**
+
 ## Where things stand
 
 - Phase 0 is done: the Broadcom BCM57762 in Apple's Thunderbolt Gigabit adapter is rejected. RX PTP timestamps never latch. See `docs/phase0-results.md`.
 - Phase 0b is done: the Intel I210 passes every hardware gate against the 16R. Link delay is about 143 ns ± 2.5 ns and NRR is stable. See `docs/phase0b-i210-results.md`.
-- Phase 1a (16R → Mac recording to WAV, listener only) is in progress on branch `phase1a-listener`.
-  - The design is approved at rev 5: `.agents/tasks/phase1a-design.md`. Design review pass 5 is APPROVED.
-  - The plan is `.agents/tasks/phase1a-plan.md`. It is split into FEAT files under `.agents/tasks/task-phase1a-listener/`.
-- Phase 1b (Mac → 16R playback, talker) is in progress on branch `feat/companion-app`.
-  See "Phase 1b: talker" below for the resume point. **Bidirectional audio now
-  works on the live 16R** (`1e88c37`): `avb-daemon duplex` gets Listener Ready
-  in both directions, with the outbound peak measured at -8.7 dBFS and ~48000
-  frames/s inbound. Remaining known gaps are the Mac-vs-16R media clock, one
-  stream per direction out of eight, and a talker-only AEM.
+- Phase 1a (16R → Mac listener/recording) is complete. All software and live
+  hardware milestones passed; see `docs/phase1a-results.md`.
+- Phase 1b (full-duplex Core Audio product) is in progress on branch
+  `feat/companion-app`. The data plane works in both directions at 64 channels;
+  the open blocker is the 16R/UC Surface live-routing candidate described in
+  the authoritative resume point above.
+
+### Resume point (2026-10-12, `65f5676`) — why the 16R still will not route us
+
+Eight talkers reach 63 809 frames/s on the wire via the batched dext send, the
+AEM answers everything the 16R asks (`refused=0`), the Milan MVU responder is
+in, and stream destination addressing is now spec-correct.
+
+**UC Surface DOES see us, and the routing surface is `Network > AVB Inputs`.**
+A screenshot (2026-10-12 16:56) settled the question the protocol probes could
+not. It lists our entity per 8-channel bank:
+
+```
+Input 1-8    None Available
+Input 9-16   0x644BF0FFFE1273B8:1 (offline)
+Input 17-24  0x644BF0FFFE1273B8:2 (offline)
+ ...
+Input 57-64  0x644BF0FFFE1273B8:7 (offline)
+```
+
+So bank N maps to 16R `STREAM_INPUT N`, Input 1-8 taking our stream `:0`.
+Seven of our eight streams were discovered and remembered as assignments.
+`(offline)` is the controller's SAVED routing for a talker that is not
+advertising ADP at that moment — it appears the instant the daemon exits, and
+is why the user saw the banks "flash in and out": each test run advertised for
+~20 s and then stopped. It is not a discovery or protocol failure. The daemon
+must be running continuously for the banks to be assignable.
+
+`Input 1-8` reading `None Available` is Fault A seen from the controller side:
+our stream `:0` has no saved assignment because the 16R never bound that sink.
+
+The remaining faults, settled by measurement rather than reasoning:
+
+**Read `docs/milan-conformance.md` FIRST.** It checks our talker against the
+Avnu Milan Baseline Interoperability Specification v2.0a clause by clause. An
+afternoon of inferring requirements from the 16R's behaviour found nothing;
+an hour with the spec found three real violations. The open one is the likely
+blocker: **MAAP is not implemented**, and Milan §6.3.1 makes MAAP allocation a
+precondition for a Talker attribute's destination address being VALID — so
+every Talker attribute we declare is formally invalid, which is consistent
+with the 16R reserving the path, counting our frames and never media-locking.
+Do not add more descriptors or capability bits before implementing MAAP.
+
+- `GET_STREAM_INFO` on the 16R's sinks 2..8 reports CONNECTED, probing
+  COMPLETED, ACMP SUCCESS, our exact stream ids and MAAP addresses, and
+  `FRAMES_RX` climbing at 8000/s — with no format, timestamp or sequence
+  counter set. `MEDIA_LOCKED` is nonetheless still 0. **A wire dump in both
+  directions has now cleared the PDU itself**: our AAF header is
+  byte-identical to the 16R's own apart from the `mr` toggle, the stream id,
+  the sequence number and the timestamp (`format`, `nsr`,
+  `channels_per_frame`, `bit_depth`, `stream_data_length`, `sp`, `evt` all
+  match), and the presentation offsets are both sane on the locked clock —
+  ours +2125 us, the 16R's own +1327 us.
+- **`MEDIA_LOCKED=0` IS NOT A FAULT — settled from the 16R's own AEM, no
+  hardware needed.** Its `CLOCK_DOMAIN` (`clock_sources_offset=76`,
+  `clock_sources_count=11`) selects `clock_source_index=0`, which is
+  `CLOCK_SOURCE 0 = "PTP Clock"` (EXTERNAL, `loc=TIMING[0]`). Its other ten
+  sources are `Internal Clock` and nine `Input Stream N` entries pointing at
+  `STREAM_INPUT[0..8]` — and it is on NONE of them. So the 16R derives its
+  media clock from gPTP and never recovers one from our stream, which is why
+  the counter has no reason to assert. Do NOT add descriptors or conformance
+  fixes chasing it; four hours went that way. Decode it yourself with the
+  CLOCK_SOURCE/CLOCK_DOMAIN snippet against `.agents/tmp/16r-aem-full.json`.
+- **Fault A: the 16R never binds its `STREAM_INPUT 1`** ("Return 1-8",
+  channels 1-8 — and `Input 1-8` in UC Surface). `stream_id=0`,
+  `dest_mac=00:00:00:00:00:00`, `probing_status=DISABLED`. Identical with
+  eight talkers or with `--listener-uid 1` as the only stream, so it is not
+  contention. It uses descriptor indices for `listener_unique_id` (naming 2
+  binds descriptor sink 2), so it is not an index-base mismatch on our side.
+  **Not our bug, and the flag word says so:** a bound sink reads
+  `flags=0xf6000006` and this one reads `0xf2000000`; the delta `0x04000006`
+  is `CONNECTED | SAVED_STATE | FAST_CONNECT`. `SAVED_STATE` clear means the
+  CONTROLLER never saved an assignment for that bank — which is also why the
+  other seven re-bound by themselves after a 16R power cycle with no
+  controller action and this one did not. Its descriptor is byte-identical in
+  kind to the seven that bind (`flags=0x0003 CLOCK_SYNC_SOURCE|CLASS_A`,
+  `clock_domain=0`, 10 formats, same current format), so nothing in the model
+  explains it. Fix: the user assigns `Input 1-8` in UC Surface. The daemon now
+  prints `saved_assignment=no -- assign this bank in the 16R's controller`.
+- **Fault B: inbound slot 0 starves under eight concurrent talkers** — 0
+  frames placed, while one talker leaves all eight inbound slots balanced
+  within 6 frames. A listener-only run shows the 16R transmitting all eight
+  streams at 8000/s with zero sequence gaps, so reception is fine and this is
+  our own TX/RX contention in the duplex loop. The same run reports
+  1 065 764 overrun frames and a nonsensical 98.9e9 "gap frames", so the gap
+  accounting regressed too.
+
+Useful instruments added here: `GET_STREAM_INFO` + repeated `GET_COUNTERS`
+probes in the duplex talker (see `stack.rs`, `SINK_PROBE_COUNT`);
+`dump_aaf_pdu`, which prints one PDU per direction through ONE formatter so
+ours is directly comparable to the 16R's known-good bytes, with each PDU's
+presentation offset against our own gPTP clock; and `aem-dump` now walks EVERY
+advertised descriptor type rather than filtering to
+`AUDIO_UNIT | STREAM_INPUT | STREAM_OUTPUT` — the filtered version is why 21
+earlier captures contained no CONTROL and no CLOCK_DOMAIN. Full 37-descriptor
+capture: `.agents/tmp/16r-aem-full.json`.
+
+The inbound dump is gated on `armed` deliberately. Dumping the first inbound
+PDU reads a PRE-STEP clock — the first arrives during discovery and the servo's
+opening step can be hundreds of ms — which measured the 16R's presentation
+offset as −475 ms, purely the step not yet applied. Both dumps must come off
+the same locked clock to be comparable at all.
+
+Read off the AEM capture, all hardware-anchored: the 16R's `STREAM_OUTPUT 0` /
+`STREAM_INPUT 0` are **CRF** ("Send CRF" / "Return CRF"), its audio streams are
+indices 1..8 at `0x0205022002006000` (48 kHz, INT_32, depth 32, 8 ch, 6 spf),
+its CLOCK_DOMAIN 0 runs on clock source 0 "PTP Clock" (EXTERNAL → TIMING), and
+its `counters_valid` is `0x0f3f` = Milan's STREAM_INPUT set minus
+`TIMESTAMP_VALID`/`NOT_VALID` at bits 6-7.
 
 | FEAT | Scope | Status | Commit |
 |---|---|---|---|
@@ -519,6 +670,99 @@ TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ make -C /Users/dexter/AVB-Audio/driv
 - SIP is **disabled**, `boot-args=amfi_get_out_of_my_way=1` is set, and `systemextensionsctl developer on`.
 - To undo: `sudo nvram -d boot-args`, `systemextensionsctl developer off`, then `csrutil enable` from Recovery.
 - Signing uses "Apple Development: armitage787@gmail.com", Team `8NG8NMGYVF`. This is a free personal team with no DriverKit profile. That is why AMFI is disabled.
+- **Why AMFI specifically, and what would replace it** (checked 2026-10-12):
+  the dext claims three *restricted* entitlements —
+  `com.apple.developer.driverkit`,
+  `...driverkit.transport.pci` (`IOPCIPrimaryMatch 0x15338086`) and
+  `...driverkit.allow-any-userclient-access`. Its signature is already
+  **valid** (Apple Development → WWDR → Apple Root, `flags=0x0(none)`), and
+  `find ... -name '*.provisionprofile'` in `build/AVBInstaller.app` returns
+  nothing. So the check AMFI fails is *entitlement authorization* ("restricted
+  entitlements, but the validation of its code signature failed"), not
+  signature validity. `amfi_allow_any_signature=1` only relaxes signature
+  validity, so it is **not** expected to be sufficient; only
+  `amfi_get_out_of_my_way=1` (full AMFI disable) bypasses the entitlement
+  allowlist.
+- **Cost of AMFI off:** with AMFI disabled, TCC cannot attribute a code
+  identity, so microphone/camera permission prompts silently fail in unrelated
+  apps (documented: OpenCore-Legacy-Patcher issue #380). This is a real,
+  known side effect, not a coincidence.
+- **The escape route now exists.** Apple changed DriverKit entitlement policy:
+  "development" variants of the DriverKit entitlements are available on **any
+  paid** developer account with **no Apple approval** (Apple DTS, forums
+  threads 718069 / 809202). A paid account ($99/yr) → enable the DriverKit
+  capability on the App ID → create a *DriverKit development provisioning
+  profile* → embed it in the dext → **AMFI can go back on**. SIP must stay
+  disabled plus `systemextensionsctl developer on` (Apple's own documented
+  dext dev requirement), but SIP-off alone does not break TCC the way AMFI-off
+  does. PCI/USB transport entitlements need the `IOPCIPrimaryMatch` dict added
+  to the plist by hand, outside Xcode's capabilities editor.
+- **When SIP can come back** (checked 2026-10-12). SIP-off buys exactly one
+  thing: `systemextensionsctl developer on` for the dext. It is **not** needed
+  for the CoreAudio plug-in — `/Library/Audio/Plug-Ins/HAL` carries no
+  `restricted` flag and is absent from `/System/Library/Sandbox/rootless.conf`.
+  Three gates, in increasing difficulty:
+  1. *AMFI on, SIP off* — paid account + DriverKit development profile. The
+     development entitlement variant is a **wildcard** (`*`), so it authorizes
+     matching any PCI device and needs no per-vendor grant; the IOKit
+     personality still restricts actual matching to 8086:1533 (Apple DTS,
+     forums thread 798049).
+  2. *SIP on, still developing* — Apple DTS says the newer Xcode-integrated
+     signing process replaces "disabling SIP and local signing" (thread
+     809202), and the analogous EndpointSecurity dev-profile path is reported
+     working with SIP enabled (thread 125508). Undocumented, so prove it.
+     Needs: the host app in **`/Applications`** (thread 767152) rather than
+     `build/`, and profiles for the APP too — `avb-installer` carries
+     `com.apple.developer.system-extension.install`, `avb-daemon` and
+     `avb-probe` carry `...driverkit.userclient-access`, all restricted. Dev
+     profiles are device-scoped, so this Mac must be registered.
+  3. *Shipping* — production `...transport.pci` for 8086:1533, which is
+     per-vendor-ID and Apple-approved. Weak: 8086 is **Intel's** VID, not
+     ours, on a NIC Apple's own `AppleEthernetE1000` claims, and Apple asks
+     about written authorization from the VID owner (thread 842748). One
+     USB-transport request sat in "Submitted" for months (thread 845213).
+     Do not plan around this.
+- **Landmine: re-enabling AMFI may break the CoreAudio plug-in too.** Our
+  installed `AVBAudio.driver` is `flags=0x2(adhoc)`, `TeamIdentifier=not set`,
+  `spctl: rejected`. Library validation is an AMFI MACF policy
+  (`file_check_library_validation`), so the adhoc bundle loads today only
+  *because AMFI is off*. Every third-party HAL plug-in on this machine that
+  works on a stock Mac is at least Developer ID signed: Waves SoundGrid is
+  Developer ID, **not** notarized, no hardened runtime — that is the minimum
+  working configuration to copy. Avid's is Developer ID + runtime + notarized.
+  So a paid account is needed twice over: a dev profile for the dext, and a
+  **Developer ID Application** signature (no hardened runtime) for the HAL
+  plug-in. Flip AMFI and the dext before assuming the audio device survives.
+- **Provisioning procedure** (prepared 2026-10-12). `package.sh` now embeds a
+  profile when one is present at `packaging/profiles/i210-dext.provisionprofile`
+  (dext) or `packaging/profiles/installer-app.provisionprofile` (app), and
+  prints "entitlements stay UNAUTHORIZED" when they are absent, so the current
+  AMFI-off build is unchanged. The directory is gitignored (profiles are
+  device- and account-scoped). Facts needed in the portal:
+  - Team `8NG8NMGYVF`; cert "Apple Development: armitage787@gmail.com"
+    (`D6DED86246DE6B98EB5A31FA4C2F2C240DBDAA92`), expires 2027-08-10.
+  - This Mac's **Provisioning UDID** is `00006040-001C30880E20801C`
+    (`system_profiler SPHardwareDataType`). Dev profiles are device-scoped.
+  - App IDs to register: `com.avbaudio.installer` (app) and
+    `com.avbaudio.installer.i210` (dext, must stay a prefix-extension).
+  - Profile type is **DriverKit development** (Profiles → + → Development);
+    only App IDs with a DriverKit capability are offered it. Apple's steps:
+    developer.apple.com/help/account/manage-provisioning-profiles/create-a-driverkit-development-provisioning-profile
+  - Embedded profile filename is `embedded.provisionprofile`, confirmed from
+    Xcode's own DriverKit platform plug-in
+    (`IDEDriverKitSupportCore.xcplugindata`, `embeddedProvisioningProfileName`).
+    A dext is a flat bundle so it sits at the bundle **root**; the app's goes
+    in `Contents/`. It must be copied **before** `codesign` — it is a sealed
+    resource.
+  - The dext entitlements file needs **no change**: a wildcard profile permits
+    a narrower `IOPCIPrimaryMatch`, and keeping `0x15338086` stays accurate.
+  - **Open question:** forum thread 795835 states "There's no 'development
+    only' capability for PCI", contradicting the DTS claim of development
+    variants for *all* DriverKit entitlements (thread 809202, which also says
+    they "allow a DEXT to match against any hardware"). The portal's
+    capability list for the App ID decides it; if no PCI development
+    capability is offered, fall back to Capability Requests. Resolve this
+    before assuming $99 is sufficient.
 - Our dext `com.avbaudio.installer.i210` (282.7.31, the Phase 0b build) owns the I210, 8086:1533 / subsystem 1ab6:0214, behind Thunderbolt. en7 is gone while we own it.
   - The ABI v3 dext from FEAT-001 has **not** been activated on hardware yet.
 - The I210 is cabled directly to the 16R. There is no switch. The 16R's gPTP port identity is `00:0a:92:ff:fe:03:3b:a9/1`.

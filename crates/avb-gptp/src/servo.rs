@@ -36,6 +36,27 @@ pub enum ServoState {
     Tracking,
     Locked,
     Holdover,
+    /// We ARE the grandmaster: our clock defines the domain's time, so there
+    /// is nothing to discipline to.
+    ///
+    /// Deliberately NOT Holdover, which they superficially resemble because
+    /// both freeze `f` and `i`. Holdover means the reference was lost and our
+    /// time is drifting away from it, so it degrades with age and a listener
+    /// should eventually distrust it. TimeSource has nothing to drift away
+    /// FROM — our oscillator is the definition — so it does not degrade and
+    /// is a fully fit clock to timestamp a stream with.
+    TimeSource,
+}
+
+impl ServoState {
+    /// Is SYSTIM fit to timestamp a stream with?
+    ///
+    /// True while Locked (we track a grandmaster) and while TimeSource (we
+    /// are one). False while acquiring, and false in Holdover, where the
+    /// reference is gone and the error is unbounded and growing.
+    pub const fn is_usable_clock(self) -> bool {
+        matches!(self, Self::Locked | Self::TimeSource)
+    }
 }
 
 impl ServoState {
@@ -45,6 +66,7 @@ impl ServoState {
             Self::Tracking => "TRACKING",
             Self::Locked => "LOCKED",
             Self::Holdover => "HOLDOVER",
+            Self::TimeSource => "TIMESOURCE",
         }
     }
 }
@@ -152,6 +174,11 @@ impl Servo {
 
     /// No Sync for 3·Ts, asCapable false, or port → Listening: freeze f and i.
     /// ACQUIRE stays ACQUIRE (it has nothing to hold).
+    ///
+    /// TIMESOURCE does not fall back to holdover either: a grandmaster has no
+    /// reference to have lost. Leaving the master role goes through
+    /// `acquire()` instead, because a clock that was free-running has no
+    /// valid tracking state against the new grandmaster.
     pub fn holdover(&mut self) -> bool {
         match self.state {
             ServoState::Tracking | ServoState::Locked => {
@@ -160,8 +187,27 @@ impl Servo {
                 self.unlock_run = 0;
                 true
             }
-            ServoState::Acquire | ServoState::Holdover => false,
+            ServoState::Acquire | ServoState::Holdover | ServoState::TimeSource => false,
         }
+    }
+
+    /// We won BTCA: become the domain's time source.
+    ///
+    /// `f` and `i` are FROZEN AS THEY ARE, not reset to zero. If we were
+    /// slaving at −83 ppm and reverted to the raw oscillator rate, that is an
+    /// 83 ppm frequency step on the clock every listener and the media clock
+    /// are already tuned to — audible as a timing discontinuity and able to
+    /// over- or under-run a listener's buffer. The rate we were holding is
+    /// also the rate the domain has agreed on, so continuing at it is both
+    /// the gentler and the more correct choice. Only the CORRECTIONS stop.
+    pub fn become_time_source(&mut self) -> bool {
+        if self.state == ServoState::TimeSource {
+            return false;
+        }
+        self.state = ServoState::TimeSource;
+        self.lock_run = 0;
+        self.unlock_run = 0;
+        true
     }
 
     /// One usable Sync. `rate_ratio` = (1 + cSRO·2^-41)·NRR_systim.
@@ -173,6 +219,13 @@ impl Servo {
                 self.track(offset_ns)
             }
             ServoState::Tracking | ServoState::Locked => self.track(offset_ns),
+            // A Sync reaching a grandmaster is not a correction to apply: our
+            // clock is the reference it would be measured against. Disciplining
+            // to it would make the domain's time chase a follower.
+            ServoState::TimeSource => ServoOutput {
+                step: None,
+                adj_ppb: None,
+            },
         }
     }
 
@@ -260,7 +313,10 @@ impl Servo {
                     self.unlock_run = 0;
                 }
             }
-            ServoState::Acquire | ServoState::Holdover => {}
+            // `track` is never reached in either: Acquire and Holdover are
+            // dispatched elsewhere by on_sync, and TimeSource returns before
+            // any correction is computed.
+            ServoState::Acquire | ServoState::Holdover | ServoState::TimeSource => {}
         }
         ServoOutput {
             step: None,
