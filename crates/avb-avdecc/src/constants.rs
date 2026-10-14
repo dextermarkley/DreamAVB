@@ -69,6 +69,15 @@ pub mod aem_cmd {
     pub const GET_STREAM_INFO: u16 = 0x000F;
     pub const SET_NAME: u16 = 0x0010;
     pub const GET_NAME: u16 = 0x0011;
+    /// IEEE 1722.1-2021 §7.4.25 / §7.4.26. Milan v1.3 §5.4.2.17-18 require
+    /// both for the "Identify" control.
+    pub const SET_CONTROL: u16 = 0x0018;
+    pub const GET_CONTROL: u16 = 0x0019;
+    /// IEEE 1722.1-2021 §7.4.35 / §7.4.36. Milan v1.3 §5.4.2.19-20 require
+    /// both for each Stream Input, and require NOT_SUPPORTED for a Stream
+    /// Output.
+    pub const START_STREAMING: u16 = 0x0022;
+    pub const STOP_STREAMING: u16 = 0x0023;
     pub const SET_SAMPLING_RATE: u16 = 0x0012;
     pub const GET_SAMPLING_RATE: u16 = 0x0013;
     pub const SET_CLOCK_SOURCE: u16 = 0x0016;
@@ -79,6 +88,10 @@ pub mod aem_cmd {
     pub const GET_AS_PATH: u16 = 0x0028;
     pub const GET_COUNTERS: u16 = 0x0029;
     pub const GET_AUDIO_MAP: u16 = 0x002B;
+    /// IEEE 1722.1-2021 GET_PTP_INSTANCE_GRANDMASTER_INFO. Numeric value is
+    /// transcribed from the on-box AudioVideoBridging.framework AVBConstants.h
+    /// and independently observed in Apple's unsolicited response to the 16R.
+    pub const GET_PTP_INSTANCE_GRANDMASTER_INFO: u16 = 0x0053;
 }
 
 /// AEM descriptor types (IEEE 1722.1-2021 §7.2, Table 7.1).
@@ -100,6 +113,11 @@ pub mod desc {
     pub const AUDIO_MAP: u16 = 0x0017;
     pub const CONTROL: u16 = 0x001A;
     pub const CLOCK_DOMAIN: u16 = 0x0024;
+    /// IEEE 1722.1-2021 descriptors. Values are anchored by the 16R's real
+    /// CONFIGURATION and descriptor responses in `16r-aem-with-ptp2.json`.
+    pub const TIMING: u16 = 0x0026;
+    pub const PTP_INSTANCE: u16 = 0x0027;
+    pub const PTP_PORT: u16 = 0x0028;
 
     /// Stable name for the AEM dump JSON and logs.
     pub fn name(t: u16) -> Option<&'static str> {
@@ -121,6 +139,9 @@ pub mod desc {
             AUDIO_MAP => "AUDIO_MAP",
             CONTROL => "CONTROL",
             CLOCK_DOMAIN => "CLOCK_DOMAIN",
+            TIMING => "TIMING",
+            PTP_INSTANCE => "PTP_INSTANCE",
+            PTP_PORT => "PTP_PORT",
             _ => return None,
         })
     }
@@ -232,7 +253,27 @@ pub mod acmp_flags {
     pub const STREAMING_WAIT: u16 = 1 << 3;
     pub const SUPPORTS_ENCRYPTED: u16 = 1 << 4;
     pub const ENCRYPTED_PDU: u16 = 1 << 5;
+    /// DISCREPANCY -- do not "clean this up" without IEEE 1722.1-2021 in hand.
+    ///
+    /// Milan v1.3 §5.5.2.2 says *"The SRP_REGISTRATION_FAILED flag is renamed
+    /// to REGISTERING_FAILED"*, and its Table 5.23 gives that flag the field
+    /// value `0x00000040` (bit #25 in the spec's MSB-first numbering) -- the
+    /// same bit this constant calls `TALKER_FAILED`. One of the two names is a
+    /// mis-transcription of 1722.1's own table, and the spec we hold names the
+    /// bit by its value, so the VALUE is certain and the NAME is not.
+    ///
+    /// Both names are kept, deliberately, so neither reading is lost. Resolve
+    /// it against 1722.1-2021 Table 8-4 before deleting either.
     pub const TALKER_FAILED: u16 = 1 << 6;
+    /// Milan v1.3 Table 5.23, by its stated field value. In a
+    /// `GET_TX_STATE_RESPONSE` it means the source is declaring a Talker
+    /// Advertise or Talker Failed attribute AND registering a matching
+    /// Listener Asking Failed attribute. Table 5.48 requires it CLEAR in a
+    /// `PROBE_TX_RESPONSE` on success.
+    pub const REGISTERING_FAILED: u16 = 0x0040;
+    /// §5.5.2.2: *"the CL_ENTRIES_VALID flag shall always be 0"* and
+    /// `connected_listeners_entries` is a reserved field.
+    pub const CL_ENTRIES_VALID: u16 = 1 << 7;
 }
 
 /// Clock source types (IEEE 1722.1-2021 §7.2.9, Table 7.14).
@@ -240,6 +281,31 @@ pub mod clock_source {
     pub const INTERNAL: u16 = 0x0000;
     pub const EXTERNAL: u16 = 0x0001;
     pub const INPUT_STREAM: u16 = 0x0002;
+}
+/// The "no localized string" sentinel for a descriptor's
+/// `localized_description`, and for any other `0xffff`-means-absent field.
+///
+/// Read off the 16R, which uses it in every descriptor it sends. A literal 0
+/// would instead name string 0 of locale 0 and send a controller to a STRINGS
+/// descriptor we do not advertise.
+pub const NO_STRING: u16 = 0xffff;
+
+/// CONTROL `control_value_type` (§7.3.5). Only the one the 16R's own IDENTIFY
+/// control uses is named: the others carry different `values` blocks that we
+/// have never read off the wire, and naming them here would invite encoding a
+/// layout we cannot check.
+pub mod control_value_type {
+    /// One unsigned byte, with a 9-byte
+    /// minimum/maximum/step/default/current/unit/string block.
+    pub const LINEAR_UINT8: u16 = 0x0001;
+}
+
+/// CONTROL `control_type` (§7.3.4): an OUI-24 followed by the control's index
+/// within it. `90:e0:f0` is the IEEE AVB OUI.
+pub mod control_type {
+    /// Milan's required identify control. Transcribed from the 16R's own
+    /// CONTROL descriptor, not derived from the OUI by hand.
+    pub const IDENTIFY: u64 = 0x90e0_f000_0000_0001;
 }
 /// AVB_INTERFACE `interface_flags` (§7.2.8). The design (§9.3) names the two
 /// we set: GPTP_SUPPORTED and SRP_SUPPORTED. GPTP_GRANDMASTER_SUPPORTED is
@@ -308,6 +374,7 @@ mod tests {
         assert_eq!(aem_cmd::GET_AVB_INFO, 0x0027);
         assert_eq!(aem_cmd::GET_COUNTERS, 0x0029);
         assert_eq!(aem_cmd::GET_AUDIO_MAP, 0x002B);
+        assert_eq!(aem_cmd::GET_PTP_INSTANCE_GRANDMASTER_INFO, 0x0053);
     }
 
     #[test]
@@ -323,6 +390,9 @@ mod tests {
         assert_eq!(desc::AUDIO_CLUSTER, 0x0014);
         assert_eq!(desc::AUDIO_MAP, 0x0017);
         assert_eq!(desc::CLOCK_DOMAIN, 0x0024);
+        assert_eq!(desc::TIMING, 0x0026);
+        assert_eq!(desc::PTP_INSTANCE, 0x0027);
+        assert_eq!(desc::PTP_PORT, 0x0028);
         assert_eq!(desc::name(0x0006), Some("STREAM_OUTPUT"));
         assert_eq!(desc::name(0x1234), None);
     }

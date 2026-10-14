@@ -43,6 +43,37 @@ pub const DEFAULT_DOMAIN: Domain = Domain {
     vid: 2,
 };
 
+/// SR class A observation interval, 125 µs.
+pub const CLASS_A_INTERVAL_NS: u32 = 125_000;
+
+/// The value a class A TALKER puts in `accumulated_latency_ns` when it first
+/// declares a Talker Advertise.
+///
+/// `accumulated_latency` accumulates along the path, and it is tempting to
+/// read that as "a directly-cabled talker with no bridge in between declares
+/// 0". That reading is WRONG, and two reference devices on the same direct
+/// cable say so — captured off the wire, not inferred:
+///
+/// ```text
+/// Apple macOS AVB talker   accumulated_latency = 12 836 ns
+/// PreSonus StudioLive 16R  accumulated_latency = 150 000 ns
+/// ```
+///
+/// Neither has a bridge in the path either. The quantity does not start at
+/// zero and get added to; it starts at the TALKER'S OWN latency — the
+/// worst-case delay from a sample being sourced to its frame reaching the
+/// wire — and bridges add their transit time to that. Declaring 0 claims a
+/// stream arrives with no latency at all, which is not merely optimistic but
+/// physically impossible, and a listener sizes its de-jitter buffer from it.
+///
+/// We declare one observation interval. A class A talker emits one frame per
+/// 125 µs interval (`max_interval_frames = 1`), so a sample placed in the
+/// output ring waits at most one full interval before its frame is sent.
+/// That is an upper bound we can defend from our own packetiser's structure
+/// rather than a measured figure, and it sits between the two reference
+/// devices' values.
+pub const TALKER_INITIAL_ACCUMULATED_LATENCY_NS: u32 = CLASS_A_INTERVAL_NS;
+
 /// Reservation failure codes that mean "not enough bandwidth / resources"
 /// (802.1Q-2018 Table 35-6 *(verify codes)*); a Talker Failed with one of
 /// these classifies the stream A-5 `not_simultaneously_streamable` (design

@@ -13,6 +13,7 @@ use avb_avtp::stream_format::StreamFormat;
 use avb_core::{Eui64, MacAddr};
 
 use super::model::*;
+use crate::constants::NO_STRING;
 use crate::wire::{Rd, Wr};
 
 /// Fixed name-field length in an AEM descriptor (§7.2.1).
@@ -34,6 +35,9 @@ const AUDIO_UNIT_RATES_OFFSET: u16 = 144;
 /// `STREAM_INPUT`/`STREAM_OUTPUT.formats_offset`.
 const STREAM_FORMATS_OFFSET: u16 = 132;
 
+/// `CLOCK_DOMAIN.clock_sources_offset`.
+const CLOCK_DOMAIN_SOURCES_OFFSET: u16 = 76;
+
 /// Bytes of port/count pairs between `base_stream_output_port` and
 /// `current_sampling_rate` in an AUDIO_UNIT: 14 `(number_of_*, base_*)` pairs
 /// (external in/out, internal in/out, controls, signal selectors, mixers,
@@ -47,6 +51,25 @@ const AUDIO_UNIT_PORT_PAIRS_BYTES: usize = 56;
 /// `avb_interface_index` in a STREAM descriptor: three `(entity_id, unique_id)`
 /// backup pairs plus one backed-up pair, 10 bytes each.
 const STREAM_BACKUP_FIELDS_BYTES: usize = 40;
+
+/// Read a 64-byte NUL-padded name out of a raw field, for the GET_NAME /
+/// SET_NAME payloads which carry one outside any descriptor.
+pub fn name_from_bytes(b: &[u8]) -> String {
+    let b = b.get(..NAME_LEN).unwrap_or(b);
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(b.get(..end).unwrap_or(b)).into_owned()
+}
+
+/// The 64-byte NUL-padded encoding of a name, truncated to fit.
+pub fn name_to_bytes(s: &str) -> [u8; NAME_LEN] {
+    let mut buf = [0u8; NAME_LEN];
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(NAME_LEN);
+    if let (Some(dst), Some(src)) = (buf.get_mut(..n), bytes.get(..n)) {
+        dst.copy_from_slice(src);
+    }
+    buf
+}
 
 fn read_name(r: &mut Rd) -> Option<String> {
     let b = r.take(NAME_LEN)?;
@@ -174,8 +197,8 @@ pub fn encode_entity(d: &EntityDesc) -> Vec<u8> {
     w.u32(d.available_index);
     w.u64(d.association_id);
     write_name(&mut w, &d.entity_name);
-    w.u16(0); // vendor_name_string
-    w.u16(1); // model_name_string
+    w.u16(NO_STRING); // vendor_name_string: no LOCALE/STRINGS advertised
+    w.u16(NO_STRING); // model_name_string: no LOCALE/STRINGS advertised
     write_name(&mut w, &d.firmware_version);
     write_name(&mut w, ""); // group_name
     write_name(&mut w, &d.serial_number);
@@ -230,7 +253,7 @@ pub fn encode_configuration(d: &ConfigurationDesc) -> Vec<u8> {
     w.u16(crate::constants::desc::CONFIGURATION);
     w.u16(0);
     write_name(&mut w, &d.object_name);
-    w.u16(0); // localized_description
+    w.u16(NO_STRING); // localized_description: no LOCALE/STRINGS advertised
     let counts = d.descriptor_counts.len().min(MAX_DESCRIPTORS_PER_TYPE) as u16;
     w.u16(counts);
     // descriptor_counts_offset is ABSOLUTE from the descriptor's first byte
@@ -252,11 +275,20 @@ pub fn decode_configuration(pdu: &[u8]) -> Option<ConfigurationDesc> {
     r.skip(2)?; // localized_description
     let counts_count = r.u16()?;
     let counts_offset = r.u16()?;
-    let descriptor_counts = read_u16_pairs_at(
-        pdu,
-        usize::from(counts_offset),
-        usize::from(counts_count).min(MAX_DESCRIPTORS_PER_TYPE),
-    );
+    let declared = usize::from(counts_count).min(MAX_DESCRIPTORS_PER_TYPE);
+    // CONFIGURATION ends with descriptor_counts[], so complete pairs after the
+    // advertised count cannot be a later field. The 16R firmware declares 10
+    // pairs but sends 11; the trailing hardware-captured pair is
+    // PTP_INSTANCE(0), which its unsolicited GET_DYNAMIC_INFO also references.
+    // Consume complete trailing pairs for interoperability while keeping our
+    // encoder strict and refusing any partial tail.
+    let available = pdu
+        .get(usize::from(counts_offset)..)
+        .filter(|tail| tail.len() % 4 == 0)
+        .map_or(declared, |tail| tail.len() / 4)
+        .min(MAX_DESCRIPTORS_PER_TYPE);
+    let descriptor_counts =
+        read_u16_pairs_at(pdu, usize::from(counts_offset), declared.max(available));
     Some(ConfigurationDesc {
         object_name,
         descriptor_counts,
@@ -270,7 +302,7 @@ pub fn encode_audio_unit(d: &AudioUnitDesc) -> Vec<u8> {
     w.u16(crate::constants::desc::AUDIO_UNIT);
     w.u16(0);
     write_name(&mut w, &d.object_name);
-    w.u16(0); // localized_description
+    w.u16(NO_STRING); // localized_description: no LOCALE/STRINGS advertised
     w.u16(d.clock_domain_index);
     w.u16(d.number_of_stream_input_ports);
     w.u16(0); // base_stream_input_port
@@ -339,7 +371,7 @@ pub fn encode_stream(d: &StreamDesc, is_input: bool) -> Vec<u8> {
     });
     w.u16(0);
     write_name(&mut w, &d.object_name);
-    w.u16(0); // localized_description
+    w.u16(NO_STRING); // localized_description: no LOCALE/STRINGS advertised
     w.u16(d.clock_domain_index);
     w.u16(d.stream_flags);
     w.u64(d.current_format.0);
@@ -402,7 +434,7 @@ pub fn encode_avb_interface(d: &AvbInterfaceDesc) -> Vec<u8> {
     w.u16(crate::constants::desc::AVB_INTERFACE);
     w.u16(0);
     write_name(&mut w, &d.object_name);
-    w.u16(0); // localized_description
+    w.u16(NO_STRING); // localized_description: no LOCALE/STRINGS advertised
     w.put(&d.mac_address.0);
     w.u16(d.interface_flags);
     w.u64(d.clock_identity.to_u64());
@@ -462,7 +494,7 @@ pub fn encode_clock_source(d: &ClockSourceDesc) -> Vec<u8> {
     w.u16(crate::constants::desc::CLOCK_SOURCE);
     w.u16(0);
     write_name(&mut w, &d.object_name);
-    w.u16(0);
+    w.u16(NO_STRING); // localized_description: no LOCALE/STRINGS advertised
     w.u16(d.clock_source_flags);
     w.u16(d.clock_source_type);
     w.u64(d.clock_source_identifier);
@@ -491,6 +523,76 @@ pub fn decode_clock_source(pdu: &[u8]) -> Option<ClockSourceDesc> {
     })
 }
 
+// ---- CONTROL ----
+
+/// Fixed-field length of a CONTROL descriptor, i.e. where `values` starts.
+/// The 16R's own descriptor reports `values_offset = 104`, which is what
+/// pins this constant to hardware rather than to arithmetic.
+pub const CONTROL_VALUES_OFFSET: u16 = 104;
+
+pub fn encode_control(d: &ControlDesc) -> Vec<u8> {
+    let mut w = Wr::new();
+    w.u16(crate::constants::desc::CONTROL);
+    w.u16(0);
+    write_name(&mut w, &d.object_name);
+    w.u16(d.localized_description);
+    w.u32(d.block_latency);
+    w.u32(d.control_latency);
+    w.u16(d.control_domain);
+    w.u16(d.control_value_type);
+    w.u64(d.control_type);
+    w.u32(d.reset_time);
+    // A real offset, not a placeholder: an unpatched 0 here is how our STREAM
+    // encoder shipped a formats array no conformant controller could find.
+    w.u16(CONTROL_VALUES_OFFSET);
+    w.u16(d.number_of_values);
+    w.u16(d.signal_type);
+    w.u16(d.signal_index);
+    w.u16(d.signal_output);
+    let mut v = w.into_vec();
+    debug_assert_eq!(v.len(), CONTROL_VALUES_OFFSET as usize);
+    v.extend_from_slice(&d.values);
+    v
+}
+
+pub fn decode_control(pdu: &[u8]) -> Option<ControlDesc> {
+    let mut r = Rd::new(pdu);
+    r.skip(4)?;
+    let object_name = read_name(&mut r)?;
+    let localized_description = r.u16()?;
+    let block_latency = r.u32()?;
+    let control_latency = r.u32()?;
+    let control_domain = r.u16()?;
+    let control_value_type = r.u16()?;
+    let control_type = r.u64()?;
+    let reset_time = r.u32()?;
+    let values_offset = r.u16()?;
+    let number_of_values = r.u16()?;
+    let signal_type = r.u16()?;
+    let signal_index = r.u16()?;
+    let signal_output = r.u16()?;
+    // Read `values` from the offset the DEVICE states, not from where our own
+    // fixed fields happen to end. A device that lays the block out elsewhere
+    // is conformant, and trusting our own arithmetic over its stated offset is
+    // the mistake that made the 16R's AUDIO_UNIT sample rate decode as 0 Hz.
+    let values = pdu.get(values_offset as usize..)?.to_vec();
+    Some(ControlDesc {
+        object_name,
+        localized_description,
+        block_latency,
+        control_latency,
+        control_domain,
+        control_value_type,
+        control_type,
+        reset_time,
+        number_of_values,
+        signal_type,
+        signal_index,
+        signal_output,
+        values,
+    })
+}
+
 // ---- CLOCK_DOMAIN ----
 
 pub fn encode_clock_domain(d: &ClockDomainDesc) -> Vec<u8> {
@@ -498,9 +600,9 @@ pub fn encode_clock_domain(d: &ClockDomainDesc) -> Vec<u8> {
     w.u16(crate::constants::desc::CLOCK_DOMAIN);
     w.u16(0);
     write_name(&mut w, &d.object_name);
-    w.u16(0);
+    w.u16(NO_STRING); // localized_description: no LOCALE/STRINGS advertised
     w.u16(d.clock_source_index);
-    w.u16(8); // clock_sources_offset (name 64 + loc 2 + index 2 + count 2 + off 2)
+    w.u16(CLOCK_DOMAIN_SOURCES_OFFSET);
     let n = d.clock_sources.len() as u16;
     w.u16(n);
     for &s in &d.clock_sources {
@@ -515,16 +617,118 @@ pub fn decode_clock_domain(pdu: &[u8]) -> Option<ClockDomainDesc> {
     let object_name = read_name(&mut r)?;
     r.skip(2)?;
     let clock_source_index = r.u16()?;
-    r.skip(2)?; // clock_sources_offset
+    let clock_sources_offset = r.u16()?;
     let n = r.u16()?;
+    let mut sources = Rd::new(pdu.get(usize::from(clock_sources_offset)..)?);
     let mut clock_sources = Vec::new();
     for _ in 0..n.min(MAX_DESCRIPTORS_PER_TYPE as u16) {
-        clock_sources.push(r.u16()?);
+        clock_sources.push(sources.u16()?);
     }
     Some(ClockDomainDesc {
         object_name,
         clock_source_index,
         clock_sources,
+    })
+}
+
+// ---- TIMING / PTP_INSTANCE / PTP_PORT -------------------------------------
+
+const TIMING_INSTANCES_OFFSET: u16 = 76;
+
+pub fn encode_timing(d: &TimingDesc) -> Vec<u8> {
+    let mut w = Wr::new();
+    w.u16(crate::constants::desc::TIMING);
+    w.u16(0);
+    write_name(&mut w, &d.object_name);
+    w.u16(NO_STRING);
+    w.u16(d.algorithm);
+    w.u16(TIMING_INSTANCES_OFFSET);
+    let n = d.ptp_instances.len().min(MAX_DESCRIPTORS_PER_TYPE) as u16;
+    w.u16(n);
+    for &index in d.ptp_instances.iter().take(usize::from(n)) {
+        w.u16(index);
+    }
+    w.into_vec()
+}
+
+pub fn decode_timing(pdu: &[u8]) -> Option<TimingDesc> {
+    let mut r = Rd::new(pdu);
+    r.skip(4)?;
+    let object_name = read_name(&mut r)?;
+    r.skip(2)?;
+    let algorithm = r.u16()?;
+    let offset = r.u16()?;
+    let n = r.u16()?;
+    let mut instances = Rd::new(pdu.get(usize::from(offset)..)?);
+    let mut ptp_instances = Vec::new();
+    for _ in 0..n.min(MAX_DESCRIPTORS_PER_TYPE as u16) {
+        ptp_instances.push(instances.u16()?);
+    }
+    Some(TimingDesc {
+        object_name,
+        algorithm,
+        ptp_instances,
+    })
+}
+
+pub fn encode_ptp_instance(d: &PtpInstanceDesc) -> Vec<u8> {
+    let mut w = Wr::new();
+    w.u16(crate::constants::desc::PTP_INSTANCE);
+    w.u16(0);
+    write_name(&mut w, &d.object_name);
+    w.u16(NO_STRING);
+    w.u64(d.clock_identity.to_u64());
+    w.u32(d.flags);
+    w.u16(d.number_of_controls);
+    w.u16(d.base_control);
+    w.u16(d.number_of_ptp_ports);
+    w.u16(d.base_ptp_port);
+    w.into_vec()
+}
+
+pub fn decode_ptp_instance(pdu: &[u8]) -> Option<PtpInstanceDesc> {
+    let mut r = Rd::new(pdu);
+    r.skip(4)?;
+    Some(PtpInstanceDesc {
+        object_name: read_name(&mut r)?,
+        clock_identity: Eui64::from_u64({
+            r.skip(2)?;
+            r.u64()?
+        }),
+        flags: r.u32()?,
+        number_of_controls: r.u16()?,
+        base_control: r.u16()?,
+        number_of_ptp_ports: r.u16()?,
+        base_ptp_port: r.u16()?,
+    })
+}
+
+pub fn encode_ptp_port(d: &PtpPortDesc) -> Vec<u8> {
+    let mut w = Wr::new();
+    w.u16(crate::constants::desc::PTP_PORT);
+    w.u16(0);
+    write_name(&mut w, &d.object_name);
+    w.u16(NO_STRING);
+    w.u16(d.port_number);
+    w.u16(d.port_type);
+    w.u32(d.flags);
+    w.u16(d.avb_interface_index);
+    w.put(&d.profile_identifier.0);
+    w.into_vec()
+}
+
+pub fn decode_ptp_port(pdu: &[u8]) -> Option<PtpPortDesc> {
+    let mut r = Rd::new(pdu);
+    r.skip(4)?;
+    let object_name = read_name(&mut r)?;
+    r.skip(2)?;
+    Some(PtpPortDesc {
+        object_name,
+        port_number: r.u16()?,
+        port_type: r.u16()?,
+        flags: r.u32()?,
+        avb_interface_index: r.u16()?,
+        profile_identifier: MacAddr(r.arr()?),
     })
 }
 
@@ -573,7 +777,7 @@ pub fn encode_audio_cluster(d: &AudioClusterDesc) -> Vec<u8> {
     w.u16(crate::constants::desc::AUDIO_CLUSTER);
     w.u16(0);
     write_name(&mut w, &d.object_name);
-    w.u16(0); // localized_description
+    w.u16(NO_STRING); // localized_description: no LOCALE/STRINGS advertised
     w.u16(0); // signal_type
     w.u16(0); // signal_index
     w.u16(0); // signal_output
@@ -811,6 +1015,11 @@ mod hw_16r {
         out
     }
 
+    /// CONTROL 0 — "Identify LED Control", the Milan IDENTIFY control. This is
+    /// the descriptor the 16R asks US for and we used to refuse, which stalled
+    /// its enumeration of us.
+    const CONTROL_0_IDENTIFY: &str = "001a00004964656e74696679204c454420436f6e74726f6c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffff00000000000000000000000190e0f000000000010000000000680001ffff0000000000ffff00000000ffff";
+
     /// CONFIGURATION 0 — "Configuration 0", 10 descriptor-count entries.
     const CONFIG_0: &str = "00010000436f6e66696775726174696f6e203000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffff000a004a001a000100020001000500090006000900090001000a000b000c0001001a0001002400010026000100270001";
 
@@ -825,6 +1034,34 @@ mod hw_16r {
 
     /// STREAM_OUTPUT 1 — "Send 1-8", the source our listener direction binds.
     const STREAM_OUTPUT_1_AAF: &str = "0006000153656e6420312d380000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffff000000020205022002006000008400020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002040220020060000205022002006000";
+
+    /// TIMING 0, PTP_INSTANCE 0 and referenced PTP_PORT 0 from the live 16R.
+    const TIMING_0: &str = "0026000054696d696e6700000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffff0000004c00010000";
+    const PTP_INSTANCE_0: &str = "0027000050545020496e7374616e636500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffff000a92fffe033ba9000000010000000000010000";
+    const PTP_PORT_0: &str = "0028000050545020506f72740000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffff00000000000000000000000000000000";
+
+    #[test]
+    fn timing_ptp_chain_reencodes_the_16r_byte_for_byte() {
+        let timing_raw = hex(TIMING_0);
+        let timing = decode_timing(&timing_raw).expect("TIMING");
+        assert_eq!(timing.algorithm, 0);
+        assert_eq!(timing.ptp_instances, vec![0]);
+        assert_eq!(encode_timing(&timing), timing_raw);
+
+        let instance_raw = hex(PTP_INSTANCE_0);
+        let instance = decode_ptp_instance(&instance_raw).expect("PTP_INSTANCE");
+        assert_eq!(instance.clock_identity.to_u64(), 0x000a_92ff_fe03_3ba9);
+        assert_eq!(instance.flags, 1, "GRANDMASTER_CAPABLE");
+        assert_eq!(instance.number_of_ptp_ports, 1);
+        assert_eq!(instance.base_ptp_port, 0);
+        assert_eq!(encode_ptp_instance(&instance), instance_raw);
+
+        let port_raw = hex(PTP_PORT_0);
+        let port = decode_ptp_port(&port_raw).expect("PTP_PORT");
+        assert_eq!(port.port_type, 0, "P2P link-layer");
+        assert_eq!(port.avb_interface_index, 0);
+        assert_eq!(encode_ptp_port(&port), port_raw);
+    }
 
     #[test]
     fn configuration_0_off_the_wire() {
@@ -845,7 +1082,12 @@ mod hw_16r {
                 .find(|&(t, _)| t == crate::constants::desc::STREAM_OUTPUT),
             Some((crate::constants::desc::STREAM_OUTPUT, 9))
         );
-        assert_eq!(d.descriptor_counts.len(), 10);
+        assert_eq!(d.descriptor_counts.len(), 11);
+        assert_eq!(
+            d.descriptor_counts.last().copied(),
+            Some((0x0027, 1)),
+            "the 16R underreports 10 pairs but physically appends PTP_INSTANCE",
+        );
     }
 
     /// The bug that made `duplex` refuse to stream: the rate was read from
@@ -955,5 +1197,62 @@ mod hw_16r {
         assert_eq!(u16::from_be_bytes([c[70], c[71]]), 1);
         assert_eq!(u16::from_be_bytes([c[72], c[73]]), 74);
         assert_eq!(u16::from_be_bytes([c[74], c[75]]), 5);
+
+        let cd = encode_clock_domain(&ClockDomainDesc {
+            object_name: "x".into(),
+            clock_source_index: 0,
+            clock_sources: vec![0, 1],
+        });
+        assert_eq!(u16::from_be_bytes([cd[68], cd[69]]), 0xffff);
+        assert_eq!(u16::from_be_bytes([cd[72], cd[73]]), 76);
+        assert_eq!(u16::from_be_bytes([cd[74], cd[75]]), 2);
+        assert_eq!(decode_clock_domain(&cd).unwrap().clock_sources, vec![0, 1]);
+    }
+
+    /// The 16R's own IDENTIFY control, decoded field by field. This is the
+    /// anchor for our encoder: every value below was read off the wire, so a
+    /// wrong field offset here cannot be hidden by our encoder agreeing with
+    /// our decoder.
+    #[test]
+    fn control_identify_decodes_the_16r_layout() {
+        let b = hex(CONTROL_0_IDENTIFY);
+        assert_eq!(b.len(), 113);
+        let d = decode_control(&b).expect("decode CONTROL");
+
+        assert_eq!(d.object_name, "Identify LED Control");
+        assert_eq!(d.localized_description, 0xffff, "no STRINGS descriptor");
+        assert_eq!(d.block_latency, 0);
+        assert_eq!(d.control_latency, 0);
+        assert_eq!(d.control_domain, 0);
+        // CONTROL_LINEAR_UINT8 — one unsigned byte, which is what makes the
+        // 9-byte values block below the right shape.
+        assert_eq!(d.control_value_type, 0x0001);
+        // IDENTIFY: AVB OUI-24 90:e0:f0 then the control index within it.
+        assert_eq!(d.control_type, 0x90e0_f000_0000_0001);
+        assert_eq!(d.reset_time, 0);
+        assert_eq!(d.number_of_values, 1);
+        assert_eq!(d.signal_type, 0xffff, "not fed by a signal source");
+        assert_eq!(d.signal_index, 0);
+        assert_eq!(d.signal_output, 0);
+
+        // minimum, maximum, step, default, current, unit, string.
+        assert_eq!(
+            d.values,
+            vec![0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff]
+        );
+
+        // The device states 104, and our fixed fields must end exactly there.
+        assert_eq!(u16::from_be_bytes([b[94], b[95]]), CONTROL_VALUES_OFFSET);
+        assert_eq!(usize::from(CONTROL_VALUES_OFFSET) + d.values.len(), b.len());
+    }
+
+    /// Our encoder must reproduce the 16R's bytes EXACTLY from the decoded
+    /// form. Byte equality against hardware is the check a round trip cannot
+    /// give: it fails if we place any field even one byte off.
+    #[test]
+    fn control_identify_re_encodes_byte_for_byte() {
+        let b = hex(CONTROL_0_IDENTIFY);
+        let d = decode_control(&b).expect("decode CONTROL");
+        assert_eq!(encode_control(&d), b);
     }
 }

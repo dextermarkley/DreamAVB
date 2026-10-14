@@ -159,12 +159,19 @@ pub struct TalkerStream {
 pub fn talker_response(cmd: &Acmpdu, s: TalkerStream) -> Option<Acmpdu> {
     use crate::constants::acmp_msg as m;
 
-    // Only the three talker-side commands. Responses are someone else's
-    // answer and listener-side commands are not ours.
+    // The talker-side commands. Milan v1.3 §5.5.2.2 renames CONNECT_TX to
+    // PROBE_TX; the message type is unchanged, so this arm serves both names.
+    //
+    // GET_TX_CONNECTION is answered, NOT ignored: §5.5.2.7 says a Milan talker
+    // does not implement it, and §5.5.4.4 / Table 5.53 spell out how to say so
+    // -- a GET_TX_CONNECTION_RESPONSE with status NOT_SUPPORTED. Staying silent
+    // leaves the controller waiting out its command timeout instead of being
+    // told, which is a worse answer than the refusal.
     let reply_type = match cmd.message_type {
         m::CONNECT_TX_COMMAND => m::CONNECT_TX_RESPONSE,
         m::DISCONNECT_TX_COMMAND => m::DISCONNECT_TX_RESPONSE,
         m::GET_TX_STATE_COMMAND => m::GET_TX_STATE_RESPONSE,
+        m::GET_TX_CONNECTION_COMMAND => m::GET_TX_CONNECTION_RESPONSE,
         _ => return None,
     };
 
@@ -182,8 +189,19 @@ pub fn talker_response(cmd: &Acmpdu, s: TalkerStream) -> Option<Acmpdu> {
         ..*cmd
     };
 
+    // §5.5.4.4, Table 5.53: the only defined answer is NOT_SUPPORTED, and it
+    // is returned without looking at the stream index.
+    if reply_type == m::GET_TX_CONNECTION_RESPONSE {
+        r.status = acmp_status::NOT_SUPPORTED;
+        return Some(r);
+    }
+
     if cmd.talker_unique_id != s.our_unique_id {
-        r.status = acmp_status::TALKER_NO_STREAM_INDEX;
+        // Tables 5.45 (PROBE_TX), 5.49 (DISCONNECT_TX) and 5.51
+        // (GET_TX_STATE) all name TALKER_UNKNOWN_ID for a talker_unique_id
+        // that is not ours. We previously sent TALKER_NO_STREAM_INDEX, which
+        // is a different status with a different meaning to the listener.
+        r.status = acmp_status::TALKER_UNKNOWN_ID;
         return Some(r);
     }
 
@@ -194,7 +212,16 @@ pub fn talker_response(cmd: &Acmpdu, s: TalkerStream) -> Option<Acmpdu> {
     r.stream_id = s.stream_id;
     r.stream_dest_mac = s.stream_dest_mac;
     r.stream_vlan_id = s.stream_vlan_id;
-    r.connection_count = s.connection_count;
+    // Table 5.48: connection_count is 0 on success, NOT a count of bound
+    // listeners. §5.5.2.7 is the reason -- "Talkers do not maintain any
+    // internal state related to bound/settled Listeners" -- so there is no
+    // count for a Milan talker to report, and the caller's value is ignored.
+    r.connection_count = 0;
+    // Table 5.48 also pins this to 0 on success, and §5.5.2.2 requires
+    // CL_ENTRIES_VALID to "always be 0" with connected_listeners_entries
+    // reserved. Both are cleared rather than echoed from the command.
+    r.flags &= !(crate::constants::acmp_flags::REGISTERING_FAILED
+        | crate::constants::acmp_flags::CL_ENTRIES_VALID);
     Some(r)
 }
 
@@ -340,14 +367,62 @@ mod tests {
 
     /// A stream index we do not have is refused with the specific status, not
     /// answered with our own stream.
+    ///
+    /// Milan v1.3 Tables 5.45 (PROBE_TX), 5.49 (DISCONNECT_TX) and 5.51
+    /// (GET_TX_STATE) all name TALKER_UNKNOWN_ID here. This test asserted
+    /// TALKER_NO_STREAM_INDEX, which is what we used to send.
     #[test]
     fn an_unknown_stream_index_is_refused_not_substituted() {
         let mut c = connect_tx_from_16r();
         c.talker_unique_id = 7;
         let r = talker_response(&c, our_stream()).expect("a response");
-        assert_eq!(r.status, acmp_status::TALKER_NO_STREAM_INDEX);
+        assert_eq!(r.status, acmp_status::TALKER_UNKNOWN_ID);
         assert_ne!(r.stream_id, StreamId(0x644b_f012_73b8_0000));
         assert_eq!(r.talker_unique_id, 7);
+    }
+
+    /// Milan v1.3 Table 5.48: on success `connection_count` is 0 and
+    /// REGISTERING_FAILED is clear, and §5.5.2.2 requires CL_ENTRIES_VALID to
+    /// "always be 0". The command arrives with all three set to the opposite,
+    /// so an implementation that echoes the command's flags fails this.
+    #[test]
+    fn probe_tx_success_zeroes_the_fields_table_5_48_pins() {
+        use crate::constants::acmp_flags as f;
+        let mut c = connect_tx_from_16r();
+        c.connection_count = 9;
+        c.flags |= f::REGISTERING_FAILED | f::CL_ENTRIES_VALID;
+        let r = talker_response(&c, our_stream()).expect("a response");
+        assert_eq!(r.status, acmp_status::SUCCESS);
+        assert_eq!(r.connection_count, 0, "Table 5.48: connection_count is 0");
+        assert_eq!(r.flags & f::REGISTERING_FAILED, 0);
+        assert_eq!(r.flags & f::CL_ENTRIES_VALID, 0);
+        // Flags the command legitimately carries are still echoed.
+        assert_eq!(r.flags & f::CLASS_B, c.flags & f::CLASS_B);
+    }
+
+    /// §5.5.2.7 says a Milan talker does not implement GET_TX_CONNECTION, and
+    /// §5.5.4.4 / Table 5.53 say how to report that: a response with status
+    /// NOT_SUPPORTED. Silence makes the controller wait out its timeout, so
+    /// `None` is the one answer that is wrong.
+    #[test]
+    fn get_tx_connection_is_answered_not_supported_not_ignored() {
+        let mut c = connect_tx_from_16r();
+        c.message_type = acmp_msg::GET_TX_CONNECTION_COMMAND;
+        let r = talker_response(&c, our_stream()).expect("Table 5.53 wants a response");
+        assert_eq!(r.message_type, acmp_msg::GET_TX_CONNECTION_RESPONSE);
+        assert_eq!(r.status, acmp_status::NOT_SUPPORTED);
+        assert_eq!(r.sequence_id, c.sequence_id, "must stay matchable");
+    }
+
+    /// And it is refused WITHOUT regard to the stream index: Table 5.53 has no
+    /// other outcome, so a bad index must not turn it into TALKER_UNKNOWN_ID.
+    #[test]
+    fn get_tx_connection_not_supported_even_for_an_unknown_index() {
+        let mut c = connect_tx_from_16r();
+        c.message_type = acmp_msg::GET_TX_CONNECTION_COMMAND;
+        c.talker_unique_id = 7;
+        let r = talker_response(&c, our_stream()).expect("a response");
+        assert_eq!(r.status, acmp_status::NOT_SUPPORTED);
     }
 
     /// Not ours to answer: a command for another talker, our own responses

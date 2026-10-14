@@ -44,6 +44,21 @@ pub const DOMAIN: u8 = 0;
 pub const FLAG_TWO_STEP: u16 = 0x0200;
 /// flags: ptpTimescale (octet 1 bit 3).
 pub const FLAG_PTP_TIMESCALE: u16 = 0x0008;
+/// flags: currentUtcOffsetValid (octet 1 bit 2).
+///
+/// Set when `currentUtcOffset` carries a real TAI−UTC value rather than a
+/// placeholder. The 16R sets it and sends 37, which is the correct offset.
+pub const FLAG_UTC_OFFSET_VALID: u16 = 0x0004;
+/// flags: leap59 (octet 1 bit 1).
+///
+/// Named only because the 16R's Announce carries it (`flagField` = `0x000e`
+/// = this | UTC_OFFSET_VALID | PTP_TIMESCALE) and the encoder's layout test
+/// re-encodes that word verbatim. We do NOT set it: it declares that the
+/// current UTC day has 59 seconds, and asserting a leap second we have no
+/// knowledge of would be a false statement about the timescale.
+pub const FLAG_LEAP59: u16 = 0x0002;
+/// What WE put in an Announce: a real UTC offset on the PTP timescale.
+pub const ANNOUNCE_FLAGS: u16 = FLAG_PTP_TIMESCALE | FLAG_UTC_OFFSET_VALID;
 
 /// logMessageInterval for Pdelay_Resp / Pdelay_Resp_Follow_Up / Signaling
 /// (802.1AS-2020 §10.6.2.2.14 / §11.4.2.8 *(verify)*).
@@ -61,6 +76,20 @@ pub const ANNOUNCE_BASE_LEN: usize = 64;
 pub const SIGNALING_BASE_LEN: usize = 44;
 /// Signaling with one 16-octet organization-extension TLV.
 pub const SIGNALING_GPTP_CAPABLE_LEN: usize = SIGNALING_BASE_LEN + 16;
+/// Buffer ceiling for an Announce: the base, the 4-octet path-trace TLV
+/// header, and room for 8 pathSequence entries. The 16R's own Announce is 76
+/// octets (base plus 4 plus one 8-octet entry); a long AVB path adds one
+/// entry per hop.
+pub const ANNOUNCE_MAX_LEN: usize = ANNOUNCE_BASE_LEN + 4 + 8 * 8;
+/// `logMessageInterval` for Announce: 0, i.e. one per second. The 16R sends
+/// exactly this.
+pub const LOG_ANNOUNCE_INTERVAL: i8 = 0;
+/// `timeSource` = INTERNAL_OSCILLATOR (1588 Table 39). What the 16R
+/// announces, and what a Mac's oscillator honestly is.
+pub const TIME_SOURCE_INTERNAL_OSCILLATOR: u8 = 0xA0;
+/// `logMessageInterval` for Sync and Follow_Up: -3, i.e. 125 ms. The 16R
+/// sends `0xfd` in both, which is -3 as a signed octet.
+pub const LOG_SYNC_INTERVAL: i8 = -3;
 
 /// TLV types (1588-2019 Table 52 / 802.1AS-2020 Table 10-11 *(verify)*).
 pub const TLV_ORGANIZATION_EXTENSION: u16 = 0x0003;
@@ -368,6 +397,31 @@ pub struct Announce<'a> {
 }
 
 impl<'a> Announce<'a> {
+    /// The Announce a grandmaster port sends for its own clock.
+    ///
+    /// `steps_removed` is 0 and `time_source` is INTERNAL_OSCILLATOR (0xA0),
+    /// which is what a Mac's oscillator is: claiming GPS or an atomic
+    /// reference would win BTCA on a false premise. The 16R announces the
+    /// same value.
+    pub fn for_grandmaster(
+        identity: ClockIdentity,
+        priority1: u8,
+        quality: ClockQuality,
+        priority2: u8,
+        current_utc_offset: i16,
+    ) -> Announce<'static> {
+        Announce {
+            current_utc_offset,
+            gm_priority1: priority1,
+            gm_clock_quality: quality,
+            gm_priority2: priority2,
+            gm_identity: identity,
+            steps_removed: 0,
+            time_source: TIME_SOURCE_INTERNAL_OSCILLATOR,
+            path_trace: &[],
+        }
+    }
+
     /// The path trace entries, in order.
     pub fn path_trace(&self) -> impl Iterator<Item = ClockIdentity> + 'a {
         self.path_trace
@@ -734,6 +788,141 @@ pub fn encode_pdelay_resp_follow_up(
     finish(src_mac, &b, complete, false, tag)
 }
 
+/// Announce (802.1AS-2020 §10.6.3), the message a grandmaster-capable port
+/// uses to put its clock dataset up for BTCA selection.
+///
+/// Milan v1.3 §4.3.1.1 requires a Talker PAAD to be capable of operating as a
+/// grandmaster, and this port could not: Announce was decode-only.
+///
+/// The layout is TRANSCRIBED from a PreSonus StudioLive 16R's own Announce,
+/// captured off the wire (see `docs/gptp-master-capture.md`), not written from
+/// the standard's field tables. That is deliberate: a guessed bit-packed
+/// layout has shipped in this project before and passed its own round-trip
+/// tests, because encode and decode shared the same mistake. The test below
+/// re-encodes the captured bytes and compares them octet for octet, which a
+/// round trip through our own decoder cannot do.
+///
+/// `path_trace` carries the pathSequence octets (a multiple of 8). As
+/// grandmaster ours is our own clockIdentity, exactly as the 16R's carries
+/// its own.
+pub fn encode_announce(
+    src_mac: MacAddr,
+    source: PortIdentity,
+    seq: u16,
+    a: &Announce<'_>,
+    path_trace: &[u8],
+    flags: u16,
+    tag: u64,
+) -> TxFrame {
+    // Base + the path trace TLV: 2 (tlvType) + 2 (lengthField) + the
+    // pathSequence itself. The 16R's 76-byte Announce is 64 + 4 + 8.
+    let len = ANNOUNCE_BASE_LEN + 4 + path_trace.len();
+    let mut b = [0u8; ANNOUNCE_MAX_LEN];
+    let Some(buf) = b.get_mut(..len) else {
+        return TxFrame::EMPTY;
+    };
+    let mut w = Wr::new(buf);
+    Header::ours(
+        MessageType::Announce,
+        len,
+        source,
+        seq,
+        LOG_ANNOUNCE_INTERVAL,
+        flags,
+    )
+    .write(&mut w);
+    // 10 reserved octets before currentUtcOffset. The 16R sends them zero.
+    w.zeros(10);
+    w.u16(a.current_utc_offset as u16);
+    w.u8(0); // reserved
+    w.u8(a.gm_priority1);
+    w.u8(a.gm_clock_quality.clock_class);
+    w.u8(a.gm_clock_quality.clock_accuracy);
+    w.u16(a.gm_clock_quality.offset_scaled_log_variance);
+    w.u8(a.gm_priority2);
+    w.put(&a.gm_identity.0);
+    w.u16(a.steps_removed);
+    w.u8(a.time_source);
+    w.u16(TLV_PATH_TRACE);
+    // lengthField counts the pathSequence octets only, not the 4-octet TLV
+    // header -- the 16R's reads 8 for one 8-octet entry.
+    w.u16(path_trace.len() as u16);
+    w.put(path_trace);
+    let complete = !w.overflowed() && w.pos() == len;
+    finish(src_mac, buf, complete, false, tag)
+}
+
+/// Sync (802.1AS-2020 §11.4.2), two-step: `originTimestamp` is ZERO and the
+/// real time travels in the paired Follow_Up.
+///
+/// The 16R's Sync carries all ten originTimestamp octets zero with
+/// `twoStepFlag` set, which is what makes the Follow_Up authoritative. A
+/// one-step implementation would put the time here instead; 802.1AS uses
+/// two-step, so writing a timestamp into this message would be wrong even
+/// though the field exists.
+///
+/// Sent with a TX-timestamp request: the hardware timestamp this message gets
+/// on the wire IS the `preciseOriginTimestamp` the Follow_Up must carry.
+pub fn encode_sync(src_mac: MacAddr, source: PortIdentity, seq: u16, tag: u64) -> TxFrame {
+    let mut b = [0u8; SYNC_LEN];
+    let mut w = Wr::new(&mut b);
+    Header::ours(
+        MessageType::Sync,
+        SYNC_LEN,
+        source,
+        seq,
+        LOG_SYNC_INTERVAL,
+        FLAG_TWO_STEP | FLAG_PTP_TIMESCALE,
+    )
+    .write(&mut w);
+    w.zeros(10); // originTimestamp, zero in two-step
+    let complete = !w.overflowed() && w.pos() == b.len();
+    // want_ts: the TX timestamp becomes the Follow_Up's preciseOriginTimestamp.
+    finish(src_mac, &b, complete, true, tag)
+}
+
+/// Follow_Up (802.1AS-2020 §11.4.3), carrying the Sync's hardware TX
+/// timestamp plus the mandatory Follow_Up information TLV.
+///
+/// `seq` MUST be the sequenceId of the Sync this follows -- that pairing is
+/// the only thing linking the two, and the capture confirms it (both the
+/// 16R's Sync and its Follow_Up read `0x41fd`). Passing a fresh sequence
+/// number here produces a Follow_Up that matches no Sync, which a listener
+/// discards silently.
+pub fn encode_follow_up(
+    src_mac: MacAddr,
+    source: PortIdentity,
+    seq: u16,
+    precise_origin: Timestamp,
+    gm_time_base_indicator: u16,
+    tag: u64,
+) -> TxFrame {
+    const LEN: usize = FOLLOW_UP_LEN;
+    let mut b = [0u8; LEN];
+    let mut w = Wr::new(&mut b);
+    Header::ours(
+        MessageType::FollowUp,
+        LEN,
+        source,
+        seq,
+        LOG_SYNC_INTERVAL,
+        FLAG_PTP_TIMESCALE,
+    )
+    .write(&mut w);
+    precise_origin.write(&mut w);
+    // Follow_Up information TLV (802.1AS §11.4.4.3), mandatory.
+    w.u16(TLV_ORGANIZATION_EXTENSION);
+    w.u16(FOLLOW_UP_TLV_LEN);
+    w.put(&ORG_ID_8021);
+    w.put(org_subtype(ORG_SUBTYPE_FOLLOW_UP_INFO).as_slice());
+    w.u32(0); // cumulativeScaledRateOffset: we are the source, so no offset
+    w.u16(gm_time_base_indicator);
+    w.zeros(12); // lastGmPhaseChange
+    w.u32(0); // scaledLastGmFreqChange
+    let complete = !w.overflowed() && w.pos() == b.len();
+    finish(src_mac, &b, complete, false, tag)
+}
+
 /// Signaling carrying our gPTP-capable TLV (design §7.4; only sent in reply
 /// to the peer's own gPTP-capable TLV). targetPortIdentity is the wildcard.
 pub fn encode_signaling_gptp_capable(
@@ -786,6 +975,153 @@ pub(crate) mod tests {
             clock: ClockIdentity([0x00, 0x0a, 0x92, 0xff, 0xfe, 0x03, 0x3b, 0xa9]),
             port: 1,
         }
+    }
+
+    // ---- The 16R's own master messages, captured off the wire -------------
+    //
+    // See docs/gptp-master-capture.md. These are the ANCHOR for the three
+    // encoders: a layout written from the standard's field tables is a guess,
+    // and this project has shipped one before (the WriteMix FourCC) that
+    // passed its own round-trip tests because encode and decode shared the
+    // same mistake.
+    //
+    // The tests below DECODE the captured bytes and RE-ENCODE them, then
+    // compare octet for octet. That is what a round trip through our own
+    // decoder cannot do: here the device decides whether we are right.
+
+    #[rustfmt::skip]
+    const R16_ANNOUNCE: [u8; 76] = [
+        0x1b, 0x02, 0x00, 0x4c, 0x00, 0x00, 0x00, 0x0e,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0,
+        0x00, 0x0a, 0x92, 0xff, 0xfe, 0x03, 0x3b, 0xa9, 0x00, 0x01,
+        0x0c, 0x48, 0x05, 0x00,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x00, 0x25, 0x00, 0xf8, 0xf8, 0x20, 0x43, 0x6a, 0xf8,
+        0x00, 0x0a, 0x92, 0xff, 0xfe, 0x03, 0x3b, 0xa9,
+        0x00, 0x00, 0xa0,
+        0x00, 0x08, 0x00, 0x08,
+        0x00, 0x0a, 0x92, 0xff, 0xfe, 0x03, 0x3b, 0xa9,
+    ];
+
+    #[rustfmt::skip]
+    const R16_SYNC_44: [u8; 44] = [
+        0x10, 0x02, 0x00, 0x2c, 0x00, 0x00, 0x02, 0x08,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0,
+        0x00, 0x0a, 0x92, 0xff, 0xfe, 0x03, 0x3b, 0xa9, 0x00, 0x01,
+        0x41, 0xfd, 0x00, 0xfd,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    #[rustfmt::skip]
+    const R16_FOLLOW_UP: [u8; 76] = [
+        0x18, 0x02, 0x00, 0x4c, 0x00, 0x00, 0x00, 0x08,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0,
+        0x00, 0x0a, 0x92, 0xff, 0xfe, 0x03, 0x3b, 0xa9, 0x00, 0x01,
+        0x41, 0xfd, 0x02, 0xfd,
+        0x00, 0x00, 0x00, 0x00, 0x0e, 0x69, 0x29, 0x2e, 0xe4, 0x32,
+        0x00, 0x03, 0x00, 0x1c, 0x00, 0x80, 0xc2, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x0c,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0,
+    ];
+
+    /// Re-encode the 16R's Announce from its own decoded fields and compare
+    /// byte for byte. A field at the wrong offset, a wrong width, or a
+    /// `lengthField` that counts the TLV header fails here.
+    #[test]
+    fn announce_reencodes_the_16r_capture_byte_for_byte() {
+        let Ok(m) = decode(&R16_ANNOUNCE) else {
+            panic!("the captured Announce must decode");
+        };
+        let hdr = m.header;
+        let Body::Announce(body) = m.body else {
+            panic!("decoded as the wrong body type");
+        };
+        // Independent cross-checks on the decode, so a shifted layout cannot
+        // quietly agree with itself.
+        assert_eq!(body.gm_priority1, 248, "Milan 4.2.6.2.1 value");
+        assert_eq!(body.gm_priority2, 248);
+        assert_eq!(body.gm_clock_quality.clock_class, 248);
+        assert_eq!(body.current_utc_offset, 37, "TAI-UTC");
+        assert_eq!(body.steps_removed, 0, "it is the grandmaster");
+        assert_eq!(body.time_source, 0xA0, "INTERNAL_OSCILLATOR");
+        assert_eq!(hdr.log_interval, LOG_ANNOUNCE_INTERVAL, "1 s");
+        assert_eq!(
+            hdr.flags & 0xFF,
+            FLAG_LEAP59 | FLAG_UTC_OFFSET_VALID | FLAG_PTP_TIMESCALE
+        );
+        assert_eq!(body.gm_identity, peer().clock);
+        let trace: Vec<ClockIdentity> = body.path_trace().collect();
+        assert_eq!(trace, vec![peer().clock], "its own identity, one hop");
+
+        let f = encode_announce(
+            OUR_MAC,
+            hdr.source,
+            hdr.sequence_id,
+            &body,
+            &body.gm_identity.0,
+            hdr.flags,
+            0,
+        );
+        assert_eq!(
+            &f.bytes()[14..],
+            &R16_ANNOUNCE[..],
+            "re-encoded Announce differs from the captured bytes"
+        );
+        assert!(!f.want_ts, "an Announce carries no timestamp");
+    }
+
+    /// The Sync's ten originTimestamp octets are ZERO in two-step. A
+    /// one-step implementation would put the time here, and a listener
+    /// pairing our Follow_Up would then see two different origins.
+    #[test]
+    fn sync_reencodes_the_16r_capture_byte_for_byte() {
+        let f = encode_sync(OUR_MAC, peer(), 0x41fd, 0);
+        assert_eq!(
+            &f.bytes()[14..],
+            &R16_SYNC_44[..],
+            "re-encoded Sync differs from the captured bytes"
+        );
+        assert!(f.want_ts, "the TX timestamp becomes the Follow_Up's origin");
+        // The capture's own interval, read back rather than asserted from our
+        // constant alone.
+        assert_eq!(R16_SYNC_44[33] as i8, -3, "125 ms");
+    }
+
+    /// The Follow_Up must reuse the Sync's sequenceId -- that pairing is the
+    /// only link between them, and the capture shows both at 0x41fd.
+    #[test]
+    fn follow_up_reencodes_the_16r_capture_byte_for_byte() {
+        let origin = Timestamp {
+            secs: 0x0e69,
+            nanos: 0x292e_e432,
+        };
+        assert!(
+            origin.nanos < 1_000_000_000,
+            "a shifted field would break this"
+        );
+        let f = encode_follow_up(OUR_MAC, peer(), 0x41fd, origin, 0x000c, 0);
+        assert_eq!(
+            &f.bytes()[14..],
+            &R16_FOLLOW_UP[..],
+            "re-encoded Follow_Up differs from the captured bytes"
+        );
+        assert_eq!(
+            R16_SYNC_44[30..32],
+            R16_FOLLOW_UP[30..32],
+            "the capture's Sync and Follow_Up share a sequenceId"
+        );
+    }
+
+    /// We must not claim a leap second we know nothing about.
+    #[test]
+    fn our_announce_flags_omit_leap59() {
+        assert_eq!(ANNOUNCE_FLAGS & FLAG_LEAP59, 0);
+        assert_ne!(ANNOUNCE_FLAGS & FLAG_PTP_TIMESCALE, 0);
+        assert_ne!(ANNOUNCE_FLAGS & FLAG_UTC_OFFSET_VALID, 0);
     }
 
     const ETH_PTP: [u8; 14] = [

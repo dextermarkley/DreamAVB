@@ -24,6 +24,7 @@ pub mod aecp;
 pub mod aem;
 pub mod constants;
 pub mod controller;
+pub mod counters;
 pub mod derive;
 pub mod entity;
 pub mod milan;

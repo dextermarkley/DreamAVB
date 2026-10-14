@@ -17,6 +17,17 @@ BUILD="$ROOT/build"
 DEXT_ID="com.avbaudio.installer.i210"
 DEXT_ENT="$ROOT/driver/AVBI210Driver/AVBI210Driver.entitlements"
 APP="$BUILD/AVBInstaller.app"
+# Optional provisioning profiles. A restricted entitlement is only AUTHORIZED
+# when a profile allowlisting it is embedded in the bundle; without them the
+# build still signs (valid signature, unauthorized entitlements) and needs
+# amfi_get_out_of_my_way=1 to load. Drop the downloaded profiles here to embed
+# them and run with AMFI on. Device-scoped, so they are gitignored.
+# DriverKit's embedded profile name comes from Xcode's own DriverKit platform
+# plug-in (embeddedProvisioningProfileName = embedded.provisionprofile); the
+# dext is a flat bundle so it sits at the bundle root, the app's under Contents.
+PROFILE_DIR="$ROOT/packaging/profiles"
+DEXT_PROFILE="$PROFILE_DIR/i210-dext.provisionprofile"
+APP_PROFILE="$PROFILE_DIR/installer-app.provisionprofile"
 DEXT_BUILT="$BUILD/driver/Debug-driverkit/$DEXT_ID.dext"
 
 mkdir -p "$SCRATCH"
@@ -142,6 +153,29 @@ for p in "$APP/Contents/Info.plist" "$DEXT/Info.plist" \
          "$DEXT_ENT"; do
     /usr/bin/plutil -lint "$p"
 done
+
+# Embed profiles BEFORE signing: the profile is a sealed bundle resource, so a
+# profile dropped in afterwards invalidates the signature instead of
+# authorizing anything.
+embed_profile() {
+    src="$1"; dest="$2"; label="$3"
+    if [ ! -f "$src" ]; then
+        echo "no $label profile at $src -- entitlements stay UNAUTHORIZED (needs amfi_get_out_of_my_way=1)"
+        return 0
+    fi
+    PLIST="$(/usr/bin/security cms -D -i "$src" 2>/dev/null)" || {
+        echo "error: $label profile at $src is not a valid CMS-signed profile" >&2
+        exit 1
+    }
+    EXPIRES="$(printf '%s\n' "$PLIST" \
+        | /usr/bin/plutil -extract ExpirationDate raw -o - - 2>/dev/null || true)"
+    PROF_NAME="$(printf '%s\n' "$PLIST" \
+        | /usr/bin/plutil -extract Name raw -o - - 2>/dev/null || true)"
+    cp "$src" "$dest"
+    echo "embedded $label profile: ${PROF_NAME:-unnamed} (expires ${EXPIRES:-unknown}) -> $dest"
+}
+embed_profile "$DEXT_PROFILE" "$DEXT/embedded.provisionprofile" "dext"
+embed_profile "$APP_PROFILE" "$APP/Contents/embedded.provisionprofile" "app"
 
 echo "== sign (inside-out)"
 /usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none \

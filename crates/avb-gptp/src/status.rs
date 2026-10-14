@@ -17,6 +17,21 @@ pub struct GptpCounters {
     pub sync_rx: u64,
     pub follow_up_rx: u64,
     pub announce_rx: u64,
+    /// BTCA outcomes (802.1AS Clause 10.3). On a link with the StudioLive 16R
+    /// `we_lost` climbing once per Announce with `we_won` at zero is the
+    /// expected steady state: both sides announce the same merit vector, so
+    /// the contest is settled on grandmasterIdentity and the 16R's is lower.
+    /// A non-zero `we_won` means this port took the grandmaster role.
+    pub btca_we_won: u64,
+    pub btca_we_lost: u64,
+    /// Master-side transmissions.
+    pub announce_tx: u64,
+    pub sync_tx: u64,
+    pub follow_up_tx: u64,
+    /// Syncs whose hardware TX timestamp never arrived, so no Follow_Up could
+    /// be paired with them. A listener discards an unpaired Sync, so this
+    /// climbing means our master-side time is not reaching anyone.
+    pub sync_tx_ts_lost: u64,
     pub signaling_rx: u64,
     pub signaling_tx: u64,
     pub pdelay_req_tx: u64,

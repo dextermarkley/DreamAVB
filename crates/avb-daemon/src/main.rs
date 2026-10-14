@@ -150,6 +150,11 @@ enum Command {
         start_timeout: u64,
         #[arg(long)]
         summary_out: Option<PathBuf>,
+        /// Also transmit a Milan Clock Reference Format (CRF) media-clock
+        /// stream (Milan v1.3 §7.3.1) and bind it to the 16R's own
+        /// `Return CRF` sink. Timestamps come from gPTP.
+        #[arg(long)]
+        crf: bool,
     },
     /// Full stack, BOTH directions in one process: play audio OUT to the 16R
     /// from the output ring AND receive audio IN from it into the input ring.
@@ -186,10 +191,47 @@ enum Command {
         /// will not attach to.
         #[arg(long)]
         all_inbound_streams: bool,
+        /// Do NOT act as the listener's controller — declare our streams over
+        /// SRP and leave its sink assignments to someone else.
+        ///
+        /// Binding is ON by default, and that is a topology fact rather than a
+        /// disagreement with Milan. §5.5.2.7 has a Talker rely only on SRP,
+        /// and §5.5.1.2 makes a binding the listener's sink property written by
+        /// a CONTROLLER — so on a network that HAS another controller we
+        /// should keep out of it, which is what this flag is for.
+        ///
+        /// But with a DriverKit dext owning the NIC exclusively, this machine
+        /// has no other controller that can reach the link:
+        ///
+        ///   - Apple's ATDECC controller (`avbutil --controller`), which is
+        ///     the tool PreSonus's own Mac-to-StudioLive guide uses for the
+        ///     routing grid, needs Apple's AVB stack on the interface. Our
+        ///     dext has it.
+        ///   - UC Surface reaches the mixer over IP on a different interface
+        ///     and never sees the AVB link, which is why its "AVB Inputs" page
+        ///     lists no available talkers however correct our streams are.
+        ///
+        /// So we are the only controller available, and §5.5.2.4 Controller
+        /// Bind is ours to perform. Pass this flag when another controller is
+        /// present and should own the assignments.
+        #[arg(long)]
+        no_bind_sinks: bool,
         #[arg(long, default_value_t = 30)]
         start_timeout: u64,
         #[arg(long)]
         summary_out: Option<PathBuf>,
+        /// Also transmit a Milan Clock Reference Format (CRF) media-clock
+        /// stream (Milan v1.3 §7.3.1) and bind it to the 16R's own
+        /// `Return CRF` sink (its STREAM_INPUT 0).
+        ///
+        /// 500 PDUs/s carrying one gPTP timestamp each, 96 media-clock events
+        /// apart. The timestamps come from gPTP, NOT from the media clock we
+        /// recover from the 16R's arriving stream — deriving them from that
+        /// would feed the device's own clock back to it as a loop. Milan §7.5
+        /// sanctions gPTP as a media clock source, and the 16R is our gPTP
+        /// grandmaster, so gPTP time is its own time.
+        #[arg(long)]
+        crf: bool,
     },
 }
 
@@ -280,6 +322,7 @@ fn run() -> Result<(), Exit> {
             allow_partial,
             start_timeout,
             summary_out,
+            crf,
         } => {
             validate::validate_seconds(seconds)?;
             validate::validate_timeout(start_timeout)?;
@@ -295,6 +338,7 @@ fn run() -> Result<(), Exit> {
                 allow_partial,
                 start_timeout,
                 summary_out,
+                crf,
             )
         }
         Command::Duplex {
@@ -302,8 +346,10 @@ fn run() -> Result<(), Exit> {
             listener,
             listener_uid,
             all_inbound_streams,
+            no_bind_sinks,
             start_timeout,
             summary_out,
+            crf,
         } => {
             // `seconds` is optional here: the companion runs this until it
             // stops the process. 0 means "no limit" to the loop.
@@ -321,8 +367,10 @@ fn run() -> Result<(), Exit> {
                 listener,
                 listener_uid,
                 all_inbound_streams,
+                !no_bind_sinks,
                 start_timeout,
                 summary_out,
+                crf,
             )
         }
     }

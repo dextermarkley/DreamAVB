@@ -27,6 +27,7 @@ use std::collections::VecDeque;
 use avb_core::{DropReason, MacAddr, MachTicks, Now, Outbox, RxMeta, Timebase, TxFrame};
 use serde::Serialize;
 
+use crate::btca;
 use crate::model::{ClockRead, GptpMachModel, ModelEstimator};
 use crate::msg::{
     self, Announce, Body, ClockIdentity, FollowUp, Header, IntervalRequest, PortIdentity,
@@ -51,6 +52,16 @@ pub const TS_PLACEHOLDER_S: f64 = 0.125;
 pub const SYNC_LOG_RANGE: (i8, i8) = (-5, 1);
 /// announceReceiptTimeout / Sync receipt multiplier.
 pub const RECEIPT_TIMEOUT_MULT: f64 = 3.0;
+/// Our Announce TX interval while master: 1 s, which is
+/// `LOG_ANNOUNCE_INTERVAL = 0` and what the 16R sends.
+pub const ANNOUNCE_TX_INTERVAL_S: f64 = 1.0;
+/// Our Sync TX interval while master: 125 ms, which is
+/// `LOG_SYNC_INTERVAL = -3` and what the 16R sends.
+pub const SYNC_TX_INTERVAL_S: f64 = 0.125;
+/// `currentUtcOffset` we announce: the TAI−UTC offset, 37 s. Read off the
+/// 16R's own Announce rather than hardcoded from memory of the leap-second
+/// table, and paired with `FLAG_UTC_OFFSET_VALID`.
+pub const UTC_OFFSET_TAI: i16 = 37;
 /// Our initial logPdelayReqInterval (1 s).
 pub const PDELAY_LOG_INITIAL: i8 = 0;
 /// Range of message-interval-request linkDelayInterval values we honor.
@@ -66,6 +77,16 @@ pub const PDELAY_RESP_LATE_NS: u64 = 8_000_000;
 pub enum PortState {
     Listening,
     Slave,
+    /// Our own clock won BTCA, so this port is the grandmaster for the
+    /// domain and transmits Announce, Sync and Follow_Up.
+    ///
+    /// Reachable only once our dataset beats every Announce we receive.
+    /// Reachable: `PRIORITY1` is 248, so we are a real BTCA contender. Against
+    /// the StudioLive 16R specifically we still lose, because every merit rung
+    /// ties and the comparison falls through to grandmasterIdentity, where its
+    /// `000a92…` beats our `644bf0…`. Against a device with a higher identity
+    /// we take the role. See the `hardware_outcome` tests in `btca`.
+    Master,
 }
 
 impl PortState {
@@ -73,6 +94,7 @@ impl PortState {
         match self {
             Self::Listening => "LISTENING",
             Self::Slave => "SLAVE",
+            Self::Master => "MASTER",
         }
     }
 }
@@ -133,6 +155,14 @@ enum TagKind {
     PdelayResp = 2,
     PdelayRespFu = 3,
     Signaling = 4,
+    /// Master-side Announce. We request no timestamp for it, but it still
+    /// needs a distinct tag so a stray completion is not misrouted.
+    Announce = 5,
+    /// Master-side Sync. Its hardware TX timestamp becomes the paired
+    /// Follow_Up's `preciseOriginTimestamp`.
+    SyncTx = 6,
+    /// Master-side Follow_Up.
+    FollowUpTx = 7,
 }
 
 fn tag_kind(tag: u64) -> Option<TagKind> {
@@ -141,6 +171,9 @@ fn tag_kind(tag: u64) -> Option<TagKind> {
         2 => TagKind::PdelayResp,
         3 => TagKind::PdelayRespFu,
         4 => TagKind::Signaling,
+        5 => TagKind::Announce,
+        6 => TagKind::SyncTx,
+        7 => TagKind::FollowUpTx,
         _ => return None,
     })
 }
@@ -175,6 +208,22 @@ pub struct Port {
     last_gm: Option<ClockIdentity>,
     ta_s: f64,
     announce_deadline: Option<MachTicks>,
+    /// When to send the next Announce, while master.
+    next_announce_tx: Option<MachTicks>,
+    /// When to send the next Sync (and its Follow_Up), while master.
+    next_sync_tx: Option<MachTicks>,
+    announce_seq: u16,
+    sync_seq: u16,
+    /// The Sync awaiting its hardware TX timestamp, which becomes the paired
+    /// Follow_Up's `preciseOriginTimestamp`. Holds the sequenceId so the
+    /// Follow_Up reuses it -- that pairing is the only link between the two.
+    sync_awaiting_ts: Option<u16>,
+    /// A Follow_Up ready to send: the Sync's sequenceId and the hardware TX
+    /// timestamp it must carry. Staged by `on_tx_timestamp`, which has no
+    /// outbox, and emitted by the next `poll_master`.
+    follow_up_pending: Option<(u16, Timestamp)>,
+    /// gmTimeBaseIndicator, bumped whenever our timebase is discontinuous.
+    gm_time_base_indicator: u16,
     ts_s: f64,
     ts_valid: bool,
     pending_sync: Option<PendingSync>,
@@ -226,6 +275,13 @@ impl Port {
             last_gm: None,
             ta_s: TA_PLACEHOLDER_S,
             announce_deadline: None,
+            next_announce_tx: None,
+            next_sync_tx: None,
+            announce_seq: 0,
+            sync_seq: 0,
+            sync_awaiting_ts: None,
+            follow_up_pending: None,
+            gm_time_base_indicator: 0,
             ts_s: TS_PLACEHOLDER_S,
             ts_valid: false,
             pending_sync: None,
@@ -446,7 +502,60 @@ impl Port {
             path_trace: a.path_trace().take(16).collect(),
             master_port: h.source,
         };
+        // BTCA (802.1AS Clause 10.3) BEFORE choosing a role. Until this
+        // existed the port accepted any Announce and went straight to Slave,
+        // so our own clock was never a candidate and we could never be the
+        // grandmaster Milan §4.3.1.1 requires a Talker PAAD to be capable of
+        // being.
+        //
+        // Losing is the normal outcome and must stay cheap: a device
+        // announcing priority1 248 beats our 255 at the first rung, so this
+        // returns `false` and everything below behaves exactly as before.
+        let theirs = btca::ClockDataset {
+            priority1: info.priority1,
+            quality: info.clock_quality,
+            priority2: info.priority2,
+            identity: info.identity,
+            steps_removed: info.steps_removed,
+            sender: h.source,
+        };
+        if btca::we_are_better(&self.our_dataset(), &theirs) {
+            self.c.btca_we_won += 1;
+            if self.state != PortState::Master {
+                self.note(
+                    now,
+                    format!("BTCA: our clock beats {} — taking MASTER", info.identity),
+                );
+                self.enter_master(now, "btca_won");
+            }
+            // An Announce we beat tells us nothing about OUR time, so none of
+            // the slave-side bookkeeping below applies. The announce deadline
+            // is irrelevant too: as master we are not waiting to hear one.
+            self.announce_deadline = None;
+            return Ok(());
+        }
+        self.c.btca_we_lost += 1;
+        if self.state == PortState::Master {
+            // A better clock appeared. Stop announcing and slave to it.
+            self.note(
+                now,
+                format!("BTCA: {} beats our clock — leaving MASTER", info.identity),
+            );
+            self.set_port_state(now, PortState::Listening, "btca_lost");
+            self.next_announce_tx = None;
+            self.next_sync_tx = None;
+            self.follow_up_pending = None;
+            self.sync_awaiting_ts = None;
+            // Our clock was free-running, so there is no valid tracking state
+            // against this new grandmaster: start from Acquire.
+            self.servo_acquire(now, "btca_lost");
+        }
         match self.state {
+            PortState::Master => {
+                // Unreachable: the branch above demoted us to Listening
+                // before this match, and the winning case returned early.
+                debug_assert!(false, "master must be resolved before role dispatch");
+            }
             PortState::Listening => {
                 self.set_port_state(now, PortState::Slave, "announce_accepted");
                 self.slave_since = now;
@@ -514,10 +623,59 @@ impl Port {
             .push_back(Action::AdvertiseAdp { gm: self.id.clock });
     }
 
+    /// The clock dataset we would announce, for BTCA.
+    ///
+    /// `steps_removed` is 0 because as grandmaster we ARE the source, and
+    /// `sender` is our own port. `PRIORITY1` is 248, the Milan
+    /// grandmaster-capable value, so this dataset genuinely competes -- see
+    /// the note on [`PortState::Master`] for what that resolves to here.
+    fn our_dataset(&self) -> btca::ClockDataset {
+        btca::ClockDataset {
+            priority1: crate::PRIORITY1,
+            quality: crate::our_clock_quality(),
+            priority2: crate::PRIORITY2,
+            identity: self.id.clock,
+            steps_removed: 0,
+            sender: self.id,
+        }
+    }
+
+    /// Take the master role: stop slaving, start the Announce and Sync
+    /// timers, and advertise ourselves as the grandmaster.
+    fn enter_master(&mut self, now: MachTicks, why: &'static str) {
+        self.set_port_state(now, PortState::Master, why);
+        // Stop disciplining: our clock is now the reference, and the rate we
+        // were holding is kept rather than reverted (see become_time_source).
+        let before = self.servo.state();
+        if self.servo.become_time_source() {
+            self.servo_edge(now, before, why);
+        }
+        self.model.invalidate();
+        // The offset window holds measurements against a grandmaster we no
+        // longer follow. As the grandmaster our offset to the reference is
+        // zero by definition, so reporting the stale figures would be a
+        // false reading rather than an old one.
+        self.offsets.clear();
+        self.gm = None;
+        self.pending_sync = None;
+        self.announce_deadline = None;
+        // First Announce and Sync go out immediately, so a listener does not
+        // wait a full interval to discover the new grandmaster.
+        self.next_announce_tx = Some(now);
+        self.next_sync_tx = Some(now);
+        self.sync_awaiting_ts = None;
+        self.last_gm = Some(self.id.clock);
+        self.actions
+            .push_back(Action::AdvertiseAdp { gm: self.id.clock });
+    }
+
     fn master(&self) -> Option<PortIdentity> {
         match self.state {
             PortState::Slave => self.gm.as_ref().map(|g| g.master_port),
-            PortState::Listening => None,
+            // As master there is no upstream port to accept Sync from, and
+            // returning our own identity would make us accept our own
+            // messages looped back.
+            PortState::Listening | PortState::Master => None,
         }
     }
 
@@ -870,6 +1028,81 @@ impl Port {
         self.poll_responder(out);
         self.poll_initiator(now, out);
         self.poll_signaling(now, out);
+        self.poll_master(now, out);
+    }
+
+    /// Announce, Sync and Follow_Up while we hold the master role.
+    ///
+    /// Only reachable from [`PortState::Master`], which BTCA grants and takes
+    /// away. While `PRIORITY1` is 255 this never runs against a Milan peer
+    /// announcing 248 — deliberately, so the path exists and is exercised by
+    /// tests before we are eligible to take a live clock.
+    ///
+    /// Announce goes at 1 s and Sync at 125 ms, the intervals transcribed
+    /// from the 16R's own messages. The Follow_Up is NOT sent here: it needs
+    /// the Sync's hardware TX timestamp, so it is emitted from
+    /// `on_tx_timestamp` once that arrives, carrying the Sync's sequenceId.
+    fn poll_master<const N: usize>(&mut self, now: MachTicks, out: &mut Outbox<N>) {
+        if self.state != PortState::Master {
+            return;
+        }
+        // 802.1AS: a port transmits Announce and Sync only while asCapable.
+        // Without a completed Pdelay exchange the peer has no link delay for
+        // us, so our timestamps would be uncorrectable at the far end.
+        if !self.as_capable {
+            return;
+        }
+        // The Follow_Up first: it completes a Sync already on the wire, and a
+        // listener holds an unpaired Sync only briefly.
+        if let Some((seq, origin)) = self.follow_up_pending.take() {
+            let t = self.next_tag(TagKind::FollowUpTx, seq);
+            let tbi = self.gm_time_base_indicator;
+            let f = msg::encode_follow_up(self.mac, self.id, seq, origin, tbi, t);
+            if self.push(out, f) {
+                self.c.follow_up_tx += 1;
+            }
+        }
+        if self.next_announce_tx.is_some_and(|d| now >= d) {
+            let a = msg::Announce::for_grandmaster(
+                self.id.clock,
+                crate::PRIORITY1,
+                crate::our_clock_quality(),
+                crate::PRIORITY2,
+                UTC_OFFSET_TAI,
+            );
+            let seq = self.announce_seq;
+            // Copy the path trace and take the tag BEFORE the encode call:
+            // the path trace borrows `self` immutably and `next_tag` needs it
+            // mutably, so they cannot be arguments to the same expression.
+            //
+            // The pathSequence is our own clockIdentity, exactly as the 16R's
+            // Announce carries its own.
+            let trace = self.id.clock.0;
+            let t = self.next_tag(TagKind::Announce, seq);
+            let f =
+                msg::encode_announce(self.mac, self.id, seq, &a, &trace, msg::ANNOUNCE_FLAGS, t);
+            if self.push(out, f) {
+                self.c.announce_tx += 1;
+                self.announce_seq = self.announce_seq.wrapping_add(1);
+            }
+            self.next_announce_tx = Some(now.add_ticks(self.secs_ticks(ANNOUNCE_TX_INTERVAL_S)));
+        }
+        if self.next_sync_tx.is_some_and(|d| now >= d) {
+            // A Sync whose timestamp never came back leaves a Follow_Up
+            // unsent, and an unpaired Sync is discarded by the listener. Count
+            // it rather than silently overwrite the pending sequenceId.
+            if self.sync_awaiting_ts.is_some() {
+                self.c.sync_tx_ts_lost += 1;
+            }
+            let seq = self.sync_seq;
+            let f = msg::encode_sync(self.mac, self.id, seq, self.next_tag(TagKind::SyncTx, seq));
+            if self.push(out, f) {
+                self.c.sync_tx += 1;
+                self.sync_awaiting_ts = Some(seq);
+                self.sync_seq = self.sync_seq.wrapping_add(1);
+            }
+            self.next_sync_tx = Some(now.add_ticks(self.secs_ticks(SYNC_TX_INTERVAL_S)));
+        }
     }
 
     fn timers(&mut self, now: MachTicks) {
@@ -1059,6 +1292,11 @@ impl Port {
     /// `SendFrame` accepted the frame.
     pub fn on_frame_sent(&mut self, tag: u64, _now: MachTicks) {
         match tag_kind(tag) {
+            // Master-side Sync asks for a TX timestamp; arm the generation
+            // hold so the stamp is matched against the clock it was taken on.
+            Some(TagKind::SyncTx) => self.hold.on_want_ts_sent(tag, self.gen),
+            // Announce and Follow_Up carry no timestamp request.
+            Some(TagKind::Announce | TagKind::FollowUpTx) => {}
             Some(TagKind::PdelayReq) => {
                 self.c.pdelay_req_tx += 1;
                 self.hold.on_want_ts_sent(tag, self.gen);
@@ -1091,6 +1329,34 @@ impl Port {
         let sent_gen = self.hold.sent_gen(tag);
         self.hold.on_ts_resolved(tag);
         match tag_kind(tag) {
+            Some(TagKind::SyncTx) => {
+                // The hardware stamp this Sync got on the wire IS the
+                // Follow_Up's preciseOriginTimestamp, and the Follow_Up must
+                // reuse the Sync's sequenceId -- that pairing is the only
+                // link between the two messages.
+                let Some(seq) = self.sync_awaiting_ts.take() else {
+                    return;
+                };
+                match res {
+                    TxTsResult::Ok(ns) => {
+                        // Raw SYSTIM nanoseconds -> the Timestamp the wire
+                        // format carries (6-octet seconds + 4-octet nanos).
+                        self.follow_up_pending = Some((
+                            seq,
+                            Timestamp {
+                                secs: ns / 1_000_000_000,
+                                nanos: (ns % 1_000_000_000) as u32,
+                            },
+                        ));
+                    }
+                    // No timestamp means no honest origin to report. Sending a
+                    // Follow_Up with a substituted time would hand the
+                    // listener a wrong clock, which is worse than sending
+                    // nothing and letting it discard the unpaired Sync.
+                    _ => self.c.sync_tx_ts_lost += 1,
+                }
+            }
+            Some(TagKind::Announce | TagKind::FollowUpTx) => {}
             Some(TagKind::PdelayReq) => {
                 let gen = sent_gen.unwrap_or(self.gen);
                 let Some(x) = self.ini.cur.as_mut().filter(|x| x.tag == tag) else {
