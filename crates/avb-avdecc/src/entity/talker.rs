@@ -1299,6 +1299,8 @@ impl TalkerEntity {
                     &StreamPortDesc {
                         clock_domain_index: 0,
                         port_flags: 0,
+                        number_of_controls: 0,
+                        base_control: 0,
                         number_of_clusters: m.channels,
                         base_cluster: m
                             .out_cluster_count()
@@ -1347,6 +1349,8 @@ impl TalkerEntity {
                     &StreamPortDesc {
                         clock_domain_index: 0,
                         port_flags: 0,
+                        number_of_controls: 0,
+                        base_control: 0,
                         number_of_clusters: m.channels,
                         base_cluster: index.saturating_mul(m.channels),
                         number_of_maps: 1,

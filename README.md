@@ -1,10 +1,13 @@
 # DreamAVB
 
-A native macOS AVB (Audio Video Bridging) audio bridge. A custom Intel I210
-DriverKit driver plus a Rust stack (gPTP / 802.1AS, MSRP/MVRP, IEEE 1722 AAF,
-1722.1 AVDECC, Milan) exposes a PreSonus StudioLive 16R to Core Audio DAWs
-(Reaper, Pro Tools) as an input and output device. Apple's own AVB stack is
-bypassed entirely.
+DreamAVB aims to be a fully Milan-compliant AVB (Audio Video Bridging) audio
+driver for macOS. We are building it because macOS's existing AVB
+implementation is old and broken for this use case. DreamAVB bypasses Apple's
+built-in ATDECC entirely and manages AVB discovery and connections itself.
+
+A custom Intel I210 DriverKit driver plus a Rust stack (gPTP / 802.1AS,
+MSRP/MVRP, IEEE 1722 AAF, 1722.1 AVDECC, Milan) exposes a PreSonus StudioLive
+16R to Core Audio DAWs (Reaper, Pro Tools) as an input and output device.
 
 The implementation is clean-room: it is written from the public IEEE 802.1AS,
 802.1Q (MSRP/MVRP), 1722, 1722.1, Milan v1.2 specifications and the Intel I210

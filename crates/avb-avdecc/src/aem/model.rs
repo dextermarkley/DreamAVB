@@ -183,6 +183,11 @@ pub struct PtpPortDesc {
 pub struct StreamPortDesc {
     pub clock_domain_index: u16,
     pub port_flags: u16,
+    /// IEEE 1722.1 §7.2.13 offsets 8-9. Zero for our ports: we expose no
+    /// per-port CONTROL descriptors.
+    pub number_of_controls: u16,
+    /// IEEE 1722.1 §7.2.13 offsets 10-11.
+    pub base_control: u16,
     pub number_of_clusters: u16,
     pub base_cluster: u16,
     pub number_of_maps: u16,

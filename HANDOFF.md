@@ -1,6 +1,15 @@
-# AVB-Audio: context handoff (2026-10-13)
+# AVB-Audio: context handoff (2026-10-14)
 
-Native macOS AVB audio bridge. Our own NIC driver plus a Rust stack exposes a PreSonus StudioLive 16R (Milan firmware 3.3.0.109659) to DAWs (Pro Tools, Reaper) as a Core Audio device. Apple's AVB stack is bypassed entirely.
+Native macOS AVB audio bridge. Our own NIC driver plus a Rust stack exposes a
+PreSonus StudioLive 16R (Milan firmware 3.3.0.109659) to DAWs (Pro Tools,
+Reaper) as a Core Audio device. The long-term goal is a fully Milan-compliant
+Mac AVB driver because the macOS AVB implementation is old and broken for this
+use. Our path bypasses Apple's built-in ATDECC entirely; the project owns
+discovery, enumeration, connection management, timing, and media transport.
+The current phase deliberately prioritizes a working end-to-end connection
+over full Milan compliance. Record conformance gaps, but do not treat
+implementing more of Milan as the next fix without evidence that a specific
+gap blocks this connection.
 
 Read this file first, then `AGENTS.md` (rules) and the docs it points to.
 
@@ -9,16 +18,20 @@ Read this file first, then `AGENTS.md` (rules) and the docs it points to.
 Phase 1a is complete on real hardware. Phase 1b is active on branch
 `feat/companion-app`: 64 channels each way, gPTP, MAAP, MSRP/MVRP, ACMP, AEM,
 AAF and an optional CRF talker all work against the live 16R. A user-authorized
-signed `duplex` daemon currently owns the I210; it locks gPTP and the 16R reports
+signed `duplex` daemon has locked gPTP, and the 16R reports
 all eight audio STREAM_INPUT sinks bound to our exact stream IDs, MAAP addresses,
 VLAN 2, formats, and `CONNECTED|SAVED_STATE|FAST_CONNECT` state.
 
-The unresolved product symptom is narrower: UC Surface still does not offer us as
-a live selectable source in `Network > AVB Inputs`. Its `avb_src_*` entries retain
-our raw entity IDs marked `(offline)`, and `mixerlist` contains only the console,
-even while the live daemon proves every audio route is connected. A known-good
-Apple/Broadcom session appeared by name and was selectable. Its wire traffic is
-captured in `.agents/tmp/apple-avdecc.pcap` and `.agents/tmp/apple-enum.pcap`.
+The `STREAM_PORT` descriptor fix below made `AVB-Audio Mac` a live, selectable
+source in UC Surface. The remaining symptom is no audible or metered Channel 1
+return despite a connected stream and a nonzero Mac output ring. **Do not treat
+this as console routing alone:** the Channel 1 test ran under `AVB_TXCAP`, which
+cut the 48 kHz / 6-sample audio stream to about 4,700 PDUs/s instead of the
+required 8,000 PDUs/s. The 16R also recorded late timestamps. See the
+"Channel 1 transport timing review" below before another hardware test.
+A known-good Apple/Broadcom session is retained only as a behavioral reference
+in `.agents/tmp/apple-avdecc.pcap` and `.agents/tmp/apple-enum.pcap`; Apple's
+ATDECC remains bypassed.
 
 The latest live ACMP diagnostic resolves a suspected index failure. Audio talker
 UIDs 0–7 bind the 16R's Return sinks 1–8. The repeated UID 8 request targets Return
@@ -28,20 +41,263 @@ Do not reindex audio streams or add a synthetic ninth output.
 
 Do **not** resume from the older MAAP, grandmaster, talker-only entity, missing
 CRF or inert-unsolicited notes below: all are implemented and hardware-tested.
-CRF, `MEDIA_CLOCK_SOURCE`, full enumeration, sink symmetry, entity lifetime,
+CRF, `MEDIA_CLOCK_SOURCE`, expanded AEM descriptor coverage, sink symmetry, entity lifetime,
 available-index reset, state notifications, Apple's per-stream GET_COUNTERS
-heartbeat, controller capability, corrected descriptor indices and offsets,
+heartbeat, controller capability, prior descriptor index and offset fixes,
 static PTP descriptors, PTP grandmaster notifications, model-ID prefix, and
-initial `CONNECT_RX.stream_id=0` have each been tested and did not change UC
-Surface's decision.
+initial `CONNECT_RX.stream_id=0` were tested before the `STREAM_PORT` fix and
+did not resolve the source-listing problem.
+
+### Connection research (2026-10-14)
+
+The current failure should not be described as an inability to establish an AVB
+connection. The signed `duplex` daemon log at
+`.agents/tmp/unmanaged-daemon-20261014.log` shows gPTP `LOCKED`, the 16R as
+grandmaster, Listener Ready for audio talker UIDs 0–7, and 16R `GET_STREAM_INFO`
+for Return sinks 1–8 with `CONNECTED|SAVED_STATE|FAST_CONNECT`, the expected
+stream IDs and destination MACs, and VLAN 2. The 16R's `FRAMES_RX` counters
+increase during live probes (for example 20,147 → 44,316 → 68,876 in
+`.agents/tmp/controller-capability-live.log`). This demonstrates binding and
+frame reception; it does not prove the console is using the samples as audio or
+explain UC Surface's `(offline)` classification.
+
+At that time, the issue was the mismatch between this live AVDECC/data-plane
+state and UC Surface's source list. **Plain IEEE 1722.1 research found a definite
+AEM wire-format bug and a matching enumeration retry loop; the hardware retest
+below confirmed that correcting it cleared UC Surface's `(offline)` label.** The
+repeated `CONNECT_TX` for talker UID 8 is the previously saved CRF route to
+sink 0, separate from all eight connected audio streams.
+
+IEEE 1722.1 §7.2.13's 20-byte `STREAM_PORT_INPUT`/`STREAM_PORT_OUTPUT`
+descriptor has `number_of_controls` and `base_control` at offsets 8 and 10,
+followed by cluster count/base at 12 and 14, then map count/base at 16 and 18.
+The current `encode_stream_port` in `crates/avb-avdecc/src/aem/desc.rs` omits
+the two control fields and emits only 16 bytes; its matching decoder makes
+local round-trip tests unable to catch the omission. The source layout is
+independently reflected in the [PipeWire AVB descriptor
+implementation](https://github.com/PipeWire/pipewire/blob/master/src/modules/module-avb/descriptors.c)
+and the [Wireshark AVDECC dissector source](https://sources.debian.org/src/wireshark/2.6.7-1~deb9u1/epan/dissectors/packet-ieee17221.c/).
+
+The transmitted `STREAM_PORT_INPUT.0` response in
+`.agents/tmp/our-controller-capability-live-20261013.pcap` is exactly 16 bytes:
+`000e 0000 0000 0000 0008 0040 0001 0008`. A conforming reader interprets
+this as **8 controls starting at index 64** and **1 cluster starting at index
+8**, with the required map fields absent. With no port controls, the intended
+20-byte descriptor would be `000e 0000 0000 0000 0000 0000 0008 0040 0001 0008`.
+The 16R then reads `AUDIO_CLUSTER.8`
+successfully, asks for `CONTROL.64`, receives `NO_SUCH_DESCRIPTOR`, and begins
+again at `ENTITY.0` about 67 ms later. This exact sequence repeats five times
+within about three seconds. The query is therefore explained by our shifted
+fields. This is
+strong evidence that malformed AEM enumeration blocks the live source listing,
+despite the independent audio stream bindings and received-frame counters.
+
+**Hardware retest (2026-10-14): confirmed.** The corrected signed daemon emitted
+20-byte STREAM_PORT descriptors with zero controls, and the prior `CONTROL.64`
+request and enumeration retry loop disappeared. UCNet then listed `AVB-Audio Mac`
+in `mixerlist` and exposed all eight named `Mac→16R` stream banks as live
+candidates in every `avb_src_*` list. This fixes the UC Surface `(offline)`
+classification gate.
+
+### Successful connection status and Channel 1 audio boundary (2026-10-14)
+
+The AVB control connection and Ethernet frame reception are proven. Audio
+playout inside the 16R is not yet proven:
+
+- The corrected entity is live in UC Surface as `AVB-Audio Mac`; all eight named
+  source banks are selectable, not `(offline)`.
+- gPTP is `LOCKED` to the 16R grandmaster. All eight 16R Return sinks report
+  `CONNECTED|SAVED_STATE|FAST_CONNECT`, exact stream IDs, MAAP destination
+  addresses, VLAN 2, and accepted MSRP Listener Ready declarations.
+- A user-authorized unmanaged signed `duplex` daemon was used for hardware
+  tests. Its captured run transmitted 60,866,728 PDUs with zero rate
+  limits/refusals, all eight sinks accepted, and a measured outbound peak of
+  -14.4 dBFS. The Mac Core Audio output ring is therefore not silent, but the
+  packet count over 1,619 s is far below the required cadence (see below).
+- `stageboxsetup/avb_src_1_8` reads back as
+  `AVB-Audio Mac:Mac→16R 1-8`; the console's AVB Send 1 is assigned digital
+  source 0. These are successful connection/routing assignments, not pending
+  protocol work.
+
+The remaining failure is **Channel 1 audio playout**, with a demonstrated
+transport-timing fault in the test run.
+A scratch channel-isolated Core Audio tone was verified nonzero in output-ring
+channel 1 and was transmitted by the daemon, but neither the daemon's returned
+input ring nor any UCNet UDP meter group reported a Channel 1 increase. A
+six-second 1 kHz Channel 1 tone at 0.25 amplitude left UDP meters unchanged;
+only pre-existing low background on channels 5 and 14 appeared. The test does
+not isolate console routing from transport timing.
+
+### Channel 1 transport timing review (2026-10-14)
+
+Spec-level review found a real media-cadence violation in the run containing
+the Channel 1 tone. The 16R's selected AAF format is 48 kHz, eight channels,
+six samples per PDU (`0x0205022002006000`). Six samples at 48 kHz require one
+PDU every 125 us, or **8,000 PDUs/s per stream**
+([Milan consolidated v1.3](Milan_Specification_Consolidated_v1.3.pdf),
+Table 6.3 and §5.3.7.6; the [IEEE 1722 AAF working-group timing
+notes](https://grouper.ieee.org/groups/1722/contributions/2014/IEEE%201722a%20Assumptions-v17.pdf)
+place each packet's timestamp at its first sample). In
+`.agents/tmp/stream-port-fix-20261014.pcap`, stream 0
+(`0x644bf01273b80000`, 16R Return 1-8) has 47,007 PDUs from 08:20:00 to
+08:20:10 local time: **4,700.7 PDUs/s**. Its channel-1 sample bytes are nonzero
+in that window, so the transmit path did not merely packetize silence. The
+16R's sink-1 `GET_COUNTERS` in `.agents/tmp/stream-port-fix-20261014.log`
+shows `LATE_TIMESTAMP` (counter slot 9) rising 14 -> 15 -> 19 over the three
+early probes. `FRAMES_RX` rises, confirming frame reception, not sample
+playout.
+
+The captured run's summary is 60,866,728 audio PDUs over 1,619 s and eight
+streams = **4,699.4 PDUs/s/stream**, with 3,772,824 missed transmit
+intervals. The earlier `.agents/tmp/unmanaged-daemon-20261014.log` summary is
+294,312,872 PDUs over 4,622 s and eight streams = **7,959.6
+PDUs/s/stream**, with only 69,444 missed intervals. This comparison strongly
+implicates diagnostic self-capture: when `AVB_TXCAP` is set,
+`crates/avb-daemon/src/realdext.rs::append_pcap` synchronously opens, appends
+and closes the pcap **once per frame on the transmit thread**, before the
+batched send. The 14 GB capture spans the Channel 1 tests. The pcap records
+attempted frames before `send_batch`, but the daemon reports zero refusals;
+the 16R's advancing receive counter corroborates the reduced arrival rate.
+
+There is an independent timestamp-design flaw to review: `talker_loop` stamps
+every PDU as `gptp.now_ns(now_mach()) + 2 ms`. On a missed deadline it moves
+`next_pdu_ns` to `elapsed + one interval`, but consumes only the next six ring
+frames. Presentation time therefore follows when the loop happened to run
+instead of the continuous media-sample timeline. This is especially severe
+under capture load; its effect during a near-8,000-PDU/s run remains unproven.
+Derive successive PDU timestamps from a media-clock/sample cursor, and account
+for skipped sample intervals when late. The 2 ms presentation offset itself is
+not the finding: Milan v1.3 §5.3.7.6 prescribes it by default and allows an
+additional timing-uncertainty term of up to 125 us.
+
+**Clean-cadence retest and final Channel 1 timing repair (2026-10-14):
+confirmed.** The scheduler now derives presentation timestamps from a
+media-interval cursor and discards matching stale ring frames when it misses
+intervals. The first uncaptured retest improved cadence and held the sink's
+late-timestamp counter flat, but its outgoing nonzero Channel 1 AAF trace was
+still +2.720 ms ahead of gPTP. That exposed a final cursor-ahead case.
+
+The repair re-anchors the media cursor only when its next timestamp would exceed
+the live 2 ms gPTP presentation target. A bounded trace run logged a nonzero
+outgoing Channel 1 sample (`70075712`) in stream 0 with a +1.949 ms presentation
+offset, inside the 2 ms limit. An earlier raw ring observation appeared to show
+a returned Channel 1 peak, but it was not reproducible and must **not** be
+considered proof of end-to-end audio.
+
+Fresh direct recordings resolve the ambiguity: a 12-second mono Channel 1 WAV
+captured from `/Users/Shared/avb16r.ring` during the same six-second 1 kHz
+Channel 1 tone contains no Channel 1 sample above 10,000,000, and a simultaneous
+raw ring sampler reports only background on channels 2–8. This recorder reads
+the daemon's world-readable mapped ring directly; it does not use macOS
+microphone permission or a Core Audio input device. macOS is therefore not
+blocking the recording. The Channel 1 playout/return path remains unresolved.
+
+Do not change UC Control settings or revisit AEM, ADP, ACMP, MSRP, MAAP, gPTP,
+or source-listing hypotheses without a new regression. The user-authorized
+unmanaged daemon remains active after the bounded test; stop it cleanly before
+starting DreamAVB-managed audio.
+
+Do not broaden testing beyond Channel 1. UC Control settings have now been
+**confirmed correct by the user**, including Channel 1 Digital Return set to
+Network. The raw UCNet node `/return/ch1/inputsrc` was restored to its original
+`0.0` after exploratory enum trials; do not infer labels from that raw value or
+retry console-setting changes. The configuration is no longer the hypothesis.
+
+After the clean-cadence test, preserve the confirmed UC Control routing and
+collect aligned Channel 1 signal-path evidence: Core Audio/output-ring sample,
+outgoing AAF payload and timing, 16R receive state, and returned input-ring
+sample. Avoid `AVB_TXCAP` on the time-critical path while collecting it.
+
+Plain IEEE 1722.1 narrows the interpretation: ADP advertises a live entity and
+answers discovery, while ACMP and `GET_STREAM_INFO` report connection state.
+The standard's `CONNECTED` flag means connected with ACMP; `SAVED_STATE` and
+`FAST_CONNECT` describe saved/reconnection state, not UC Surface's definition
+of a selectable source. See the IEEE working-group material on
+[ADP announce/discover](https://grouper.ieee.org/groups/1722/1/contributions/2016/1722.1-butterworth-Scaling.pdf)
+and the [1722.1 draft's `GET_STREAM_INFO` flag table](https://grouper.ieee.org/groups/1722/1/contributions/2019/Rimas%20P1722.1REV1%20changes/IEEE-P1722.1REV1-changes.pdf).
+In `.agents/tmp/our-controller-capability-live-20261013.pcap`, our nine
+`ENTITY_AVAILABLE` frames have consecutive `available_index` values 0–8 and
+2.03–8.24 s gaps against a 20 s advertised validity, followed by one
+`ENTITY_DEPARTING` at shutdown. This rules out an obvious transmit-side ADP
+expiry in that capture, but it does not show whether the 16R received each
+advertisement or how UC Surface classified it. The malformed AEM descriptor
+was subsequently confirmed by the hardware retest above.
+
+### AVB and Milan version compatibility (research, 2026-10-14)
+
+There is no single negotiated "AVB version": AVB combines IEEE timing,
+reservation, transport and AVDECC protocols. Individual AVTP/AVDECC packets
+carry a protocol `version` field (the current AVDECC frames here use 0), while
+ADP/AEM descriptors expose capabilities and supported stream formats. A
+controller discovers a peer, reads its model and selects a mutually supported
+configuration; it does not exchange a stack-wide version and automatically
+downgrade. See the [IEEE 1722.1-2021 standard page](https://standards.ieee.org/ieee/1722.1/6670/)
+and the [Avnu AVB packet-format example](https://avnu.org/wp-content/uploads/2014/05/AutoCDSFunctionalSpec-1_4-public_with_legal_notices.pdf).
+
+Milan adds explicit profile identification through the vendor-unique
+`GET_MILAN_INFO` response. The [Milan consolidated v1.3
+specification](https://avnu.org/resource/milan-specification/) §5.4.4.1 gives
+separate `protocol_version` (currently 1), `features_flags`,
+`certification_version` (0 if uncertified), and `specification_version`
+(e.g. 1.3.0.0) fields. `specification_version` was added in v1.3; a zero in
+an older device's response does not mean Milan protocol version 0. The live
+16R capture in `crates/avb-avdecc/src/milan.rs` has protocol version 1,
+certification version 1.1.0.0, and no declared specification version. Our
+response currently reports protocol version 1, certification 0 and
+specification version 1.3.0.0. The specification revision describes supported
+behavior, not just the document used during development: §5.4.4.1 recommends
+that a noncompliant active Configuration not answer `GET_MILAN_INFO` (a future
+requirement), and the introduction requires full compliance when advertising
+Milan compatibility. Reconcile our advertised 1.3 behavior with actual
+conformance in the later Milan phase; retain the working interoperability
+experiment for the current phase.
+
+Backward compatibility should be deliberate and per feature. Milan v1.3 itself
+keeps ACMP binding commands for older controllers without MVU binding
+(§5.5.2.1), requires sending and accepting the 56-byte ACMP PDU for backward
+compatibility (§5.5.2.2), and describes revision-sensitive meanings for
+`GET_STREAM_INFO` length/latency (§5.4.2.10) and Stream Output counter indices
+(§5.4.2.25). The controller should read available version/capability/format
+signals, handle known older layouts by their defined length or revision, and
+use the common supported feature set. Unsupported extensions should receive
+the specified response. Do not infer that two peers interoperate just because
+both report protocol version 1 or because one has a Milan certification. No
+evidence ties the current UC Surface `(offline)` state to a version mismatch;
+the malformed base IEEE 1722.1 `STREAM_PORT` descriptor and matching 16R
+retry loop remain the first concrete blocker to test.
+
+The existing Apple captures show a selectable baseline, but the current
+`AVB_TXCAP` path captures only Mac transmissions (see
+`crates/avb-daemon/src/realdext.rs`). Our transmit-only capture cannot reveal
+the 16R's complete response or the controller decision. The I210 cannot be
+captured with `tcpdump` while its dext owns it; use an external capture point
+or add receive-side instrumentation in a later code phase. ADP
+capability/model fields differ between Apple and our entity, but none is
+established as the cause. If correcting the malformed STREAM_PORT descriptors
+does not restore UC Surface's source listing, the next observation should be a
+**bidirectional** capture of the running daemon and 16R while UC Surface
+changes or refreshes its source list, aligned with daemon logs and the
+displayed state. Compare the resulting ADP, AEM, ACMP, and any vendor traffic
+with the known-good capture, then test one hardware-grounded hypothesis at a
+time.
+PreSonus's
+[Mac AVB connection guide](https://support.presonus.com/hc/en-us/articles/38925260615437-How-to-connect-your-Series-III-console-running-firmware-v3-1-to-a-Mac-over-AVB)
+describes Apple's routing workflow and is useful only as reference behavior
+for this independent driver.
 
 Suggested next steps, in order:
-1. Capture the current live ADP/ACMP transaction and compare controller identity,
-   timing, and command sequencing byte-for-byte with the known-good Apple capture.
-2. Derive the 16R's remaining online-classification rule from that captured
-   difference; do not add protocol surface without a hardware-anchored mismatch.
-3. Before returning control to DreamAVB, stop the user-authorized unmanaged daemon
-   cleanly so the companion can again own the I210 exclusively.
+1. Preserve the user-confirmed correct UC Control configuration. Do not change
+   Channel 1 Digital Return, AVB source banks, AVB Send 1, or raw UCNet enum
+   values without new evidence.
+2. Replay the existing Channel 1-only 1 kHz tone through `AVB StudioLive 16R`
+   while collecting aligned evidence at four boundaries: Core Audio/output ring,
+   outgoing AAF frame, 16R AVB receive state, and returned input ring or UDP
+   meter. Keep all experiments scoped to Channel 1.
+3. Use the first boundary that lacks the tone to investigate only that layer of
+   the Channel 1 internal return/send routing. Do not reopen resolved AEM, ADP,
+   ACMP, MSRP, MAAP, gPTP, or source-listing hypotheses.
+4. Before returning control to DreamAVB, stop the user-authorized unmanaged
+   daemon cleanly so the companion can again own the I210 exclusively.
 
 Validation for the staged batch is green: workspace fmt, warning-denied clippy,
 576 Rust tests, 97 tg3 host checks, 390 I210 host checks, and `scripts/package.sh`

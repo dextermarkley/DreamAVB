@@ -744,6 +744,11 @@ pub fn encode_stream_port(d: &StreamPortDesc, is_input: bool) -> Vec<u8> {
     w.u16(0);
     w.u16(d.clock_domain_index);
     w.u16(d.port_flags);
+    // IEEE 1722.1 §7.2.13: controls precede clusters and maps. Omitting
+    // these two words shifted our cluster block into the control slots,
+    // making the 16R request CONTROL.64 and restart enumeration.
+    w.u16(d.number_of_controls);
+    w.u16(d.base_control);
     w.u16(d.number_of_clusters);
     w.u16(d.base_cluster);
     w.u16(d.number_of_maps);
@@ -756,6 +761,8 @@ pub fn decode_stream_port(pdu: &[u8]) -> Option<StreamPortDesc> {
     r.skip(4)?;
     let clock_domain_index = r.u16()?;
     let port_flags = r.u16()?;
+    let number_of_controls = r.u16()?;
+    let base_control = r.u16()?;
     let number_of_clusters = r.u16()?;
     let base_cluster = r.u16()?;
     let number_of_maps = r.u16()?;
@@ -763,6 +770,8 @@ pub fn decode_stream_port(pdu: &[u8]) -> Option<StreamPortDesc> {
     Some(StreamPortDesc {
         clock_domain_index,
         port_flags,
+        number_of_controls,
+        base_control,
         number_of_clusters,
         base_cluster,
         number_of_maps,
@@ -951,16 +960,30 @@ mod tests {
     }
 
     #[test]
-    fn stream_port_cluster_map_round_trip() {
+    fn stream_port_has_the_literal_20_byte_control_cluster_map_layout() {
         let p = StreamPortDesc {
             clock_domain_index: 0,
             port_flags: 0,
+            number_of_controls: 0,
+            base_control: 0,
             number_of_clusters: 4,
             base_cluster: 0,
             number_of_maps: 1,
             base_map: 0,
         };
-        assert_eq!(decode_stream_port(&encode_stream_port(&p, true)), Some(p));
+        // IEEE 1722.1 §7.2.13: header, clock domain, flags, controls,
+        // clusters, then maps. This must not regress to the old 16-byte
+        // layout that moved the cluster block into the control slots.
+        let wire = vec![
+            0x00, 0x0e, 0x00, 0x00, // STREAM_PORT_INPUT, descriptor index 0
+            0x00, 0x00, 0x00, 0x00, // clock domain, port flags
+            0x00, 0x00, 0x00, 0x00, // number/base controls
+            0x00, 0x04, 0x00, 0x00, // number/base clusters
+            0x00, 0x01, 0x00, 0x00, // number/base maps
+        ];
+        assert_eq!(encode_stream_port(&p, true), wire);
+        assert_eq!(decode_stream_port(&wire), Some(p));
+
         let c = AudioClusterDesc {
             object_name: "In 1 ch 1".into(),
             channel_count: 1,

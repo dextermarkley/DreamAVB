@@ -3248,6 +3248,9 @@ fn talker_loop(
     let presentation_offset_ns = PRESENTATION_FLOOR_NS;
 
     let mut consumer = avb_audioring::Consumer::new(out_ring.ring());
+    let mut presentation_timeline = AudioPresentationTimeline::default();
+    let mut skipped_media_frames: u64 = 0;
+    let mut presentation_reanchors: u64 = 0;
     let frame_bytes = out_ring.ring().frame_bytes();
     // One PDU's worth of FULL-WIDTH ring frames (64 channels), plus a
     // per-stream buffer the packetizer gets: it wants one stream's channels
@@ -3478,6 +3481,10 @@ fn talker_loop(
     // field nobody counts — a round trip through our own codec cannot, since
     // encode and decode would share the same mistake.
     let mut tx_pdu_dumped = false;
+    // One bounded trace of stream 0 carrying a real Channel 1 sample. The
+    // start-up dump is normally silence, so it cannot prove the actual tone
+    // crossed the Core Audio -> AAF packetizer boundary.
+    let mut tx_channel1_signal_dumped = false;
     let mut rx_pdu_dumped = false;
     let mut our_adp_dumped = false;
     // MAAP frames seen on the control ring, and how many we have dumped.
@@ -5129,6 +5136,7 @@ fn talker_loop(
                 );
                 // Start pacing from here, so the wait does not leave a backlog
                 // that would be emitted as a burst.
+                presentation_timeline.reset();
                 next_pdu_ns = ns_since(start);
             } else {
                 if ns_since(start) >= lock_deadline_ns {
@@ -5382,6 +5390,26 @@ fn talker_loop(
             continue;
         }
 
+        // If the loop is more than one observation interval late, retire the
+        // missed media intervals as a matched pair: discard their ring frames
+        // and advance the presentation cursor. The one interval we are about
+        // to emit may be slightly late but still has a presentation time in
+        // the listener's future window; older intervals must never be retimed.
+        let skipped_intervals = elapsed
+            .saturating_sub(next_pdu_ns)
+            .checked_div(pdu_interval_ns)
+            .unwrap_or(0);
+        if skipped_intervals > 0 {
+            let frames_to_discard = skipped_intervals.saturating_mul(spf as u64);
+            let discarded =
+                consumer.discard(usize::try_from(frames_to_discard).unwrap_or(usize::MAX));
+            skipped_media_frames = skipped_media_frames.saturating_add(discarded as u64);
+            missed_intervals = missed_intervals.saturating_add(skipped_intervals);
+            presentation_timeline.skip_intervals(skipped_intervals);
+            next_pdu_ns =
+                next_pdu_ns.saturating_add(skipped_intervals.saturating_mul(pdu_interval_ns));
+        }
+
         // Drain exactly one PDU's worth of frames from the output ring.
         let got = consumer.read_into(&mut sample_scratch, spf);
         if got < spf {
@@ -5411,10 +5439,28 @@ fn talker_loop(
         // is worse than a PDU not sent, because the listener acts on it.
         let Some(gptp_now) = gptp.now_ns(now_mach()) else {
             ts_unavailable += 1;
+            // A servo step invalidates the old gPTP interpolation anchor. The
+            // next valid reading starts a fresh media timeline rather than
+            // emitting timestamps derived across that discontinuity.
+            presentation_timeline.reset();
             next_pdu_ns = next_pdu_ns.saturating_add(pdu_interval_ns);
             continue;
         };
-        let avtp_ts = (gptp_now.wrapping_add(presentation_offset_ns) & 0xFFFF_FFFF) as u32;
+        if presentation_timeline.reanchor_if_ahead(
+            gptp_now,
+            presentation_offset_ns,
+            pdu_interval_ns,
+        ) {
+            presentation_reanchors = presentation_reanchors.saturating_add(1);
+            log.log_rate_limited(
+                Level::Warn,
+                "play",
+                "presentation_timeline_ahead",
+                "audio presentation cursor ran ahead of gPTP; re-anchored at the 2 ms presentation offset",
+            );
+        }
+        let avtp_ts =
+            presentation_timeline.next_timestamp(gptp_now, presentation_offset_ns, pdu_interval_ns);
 
         // Eight streams at 8000 frames/s each is 64 000 frames/s. That is
         // unreachable one user-client call at a time -- a SendFrame round
@@ -5468,6 +5514,31 @@ fn talker_loop(
             };
             match packed {
                 Ok(n) => {
+                    if uid == 0 && !tx_channel1_signal_dumped {
+                        let channel1_sample = stream_scratch
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .step_by(channels)
+                            .map(|sample| i32::from_ne_bytes(*sample))
+                            .find(|sample| *sample != 0);
+                        if let Some(sample) = channel1_sample {
+                            tx_channel1_signal_dumped = true;
+                            log.log(
+                                Level::Info,
+                                "wire",
+                                &format!(
+                                    "TX Channel 1 signal sample={sample} avtp_ts=0x{avtp_ts:08x} \
+                                     gptp_now={gptp_now}; {}",
+                                    dump_aaf_pdu(
+                                        "TX Channel 1 ",
+                                        pdu_scratch.get(..n).unwrap_or(&[]),
+                                        Some(gptp_now),
+                                    )
+                                ),
+                            );
+                        }
+                    }
                     if !tx_pdu_dumped {
                         tx_pdu_dumped = true;
                         log.log(
@@ -5561,25 +5632,10 @@ fn talker_loop(
         }
         tx_peak_tick = tx_peak_tick.wrapping_add(1);
 
-        // Schedule the next interval, and NEVER resynchronise to "now".
-        //
-        // This used to set `next_pdu_ns = elapsed` when it fell behind. With
-        // one stream the per-tick work fitted inside 125 us and that never
-        // fired. With eight it does not always fit, and resyncing to now made
-        // the gate `elapsed < next_pdu_ns` immediately false again — so the
-        // loop sent group after group with no pacing at all, drained the
-        // dext's 64-token burst and had 415 140 of 935 952 frames denied while
-        // the wire still only saw 14 880/s. A pacing loop that falls behind
-        // must SLOW DOWN, not spin.
-        //
-        // Falling behind is now counted and the schedule placed on the next
-        // boundary in the FUTURE, which guarantees a sleep before the next
-        // group.
+        // Keep the scheduler on the media grid. The next loop accounts for
+        // any intervals that elapsed during packetization or transmission by
+        // advancing both the ring cursor and presentation timeline together.
         next_pdu_ns = next_pdu_ns.saturating_add(pdu_interval_ns);
-        if next_pdu_ns <= elapsed {
-            missed_intervals += 1;
-            next_pdu_ns = elapsed.saturating_add(pdu_interval_ns);
-        }
     }
 
     // Tell the 16R we are going before we stop answering. Without this it
@@ -5631,7 +5687,7 @@ fn talker_loop(
         Level::Info,
         dir,
         &format!(
-            "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns, {missed_intervals} intervals missed over {actual_elapsed_s:.1}s; outbound peak {tx_peak} ({}); 16R listener_ready={listener_ready}; AEM commands answered={aecp_answered} refused={aecp_refused} (plus {aecp_probes_past_end} correct end-of-list probes); Milan MVU answered={mvu_answered}; ACMP talker commands answered={acmp_talker_answered} listener commands answered={acmp_listener_answered}; MAAP seen={maap_seen} sent={maap_tx} acquired={maap_acq} conflicts={maap_conf}; sinks bound={}/{} unbind events={sink_reconnects}; ADP discovers answered={adp_discovers_answered} available_index={}; gPTP servo={} offset {:.0} ns, {ts_unavailable} ticks with no clock anchor, {ticks_unlocked} unlocked",
+            "talker done: {tx_pdus} PDUs on the wire, {tx_rate_limited} rate-limited, {tx_rejected} otherwise refused, {underruns} underruns, {missed_intervals} intervals missed ({skipped_media_frames} media frames discarded, {presentation_reanchors} presentation re-anchors) over {actual_elapsed_s:.1}s; outbound peak {tx_peak} ({}); 16R listener_ready={listener_ready}; AEM commands answered={aecp_answered} refused={aecp_refused} (plus {aecp_probes_past_end} correct end-of-list probes); Milan MVU answered={mvu_answered}; ACMP talker commands answered={acmp_talker_answered} listener commands answered={acmp_listener_answered}; MAAP seen={maap_seen} sent={maap_tx} acquired={maap_acq} conflicts={maap_conf}; sinks bound={}/{} unbind events={sink_reconnects}; ADP discovers answered={adp_discovers_answered} available_index={}; gPTP servo={} offset {:.0} ns, {ts_unavailable} ticks with no clock anchor, {ticks_unlocked} unlocked",
             peak_label(tx_peak),
             sink_connected.values().filter(|v| **v).count(),
             sink_connected.len(),
@@ -5954,6 +6010,65 @@ fn talker_loop(
 fn stream_dest_mac(stream_id: avb_core::StreamId) -> avb_core::MacAddr {
     const MAAP_BLOCK_LEN: u16 = 64;
     avb_core::maap_stream_dest(stream_id.mac(), stream_id.unique_id(), MAAP_BLOCK_LEN)
+}
+
+/// AVTP presentation timestamps on the continuous media observation grid.
+///
+/// The talker can wake late, but its samples and timestamps still belong to
+/// 125-us media intervals. Advancing this cursor for every skipped interval
+/// prevents a delayed loop wake from retiming stale samples as future audio.
+#[derive(Debug, Default)]
+struct AudioPresentationTimeline {
+    anchor_ns: Option<u64>,
+    next_interval: u64,
+}
+
+impl AudioPresentationTimeline {
+    fn reset(&mut self) {
+        self.anchor_ns = None;
+        self.next_interval = 0;
+    }
+
+    fn skip_intervals(&mut self, intervals: u64) {
+        self.next_interval = self.next_interval.saturating_add(intervals);
+    }
+
+    /// Re-anchor only when the cursor has advanced beyond the permissible
+    /// presentation offset. This is a scheduler recovery path, not normal
+    /// pacing: normal media timestamps continue from the original grid.
+    fn reanchor_if_ahead(
+        &mut self,
+        gptp_now_ns: u64,
+        presentation_offset_ns: u64,
+        interval_ns: u64,
+    ) -> bool {
+        let target = gptp_now_ns.wrapping_add(presentation_offset_ns);
+        let Some(anchor) = self.anchor_ns else {
+            return false;
+        };
+        let expected = anchor.wrapping_add(self.next_interval.saturating_mul(interval_ns));
+        if expected > target {
+            self.anchor_ns = Some(target);
+            self.next_interval = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn next_timestamp(
+        &mut self,
+        gptp_now_ns: u64,
+        presentation_offset_ns: u64,
+        interval_ns: u64,
+    ) -> u32 {
+        let anchor = *self
+            .anchor_ns
+            .get_or_insert_with(|| gptp_now_ns.wrapping_add(presentation_offset_ns));
+        let timestamp = anchor.wrapping_add(self.next_interval.saturating_mul(interval_ns));
+        self.next_interval = self.next_interval.saturating_add(1);
+        (timestamp & 0xFFFF_FFFF) as u32
+    }
 }
 
 /// The MSRP Talker Advertise TSpec for our stream (802.1Q-2018 §35.2.2.8).
@@ -7360,6 +7475,36 @@ mod talker_tests {
         descriptor[88..90].copy_from_slice(&0u16.to_be_bytes());
         assert_eq!(ptp_port_range(&descriptor), Some((0, 1)));
         assert_eq!(ptp_port_range(&descriptor[..89]), None);
+    }
+
+    #[test]
+    fn audio_presentation_timeline_skips_on_the_media_grid() {
+        let mut timeline = AudioPresentationTimeline::default();
+        let now = 10_000_000_000u64;
+        let offset = 2_000_000u64;
+        let interval = 125_000u64;
+        assert_eq!(
+            timeline.next_timestamp(now, offset, interval),
+            1_412_065_408
+        );
+        // Two missed 125-us intervals retire their matching samples, so the
+        // next emitted timestamp is interval three, not a fresh now + offset.
+        timeline.skip_intervals(2);
+        assert_eq!(
+            timeline.next_timestamp(now + 375_000, offset, interval),
+            1_412_440_408
+        );
+        timeline.reset();
+        assert_eq!(
+            timeline.next_timestamp(now + 1_000_000, offset, interval),
+            1_413_065_408
+        );
+        timeline.skip_intervals(8);
+        assert!(timeline.reanchor_if_ahead(now + 1_000_000, offset, interval));
+        assert_eq!(
+            timeline.next_timestamp(now + 1_000_000, offset, interval),
+            1_413_065_408
+        );
     }
 
     /// A run can establish the stream perfectly and transmit all zeros, so the
