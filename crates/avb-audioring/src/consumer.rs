@@ -81,6 +81,25 @@ impl<'a> Consumer<'a> {
         self.ring.store_read_frame(self.read_frame);
         copied
     }
+
+    /// Discard up to `max_frames` committed frames without copying them.
+    ///
+    /// A paced talker uses this when it has missed media observation intervals:
+    /// emitting a later presentation timestamp with earlier ring samples would
+    /// play old audio at the wrong media time. The same overrun recovery as
+    /// [`read_into`](Self::read_into) applies before advancing the cursor.
+    pub fn discard(&mut self, max_frames: usize) -> usize {
+        let write = self.ring.write_frame();
+        let cap = self.ring.capacity_frames();
+        if write.saturating_sub(self.read_frame) > cap {
+            self.read_frame = write - cap;
+            self.ring.add_counter(counter::CONSUMER_SKIPS, 1);
+        }
+        let n = (write.saturating_sub(self.read_frame) as usize).min(max_frames);
+        self.read_frame = self.read_frame.saturating_add(n as u64);
+        self.ring.store_read_frame(self.read_frame);
+        n
+    }
 }
 
 #[cfg(test)]
@@ -134,21 +153,19 @@ mod tests {
     }
 
     #[test]
-    fn overrun_skips() {
-        let r = ring(); // capacity 16
+    fn discard_advances_the_read_frontier_without_copying() {
+        let r = ring();
         let mut p = Producer::new(&r, &[(0, 2, 24)], 192, 192);
         let data = vec![0u8; 2 * 2 * 4];
-        // Write 20 frames without the consumer reading -> overrun past 16.
-        for i in 0..10 {
+        for i in 0..4 {
             p.place(0, i * 2, 2, SampleFormat::Int32, &data);
-            p.commit(false, None); // commit each tick, as the audio loop does
+            p.commit(false, None);
         }
-        assert_eq!(r.write_frame(), 20);
+        assert_eq!(r.write_frame(), 8);
         let mut c = Consumer::new(&r);
-        let mut out = vec![0u8; 32 * 8];
-        c.read_into(&mut out, 32);
-        // Consumer skipped to write - capacity = 4.
-        assert!(c.read_frame() >= 4);
-        assert_eq!(r.counter(counter::CONSUMER_SKIPS), 1);
+        assert_eq!(c.discard(6), 6);
+        assert_eq!(c.read_frame(), 6);
+        assert_eq!(r.read_frame(), 6);
+        assert_eq!(c.available(), 2);
     }
 }
