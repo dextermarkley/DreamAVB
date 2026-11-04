@@ -306,3 +306,56 @@ settle this. Licensing: ThunderGate is GPLv3 — fine for personal use and as a
 programming-model reference; shipping inside a proprietary product would require
 either a clean-room reimplementation from the hardware facts or shipping our
 NIC firmware as a separate GPLv3 component.
+
+### Feasibility RESOLVED: the RX timestamp is hardware-latched (2026-11-04)
+
+Settled from ThunderGate's firmware model plus Broadcom's own documented
+register map (Linux `tg3.h`/`tg3.c`, behaviour reference only per AGENTS.md).
+The answer is yes, with hardware-grade quality, and it connects directly to
+code we already have.
+
+The documented tg3 RX-PTP path on this silicon:
+- The MAC captures a matched frame's arrival time (from the EAV reference clock
+  at 0x6900) into an **RX timestamp register pair**: `TG3_RX_TSTAMP_LSB 0x6b0`
+  / `TG3_RX_TSTAMP_MSB 0x6b4` (64-bit).
+- It marks the frame in the **RX descriptor `type_flags`** with a PTP-status
+  code: `RXD_FLAG_PTPSTAT_MASK 0x0210`, `PTPV1 0x0010`, `PTPV2 0x0200`.
+- `RX_PTP_CTL 0x6c8` selects the event classes and carries the capture
+  interlock (`HWTS_INTERLOCK 0x04000000`); `GRC_MODE 0x00080000` is
+  `TIME_SYNC_ENABLE`.
+- The driver reads the descriptor flag, then reads 0x6b0/0x6b4 — exactly
+  `tg3_rx()` in tg3.c:
+      if ((desc->type_flags & RXD_FLAG_PTPSTAT_MASK) == PTPV1/PTPV2) {
+          tstamp  =  tr32(TG3_RX_TSTAMP_LSB);
+          tstamp |= (u64)tr32(TG3_RX_TSTAMP_MSB) << 32;
+      }
+
+This is a **MAC hardware** latch of the EAV clock (the same clock Apple's gPTP
+reaches ~58 ns on), not a software event. On tg3's plain PTP parts
+(5717/5719/5720) the host writes 0x6c8 directly and it just works.
+
+It lines up exactly with our own probe. Our dext already reads
+`desc->type_flags` and would read the timestamp registers; the failing capture
+shows `type_flags=0x0004 has_ts=0` — i.e. NONE of the 0x0210 PTPSTAT bits set,
+so the MAC is simply not arming the capture. That is consistent with the halt
+test: on the 57766/57762, 0x6c8 and the 0x5400 classifier are firmware-owned,
+so the host's write of 0x0480000f never sticks and the capture never arms.
+
+Consequence for scope — the encouraging part. The firmware we would write does
+NOT have to be a full NIC stack. Its minimum job is an **enable shim** running
+on the core, in the firmware-owned space where the writes stick:
+  1. program the receive rules (ThunderGate's named `emac.rx_rule`: offset 12,
+     `activate_rxcpu`, `pclass`, `mask_value = 0xffff0000 | 0x88f7`);
+  2. set `RX_PTP_CTL 0x6c8` = V2_L2_EN | ALL_V2_EVENTS | HWTS_INTERLOCK.
+After that the MAC latches 0x6b0/0x6b4 and sets the descriptor PTPSTAT flag by
+itself, and **our existing host dext already consumes that exact path** — no
+change to the host RX datapath. If the core firmware can also be made to expose
+0x6b0/0x6b4 to the host read (or the host can read them once armed), the
+per-frame firmware work may be zero.
+
+Everything the shim needs is documented: timestamp registers and control/flags
+from tg3.h; the receive-rule classifier and the per-frame core hook
+(`ftq.rdiq`) from ThunderGate's `fw/rx.c`; and the MIPS toolchain + macOS
+PCIDriverKit firmware loader from ThunderGate. The feasibility unknown is
+closed; what remains is a bounded implementation, and confirming on hardware
+that a core-side 0x6c8 write sticks where the host-side one did not.
