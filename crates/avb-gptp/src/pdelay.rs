@@ -191,6 +191,10 @@ pub struct PdelayInitiator {
     pub nrr: NrrWindow,
     pub delay_raw: Window,
     pub delay_comp: Window,
+    /// Our round trip t4 − t1 (raw SYSTIM ns), for diagnosing a bad delay.
+    pub rtt: Window,
+    /// The peer's reported turnaround t3 − t2 (ns, its clock).
+    pub peer_turnaround: Window,
     /// Compensated delays averaged for use (last [`DELAY_AVG`]).
     delay_use: Window,
     pub lost_since_good: u32,
@@ -206,6 +210,8 @@ impl Default for PdelayInitiator {
             nrr: NrrWindow::default(),
             delay_raw: Window::new(64),
             delay_comp: Window::new(64),
+            rtt: Window::new(64),
+            peer_turnaround: Window::new(64),
             delay_use: Window::new(DELAY_AVG),
             lost_since_good: 0,
             multi: std::collections::VecDeque::new(),
@@ -272,6 +278,8 @@ impl PdelayInitiator {
         let delay_comp = link_delay(t1c, t2, t3, t4c, n);
         self.delay_raw.push(delay_raw);
         self.delay_comp.push(delay_comp);
+        self.rtt.push(t4 as f64 - t1 as f64);
+        self.peer_turnaround.push((t3 - t2) as f64 / 65536.0);
         self.delay_use.push(delay_comp);
         self.lost_since_good = 0;
         Some(ExchangeResult {

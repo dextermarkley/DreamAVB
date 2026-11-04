@@ -236,6 +236,10 @@ pub struct GptpStatus {
     pub offset_ns: Stat,
     pub path_delay_raw_ns: Stat,
     pub path_delay_comp_ns: Stat,
+    /// Our Pdelay round trip t4 − t1, ns.
+    pub pdelay_rtt_ns: Stat,
+    /// The peer's reported Pdelay turnaround t3 − t2, ns.
+    pub peer_turnaround_ns: Stat,
     pub nrr_systim: Option<f64>,
     pub nrr_free: Option<f64>,
     pub cumulative_rate_ratio: Option<f64>,

@@ -1491,6 +1491,8 @@ impl Port {
             offset_ns: self.offsets.summary(),
             path_delay_raw_ns: self.ini.delay_raw.summary(),
             path_delay_comp_ns: self.ini.delay_comp.summary(),
+            pdelay_rtt_ns: self.ini.rtt.summary(),
+            peer_turnaround_ns: self.ini.peer_turnaround.summary(),
             nrr_systim: nrr,
             nrr_free: nrr.map(|n| n * (1.0 + self.servo.f_applied() * 1e-9)),
             cumulative_rate_ratio: self.last_rate_ratio,

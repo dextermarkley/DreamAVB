@@ -3708,7 +3708,7 @@ fn talker_loop(
     // whether we are alive, and before this existed we never replied.
     let mut adp_discovers_answered: u64 = 0;
     // PTP message types already hex-dumped, so each is captured once.
-    let mut ptp_dumped: Vec<u8> = Vec::with_capacity(3);
+    let mut ptp_dumped: Vec<u8> = Vec::with_capacity(5);
     // What the 16R last told us about each of its sinks, keyed by sink index:
     // `Some(true)` = it reported CONNECTED, `Some(false)` = it reported not,
     // absent = we have not asked yet.
@@ -3910,14 +3910,19 @@ fn talker_loop(
                 // Dumped raw and undecoded on purpose: a decoder written to a
                 // guessed layout would misread the very bytes being captured.
                 let mt = p.payload.first().map(|b| b & 0x0F);
-                let want = matches!(mt, Some(0x0B) | Some(0x00) | Some(0x08));
-                if want && ptp_dumped.len() < 3 {
+                let want = matches!(
+                    mt,
+                    Some(0x0B) | Some(0x00) | Some(0x08) | Some(0x03) | Some(0x0A)
+                );
+                if want && ptp_dumped.len() < 5 {
                     if let Some(m) = mt {
                         if !ptp_dumped.contains(&m) {
                             ptp_dumped.push(m);
                             let name = match m {
                                 0x0B => "ANNOUNCE",
                                 0x00 => "SYNC",
+                                0x03 => "PDELAY_RESP",
+                                0x0A => "PDELAY_RESP_FOLLOW_UP",
                                 _ => "FOLLOW_UP",
                             };
                             let hex: String = p
@@ -3929,7 +3934,11 @@ fn talker_loop(
                             log.log(
                                 Level::Info,
                                 "wire",
-                                &format!("PTP {name} from 16R, {} B: [{hex}]", p.payload.len()),
+                                &format!(
+                                    "PTP {name} from {}, {} B: [{hex}]",
+                                    p.hdr.src,
+                                    p.payload.len()
+                                ),
                             );
                         }
                     }
@@ -4388,6 +4397,36 @@ fn talker_loop(
                 // positions: this project has been burned by originating a
                 // bit-packed field, and a misread bit here would invent an
                 // answer to the exact question we are trying to settle.
+                // A device's own gPTP view of its link (1722.1-2021 §7.4.40):
+                // the grandmaster it follows and the propagation delay IT
+                // measures to its neighbour, the switch. Compared against our
+                // own measurement to the same switch, this says whether a
+                // strange link delay is the switch's or ours.
+                if cmd.message_type == avb_avdecc::constants::aecp_msg::AEM_RESPONSE
+                    && cmd.command_type == avb_avdecc::constants::aem_cmd::GET_AVB_INFO
+                {
+                    if let Some(info) = parse_avb_info(&cmd.payload) {
+                        log.log(
+                            Level::Info,
+                            "aem",
+                            &format!(
+                                "0x{:016x} GET_AVB_INFO status={} gm=0x{:016x} \
+                                 propagation_delay={} ns domain={} flags=0x{:02x} \
+                                 (as_capable={} gptp_enabled={} srp_enabled={})",
+                                u64::from_be_bytes(cmd.target_entity_id.0),
+                                cmd.status,
+                                info.gm,
+                                info.propagation_delay_ns,
+                                info.domain,
+                                info.flags,
+                                info.flags & 0x01 != 0,
+                                info.flags & 0x02 != 0,
+                                info.flags & 0x04 != 0,
+                            ),
+                        );
+                    }
+                    continue;
+                }
                 if cmd.message_type == avb_avdecc::constants::aecp_msg::AEM_RESPONSE
                     && cmd.command_type == avb_avdecc::constants::aem_cmd::GET_COUNTERS
                 {
@@ -5563,6 +5602,31 @@ fn talker_loop(
         // the clock from the device we stream to.
         if ns_since(start).saturating_sub(last_role_log_ns) >= ROLE_LOG_PERIOD_NS {
             last_role_log_ns = ns_since(start);
+            // Each device's own view of its link to the switch.
+            for &(dev, mac) in &devs {
+                let mut pl = Vec::with_capacity(4);
+                pl.extend_from_slice(&avb_avdecc::constants::desc::AVB_INTERFACE.to_be_bytes());
+                pl.extend_from_slice(&0u16.to_be_bytes());
+                let hdr = EthHeader {
+                    dst: mac,
+                    src: our_mac,
+                    vlan: None,
+                    ethertype: avb_avtp::common::ETHERTYPE_AVTP,
+                };
+                let q = avb_avdecc::aecp::AemPdu {
+                    message_type: avb_avdecc::constants::aecp_msg::AEM_COMMAND,
+                    status: avb_avdecc::constants::aecp_status::SUCCESS,
+                    target_entity_id: dev,
+                    controller_entity_id: our_id,
+                    sequence_id: 0xC200,
+                    command_type: avb_avdecc::constants::aem_cmd::GET_AVB_INFO,
+                    unsolicited: false,
+                    payload: pl,
+                };
+                if let Ok(frame) = TxFrame::build(&hdr, &q.encode(), false, 0) {
+                    let _ = dext.send(frame.bytes(), false, 0);
+                }
+            }
             let st = gptp.status();
             let c = gptp.counters();
             log.log(
@@ -5570,7 +5634,7 @@ fn talker_loop(
                 "clock",
                 &format!(
                     "role={} servo={} gm={} (ours={}) btca(won={} lost={}) mastertx(ann={} sync={} fu={} ts_lost={}) \
-                     link(asCapable={} delay_raw={:?} delay_comp={:?} nrr={:?} our_turnaround={:?} max={:?} \
+                     link(asCapable={} delay_raw={:?} delay_comp={:?} rtt={:?} peer_turnaround={:?} nrr={:?} our_turnaround={:?} max={:?} \
                      req_rx={} resp_tx={} fu_tx={} resp_ts_fail={} lost={} sync_rx={} ann_rx={}){}",
                     st.port_state.name(),
                     st.servo_state.name(),
@@ -5585,6 +5649,8 @@ fn talker_loop(
                     st.as_capable,
                     st.path_delay_raw_ns.mean.map(|v| v.round() as i64),
                     st.path_delay_comp_ns.mean.map(|v| v.round() as i64),
+                    st.pdelay_rtt_ns.last.map(|v| v.round() as i64),
+                    st.peer_turnaround_ns.last.map(|v| v.round() as i64),
                     st.nrr_systim,
                     st.responder_turnaround_ns.mean.map(|v| v.round() as i64),
                     st.responder_turnaround_max_ns.map(|v| v.round() as i64),
@@ -8305,6 +8371,27 @@ fn connect_rx_pdu(
     }
 }
 
+/// The fields of a GET_AVB_INFO response we log.
+#[derive(Debug, PartialEq, Eq)]
+struct AvbInfo {
+    gm: u64,
+    propagation_delay_ns: u32,
+    domain: u8,
+    flags: u8,
+}
+
+/// Decode a GET_AVB_INFO response payload (1722.1-2021 §7.4.40.2):
+/// descriptor_type(2) descriptor_index(2) gptp_grandmaster_id(8)
+/// propagation_delay(4) reserved(2) gptp_domain_number(1) flags(1) ...
+fn parse_avb_info(p: &[u8]) -> Option<AvbInfo> {
+    Some(AvbInfo {
+        gm: u64::from_be_bytes(p.get(4..12)?.try_into().ok()?),
+        propagation_delay_ns: u32::from_be_bytes(p.get(12..16)?.try_into().ok()?),
+        domain: *p.get(18)?,
+        flags: *p.get(19)?,
+    })
+}
+
 /// Ask a listener which talker stream its sink `listener_uid` is bound to
 /// (ACMP GET_RX_STATE_COMMAND, 1722.1-2021 §8.2.2.6). Read-only.
 fn send_get_rx_state(
@@ -8438,6 +8525,25 @@ mod talker_tests {
         descriptor[88..90].copy_from_slice(&0u16.to_be_bytes());
         assert_eq!(ptp_port_range(&descriptor), Some((0, 1)));
         assert_eq!(ptp_port_range(&descriptor[..89]), None);
+    }
+
+    /// Field offsets match the layout our own entity encodes (and 1722.1).
+    #[test]
+    fn avb_info_decodes_gm_delay_domain_flags() {
+        let mut p = vec![0x00, 0x09, 0x00, 0x00];
+        p.extend_from_slice(&0x0001_f2ff_feff_ab61u64.to_be_bytes());
+        p.extend_from_slice(&312u32.to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, 0x07, 0, 1]);
+        assert_eq!(
+            parse_avb_info(&p),
+            Some(AvbInfo {
+                gm: 0x0001_f2ff_feff_ab61,
+                propagation_delay_ns: 312,
+                domain: 0,
+                flags: 0x07,
+            })
+        );
+        assert_eq!(parse_avb_info(&p[..19]), None);
     }
 
     /// Only a binding to one of OUR other streams is released. Ours is
