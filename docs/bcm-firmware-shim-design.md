@@ -1,0 +1,177 @@
+# BCM57762 RX-timestamp enable-shim: firmware design + build/load plan
+
+Status: design draft, 2026-11-04. Prereq reading:
+`docs/bcm-rx-timestamp-investigation.md` (why this is needed and the resolved
+feasibility). No code has been written yet; this is the plan to review before
+building.
+
+## 1. Goal and principle
+
+Get hardware RX PTP timestamps out of the Broadcom BCM57762 (Apple Thunderbolt
+Gigabit Ethernet adapter, `14e4:1682` / `106b:00f6`) by running a **minimal
+enable shim** on the chip's on-die RX CPU — the one place the AVB classifier
+and `RX_PTP_CTL` writes actually stick (see the halt test: host-side writes to
+`0x6c8` and the `0x5400` block read back 0; a core-side write is expected to
+stick).
+
+Principles:
+- **Smallest thing that works.** The shim arms the MAC's documented RX-PTP
+  capture, then gets out of the way. It is not a NIC firmware and does not move
+  packets. The host dext keeps driving the normal RX ring.
+- **Clean-room.** We write our own shim source. ThunderGate (GPLv3) and Linux
+  `tg3` (GPL) are *programming-model and behaviour references only*, per
+  AGENTS.md. The register offsets/values we replay are hardware facts we
+  observed read-only from Apple's driver (already recorded in `Tg3Logic.hpp`).
+- **RAM only, never NVRAM.** The image is loaded into the RX-CPU scratch pad
+  (volatile). We never write the adapter's flash. A power cycle fully restores
+  the factory state. This keeps us clear of the AGENTS.md "ask before NVRAM /
+  boot security" rule and makes every experiment reversible.
+
+## 2. What the shim does
+
+The MAC's RX-PTP timestamp path is documented hardware (Linux `tg3.h`): on a
+matched frame the MAC latches the EAV reference clock (`0x6900`) into the
+`RX_TSTAMP` register pair (`0x6b0`/`0x6b4`) and sets a PTP-status code in the RX
+descriptor `type_flags` (`RXD_FLAG_PTPSTAT_MASK 0x0210`, V1 `0x0010`, V2
+`0x0200`). On ordinary tg3 PTP parts the host just writes `RX_PTP_CTL 0x6c8`
+and it works; on the 57762 those config registers are RX-CPU-owned, so the
+write has to come from the core.
+
+Shim lifecycle:
+1. **Hardware housekeeping** equivalent to ThunderGate `init()` so replacing the
+   resident firmware does not break basic operation: enable the memory arbiter
+   and buffer manager (`ma.mode.enable`, `bufman.mode.enable`), set the CPMU
+   clock policies, set the timer prescaler. (Scope to confirm on hardware; keep
+   only what basic RX actually needs.)
+2. **Arm the RX-PTP capture.** Replay the exact classifier/config writes Apple
+   makes — the 22 ordered writes already captured in
+   `kAvbRxRuleWrites[]` (the `0x5400`–`0x561c` block, ethertype `0x88F7`) —
+   then set `RX_PTP_CTL 0x6c8` = `V2_L2_EN | ALL_V2_EVENTS | HWTS_INTERLOCK`
+   (`0x0480000f`, our existing `kRxPtpPhase0Value`). Executed from the core,
+   where the writes stick.
+   - Deliberately we do **not** set the receive rules' `activate_rxcpu` bit for
+     the gPTP frames: we are not stealing the frame to the core, we are only
+     arming the timestamp unit. The frame must continue to the host RX ring.
+     Replaying Apple's exact block (which produces host-path timestamps in
+     Apple's own driver) is the safe encoding; the ThunderGate `emac.rx_rule`
+     named model is the cross-check for what each bit means.
+3. **Park.** Enter a tiny idle loop (or halt) and leave the hardware armed.
+   - Open question (test on hardware): whether the armed config persists after
+     the core parks. If it does, the shim is run-once. If the config is
+     core-local and decays, the shim stays resident in a minimal loop that does
+     nothing else. Either way it is small.
+
+Explicitly **out of scope**: the on-core TCP/IP stack, zForth/uBASIC, the gate
+control protocol, beaconing, DMA engines. None are built.
+
+## 3. Memory map and image format (from ThunderGate `fw/image.x`)
+
+- RX-CPU scratch pad: `0x08000000`–`0x0800FFFF` (64 KB). Image loads at
+  `0x08000000`; stack at `0x08010000` growing down; text/rodata/data/bss grow
+  up and must stop below `0x0800E000`. Apple's own on-NIC image loads at the
+  same base (~40 KB), so our few-KB shim fits with vast headroom.
+- Output is a **flat binary** (`objcopy -O binary` of `.text/.rodata/.data/
+  .bss`), loaded verbatim to `0x08000000`. This matches the per-segment
+  `FWIMG_INFO` layout we decoded from Apple's `loadFirmware`.
+- Start PC: `0x08000000` (the reset/entry stub).
+
+## 4. Toolchain (from ThunderGate `misc/build-toolchain.sh` + `fw/Makefile`)
+
+- `mips-elf-gcc` / `ld` / `objcopy`, a custom `-mtigon` target (GCC 14), built
+  by `misc/build-toolchain.sh`. The core is MIPS (confirmed by our own opcode
+  read and the OpenBSD Tigon=R4000 note).
+- Compile flags of record: `-mips2 -march=r6000 -mfix-r4000 -msoft-float -G 0
+  -fno-pic -mno-abicalls -mno-llsc -mtigon -ffreestanding`. Link:
+  `-nostdlib -T <our linker script> -static`, plus `libgcc` for soft
+  multiply/divide.
+- Register-block base addresses come from a generated `fixed.sym`
+  (`py/symgen.py` from the datamodel). For a clean-room shim we instead define
+  our own small header of only the registers we touch, with the offsets we
+  already use in `Bcm57762Regs.h` / `Tg3Logic.hpp` — no dependency on
+  ThunderGate's generated symbols.
+
+## 5. Load protocol (host side, in our dext)
+
+ThunderGate `py/blocks/cpu.py::image_load` and Apple's `loadFirmware` agree on
+the mechanism, which our dext already has the primitives for (`wr`/`rd`, the
+HaltCpu sequence we added in `programAvbRxRules`):
+
+1. **Halt the RX CPU** — `STATE = 0xffffffff`, `MODE |= HALT (0x400)`, poll
+   halted. (Already implemented.)
+2. **Write the image** into the scratch pad through the indirect memory window:
+   scratch address `0x08000000+i` maps to chip offset `0x30000+i`
+   (`(addr & 0xffff) | 0x30000`), written via the `reg_base_addr`/`reg_data`
+   indirect port — i.e. Apple's `memWrInd`. Word-by-word, big-endian, length
+   padded to 4.
+3. **Set the start PC**: `grc.fastboot_pc.addr = 0x08000000`,
+   `grc.fastboot_pc.enable = 1` (ThunderGate `init` uses fastboot PC), and/or
+   set the CPU PC register directly as `image_load` does.
+4. **Release** the RX CPU (clear HALT), exactly as our release step does.
+5. Optionally handshake: Apple follows load with `WriteFirmwareSig` +
+   `WaitForFirmwareInit` (poll a signature word). We can add a tiny "I'm armed"
+   signature the host polls, so the dext knows the shim ran before it trusts
+   the timestamp path.
+
+This replaces the current host-side `programAvbRxRules` register replay (which
+cannot stick) with: load shim -> shim does the replay from the core.
+
+## 6. Host dext integration
+
+Minimal. Our RX path already reads `desc->type_flags`; the failing capture
+showed `type_flags=0x0004 has_ts=0` (no PTPSTAT bit). Add:
+- when `(type_flags & 0x0210)` is `PTPV1 (0x0010)` or `PTPV2 (0x0200)`, read the
+  64-bit timestamp from `RX_TSTAMP_LSB 0x6b0` / `RX_TSTAMP_MSB 0x6b4` and attach
+  it to the harvested frame (the field `avb-probe rx-ptp` already prints as
+  `hw_ts`).
+No change to ring management, classifier offsets, or the gPTP consumer.
+
+## 7. Open hardware questions (the test plan answers these)
+
+1. Does a **core-side** write to `0x6c8` / the `0x5400` block stick where the
+   host-side write did not? (Predicted yes by the firmware-owned picture; first
+   thing to confirm.)
+2. Is `0x6c8` alone sufficient, or is the `0x5400` rule block also required to
+   mark gPTP frames for the timestamp unit on this ASIC? (Replay both to be
+   safe; then minimise.)
+3. Does the armed config **persist after the core parks**, or must the shim stay
+   resident?
+4. Does basic host RX still work once our shim replaces the resident firmware
+   (is our housekeeping subset sufficient)?
+
+## 8. Build / load / test milestones
+
+- M0 Toolchain: run `misc/build-toolchain.sh`, get `mips-elf-gcc -mtigon`
+  working in `$KIROCREW_SCRATCH` / `.agents/tmp`. Back up the adapter's factory
+  NVRAM image first (read-only dump) before any core experiments.
+- M1 Hello-core: build a trivial image that writes a signature word to a known
+  scratch/GENCOMM location and parks; load it via the dext; confirm from the
+  host that it ran (proves halt/load/PC/release end-to-end on our hardware).
+- M2 Enable shim: add the housekeeping subset + the classifier/`0x6c8` replay;
+  load it; read back `0x6c8` and snapshot to confirm the writes now stick.
+- M3 Timestamp: `avb-probe --nic bcm datapath up` then `rx-ptp`; confirm
+  `type_flags` shows a PTPSTAT bit and `hw_ts` is non-zero and advances with the
+  EAV clock.
+- M4 Quality: compare BCM `hw_ts` jitter against the I210 baseline; decide
+  whether it is Milan-grade.
+
+## 9. Licensing / distribution
+
+- ThunderGate is GPLv3 and Linux `tg3` is GPL. Both are references for the
+  hardware programming model only; the shim is our own source. The replayed
+  register values are observed hardware facts, already in-repo.
+- RAM-load only: no NVRAM flash, no redistribution of any Broadcom/Apple blob.
+- For a shipped product the I210 remains the timestamping NIC. This shim is a
+  personal-machine capability for this owner's adapter; if ever distributed, the
+  on-core firmware would ship as its own source-available component, kept
+  separate from the proprietary host stack.
+
+## 10. Risks
+
+- Replacing the resident firmware could disturb functions it performs
+  (management/housekeeping). Mitigated by RAM-only load (power-cycle recovery)
+  and by starting from M1 before M2.
+- If the capture is gated on a rule action we have not identified, M2/M3 expose
+  it; the fallback is to replay Apple's full block verbatim (already captured).
+- Core-side register access assumptions (the `0x30000` window, fastboot PC) are
+  cross-checked against two independent sources (ThunderGate and Apple's
+  `loadFirmware`) but still need the M1 hardware confirmation.
