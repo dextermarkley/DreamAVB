@@ -14,7 +14,7 @@
 # Remove the old bundle before copying rather than copying over the top, so a
 # file dropped from a later build cannot survive inside it.
 #
-# Then the device "AVB StudioLive 16R" appears in Audio MIDI Setup, with an
+# Then the device "DreamAVB" appears in Audio MIDI Setup, with an
 # input side fed by the daemon's recovered-audio ring and an output side that
 # writes into the talker's ring.
 #

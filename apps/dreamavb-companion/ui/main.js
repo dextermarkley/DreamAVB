@@ -248,7 +248,7 @@ function paintAudio(info) {
     dot.className = "status-dot ok";
     main.textContent = "Audio running";
     sub.textContent =
-      "Bidirectional audio with the 16R" +
+      "Bidirectional audio with your AVB devices" +
       (info.pid ? ` · daemon ${info.pid}` : "");
     if (!audioBusy) box.checked = true;
   } else {
@@ -259,7 +259,7 @@ function paintAudio(info) {
     sub.textContent =
       info.reason && info.reason !== "not started"
         ? info.reason
-        : "Start bidirectional audio with the 16R";
+        : "Start bidirectional audio with your AVB devices";
     if (!audioBusy) box.checked = false;
   }
 }

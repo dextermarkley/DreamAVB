@@ -68,7 +68,7 @@ sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
 ```
 
 Wait a few seconds, then open **Audio MIDI Setup**. The device named
-**AVB StudioLive 16R** should appear when the HAL plug-in loaded. If it does
+**DreamAVB** should appear when the HAL plug-in loaded. If it does
 not appear, read the latest
 `/Library/Logs/DiagnosticReports/com.apple.audio.Core-Audio-Driver-Service.helper-*.ips`
 report before changing code or signing settings.
@@ -120,7 +120,7 @@ Use these checks:
    `Mac→16R` source banks should be selectable. Do not change UC Control
    routing merely to repeat this check; the established Channel 1 settings are
    already correct.
-4. In Audio MIDI Setup or a DAW, select **AVB StudioLive 16R** as the desired
+4. In Audio MIDI Setup or a DAW, select **DreamAVB** as the desired
    input and output device. Play a moderate test signal, beginning with
    Channel 1 only if investigating the existing Channel 1 path.
 5. Observe companion stats and the daemon log at

@@ -44,13 +44,19 @@ const DEVICE_MODEL_UID: &str = "com.avbaudio.16r.model";
 /// device offering 64 channels. The stale name actively misled a hardware test
 /// session into reading "(Input)" as a scope rather than a label.
 ///
-/// `DEVICE_UID` deliberately keeps its `.input` suffix: macOS persists the
-/// user's default-device choice by UID, so changing it would silently reset
-/// their selection. It is an internal identifier and never shown.
-const DEVICE_NAME: &str = "AVB StudioLive 16R";
+/// "DreamAVB", not a device model: one Core Audio device carries the streams
+/// of every AVB device DreamAVB is connected to (16R, 24R, ...), mapped onto
+/// its channels by the user's input map.
+///
+/// The UIDs deliberately keep their old `16r` / `.input` spelling: macOS
+/// persists the user's default-device choice by UID, so changing them would
+/// silently reset that selection. They are internal identifiers and never
+/// shown. (DAWs such as REAPER remember the device by NAME, so the rename
+/// itself needs the user to reselect the device once.)
+const DEVICE_NAME: &str = "DreamAVB";
 const BOX_UID: &str = "com.avbaudio.16r.box";
-const BOX_NAME: &str = "AVB-Audio Box";
-const MANUFACTURER: &str = "AVB-Audio";
+const BOX_NAME: &str = "DreamAVB";
+const MANUFACTURER: &str = "DreamAVB";
 /// Device ring/zero-timestamp period (frames). Must match the IO ring; a
 /// round power-of-two keeps GetZeroTimeStamp arithmetic exact.
 const RING_FRAMES: u32 = 8192;
@@ -446,9 +452,9 @@ pub extern "C" fn get_property_data(
                 let name = match object_id {
                     K_BOX_OBJECT => BOX_NAME,
                     K_DEVICE_OBJECT => DEVICE_NAME,
-                    K_STREAM_OBJECT => "AVB 16R Input Stream",
-                    K_STREAM_OUT_OBJECT => "AVB 16R Output Stream",
-                    _ => "AVB-Audio",
+                    K_STREAM_OBJECT => "DreamAVB Input",
+                    K_STREAM_OUT_OBJECT => "DreamAVB Output",
+                    _ => "DreamAVB",
                 };
                 return put(cfstring(name), in_data_size, out_data_size, out_data);
             }

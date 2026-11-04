@@ -419,6 +419,8 @@ impl Config {
     }
 }
 
+pub mod routing;
+
 #[cfg(test)]
 mod tests {
     use super::*;
