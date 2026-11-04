@@ -820,6 +820,207 @@ async fn set_clock_source(value: String) -> Result<ClockSourceInfo, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Channel map
+//
+// The user's map from AVB device streams to DreamAVB inputs, edited as a grid
+// of 8-channel blocks. Rules (docs/multi-device-design.md):
+//   * nothing changes until the user presses Save;
+//   * a device that is not connected keeps its blocks, shown as such;
+//   * a new device appears in the source list and takes no inputs until the
+//     user assigns it.
+// Entity ids cross the IPC boundary as hex STRINGS: a 64-bit id does not fit
+// a JavaScript number exactly, and a rounded id would map the wrong device.
+
+use avb_config::devices::Device as AvbDevice;
+use avb_config::routing::{input_placement, Assign, RoutingMap, BLOCK_CHANNELS};
+
+const MAP_WIDTH: u16 = avb_audioring::DEVICE_CHANNELS as u16;
+
+/// One stream the user can put on a block.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MapSource {
+    /// Stable key `0x<entity>:<stream>`, what a block refers to.
+    pub key: String,
+    pub device: String,
+    pub stream: String,
+    pub channels: u16,
+    /// On the network in the daemon's last report.
+    pub connected: bool,
+}
+
+/// The channel-map screen's whole state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChannelMapInfo {
+    /// False until the user has saved a map once. The blocks then show the
+    /// layout the daemon uses without one, labelled as such in the UI.
+    pub saved: bool,
+    /// One entry per 8-channel block: the source key, or null for none.
+    pub blocks: Vec<Option<String>>,
+    pub block_channels: u16,
+    pub sources: Vec<MapSource>,
+    pub warnings: Vec<String>,
+    /// The daemon reads the map when audio starts; the UI offers a restart.
+    pub audio_running: bool,
+}
+
+fn source_key(entity_id: u64, stream: u16) -> String {
+    format!("0x{entity_id:016x}:{stream}")
+}
+
+fn parse_source_key(key: &str) -> Option<Assign> {
+    let (e, s) = key.split_once(':')?;
+    let e = e.trim();
+    Some(Assign {
+        entity_id: u64::from_str_radix(e.strip_prefix("0x").unwrap_or(e), 16).ok()?,
+        stream_index: s.trim().parse().ok()?,
+    })
+}
+
+/// Pure: build the screen state from the saved map (if any) and the
+/// daemon's device report.
+fn channel_map_info(
+    saved: Option<&RoutingMap>,
+    devices: &[AvbDevice],
+    warnings: Vec<String>,
+    audio_running: bool,
+) -> ChannelMapInfo {
+    let mut sources: Vec<MapSource> = Vec::new();
+    for d in devices {
+        let dev_name = if d.name.is_empty() {
+            format!("Device 0x{:016x}", d.entity_id)
+        } else {
+            d.name.clone()
+        };
+        for s in &d.sources {
+            sources.push(MapSource {
+                key: source_key(d.entity_id, s.index),
+                device: dev_name.clone(),
+                stream: s.name.clone(),
+                channels: s.channels,
+                connected: true,
+            });
+        }
+    }
+    let blocks: Vec<Option<Assign>> = match saved {
+        Some(m) => m.input_blocks(MAP_WIDTH),
+        None => {
+            // No saved map: show the layout the daemon actually uses, the
+            // device it picks (lowest entity id, see choose_device) on inputs
+            // 1-64. Shown, not saved.
+            let mut b = vec![None; usize::from(MAP_WIDTH / BLOCK_CHANNELS)];
+            if let Some(d) = devices.iter().min_by_key(|d| d.entity_id) {
+                let srcs: Vec<(u16, u16)> =
+                    d.sources.iter().map(|s| (s.index, s.channels)).collect();
+                for (idx, first) in input_placement(None, d.entity_id, &srcs, MAP_WIDTH) {
+                    if let Some(slot) = b.get_mut(usize::from(first / BLOCK_CHANNELS)) {
+                        *slot = Some(Assign {
+                            entity_id: d.entity_id,
+                            stream_index: idx,
+                        });
+                    }
+                }
+            }
+            b
+        }
+    };
+    // A mapped stream that is not on the network stays listed, by its
+    // remembered name, so its block shows what it is waiting for.
+    for a in blocks.iter().flatten() {
+        let key = source_key(a.entity_id, a.stream_index);
+        if !sources.iter().any(|s| s.key == key) {
+            let device = saved
+                .and_then(|m| m.name(a.entity_id, None))
+                .map_or_else(|| format!("Device 0x{:016x}", a.entity_id), str::to_string);
+            let stream = saved
+                .and_then(|m| m.name(a.entity_id, Some(a.stream_index)))
+                .map_or_else(|| format!("Stream {}", a.stream_index), str::to_string);
+            sources.push(MapSource {
+                key,
+                device,
+                stream,
+                channels: BLOCK_CHANNELS,
+                connected: false,
+            });
+        }
+    }
+    ChannelMapInfo {
+        saved: saved.is_some(),
+        blocks: blocks
+            .iter()
+            .map(|b| b.map(|a| source_key(a.entity_id, a.stream_index)))
+            .collect(),
+        block_channels: BLOCK_CHANNELS,
+        sources,
+        warnings,
+        audio_running,
+    }
+}
+
+fn current_channel_map() -> ChannelMapInfo {
+    let (saved, warnings) = RoutingMap::load_if_present(MAP_WIDTH);
+    let devices = avb_config::devices::load();
+    let running = match AUDIO.lock() {
+        Ok(mut g) => audio_status_locked(&mut g).running,
+        Err(_) => false,
+    };
+    channel_map_info(saved.as_ref(), &devices, warnings, running)
+}
+
+#[tauri::command]
+async fn get_channel_map() -> ChannelMapInfo {
+    current_channel_map()
+}
+
+/// Save the grid the user built. Only 8-channel streams can go on a block;
+/// anything else, a stream on two blocks, or an unknown key is REFUSED and
+/// nothing is written. Routes the grid does not show are kept as they are.
+#[tauri::command]
+async fn set_channel_map(blocks: Vec<Option<String>>) -> Result<ChannelMapInfo, String> {
+    if blocks.len() != usize::from(MAP_WIDTH / BLOCK_CHANNELS) {
+        return Err(format!("expected {} blocks", MAP_WIDTH / BLOCK_CHANNELS));
+    }
+    let devices = avb_config::devices::load();
+    let mut assigns: Vec<Option<Assign>> = Vec::with_capacity(blocks.len());
+    for k in &blocks {
+        match k {
+            None => assigns.push(None),
+            Some(k) => {
+                let a = parse_source_key(k).ok_or_else(|| format!("bad source {k:?}"))?;
+                if let Some(s) = devices
+                    .iter()
+                    .find(|d| d.entity_id == a.entity_id)
+                    .and_then(|d| d.sources.iter().find(|s| s.index == a.stream_index))
+                {
+                    if s.channels != BLOCK_CHANNELS {
+                        return Err(format!(
+                            "{} has {} channels; only {BLOCK_CHANNELS}-channel streams fit a block",
+                            s.name, s.channels
+                        ));
+                    }
+                }
+                assigns.push(Some(a));
+            }
+        }
+    }
+    let (saved, _) = RoutingMap::load_if_present(MAP_WIDTH);
+    let mut next = saved
+        .unwrap_or_default()
+        .with_blocks(&assigns, MAP_WIDTH)
+        .map_err(|e| e.to_string())?;
+    // Remember names for everything currently on the network, so a mapped
+    // device keeps its name while it is unplugged.
+    for d in &devices {
+        next.set_name(d.entity_id, None, &d.name);
+        for s in &d.sources {
+            next.set_name(d.entity_id, Some(s.index), &s.name);
+        }
+    }
+    next.save()
+        .map_err(|e| format!("could not save the channel map: {e}"))?;
+    Ok(current_channel_map())
+}
+
+// ---------------------------------------------------------------------------
 // Launch at login (hand-rolled macOS LaunchAgent)
 //
 // We do NOT use tauri-plugin-autostart: its transitive deps float and break
@@ -1682,7 +1883,9 @@ pub fn run() {
             eval_auto_select_nic,
             audio_status,
             start_audio,
-            stop_audio
+            stop_audio,
+            get_channel_map,
+            set_channel_map
         ])
         .setup(|app| {
             diag("--- DreamAVB starting ---");
@@ -1781,6 +1984,85 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const R16: u64 = 0x000a_92ff_fe03_3ba9;
+    const R24: u64 = 0x000a_92ff_fe04_0001;
+
+    fn dev(id: u64, name: &str, n: u16) -> AvbDevice {
+        AvbDevice {
+            entity_id: id,
+            model_id: 0,
+            name: name.into(),
+            sources: (1..=n)
+                .map(|i| avb_config::devices::Source {
+                    index: i,
+                    channels: 8,
+                    name: format!("Send {i}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn unsaved_map_shows_the_daemons_default_layout() {
+        let info = channel_map_info(
+            None,
+            &[dev(R24, "24R", 8), dev(R16, "16R", 8)],
+            vec![],
+            false,
+        );
+        assert!(!info.saved);
+        assert_eq!(info.blocks.len(), 16);
+        // The lowest entity id, like the daemon, on blocks 0-7.
+        assert_eq!(info.blocks[0].as_deref(), Some("0x000a92fffe033ba9:1"));
+        assert_eq!(info.blocks[7].as_deref(), Some("0x000a92fffe033ba9:8"));
+        assert!(info.blocks[8].is_none());
+        // Both devices' streams are offered.
+        assert_eq!(info.sources.len(), 16);
+    }
+
+    #[test]
+    fn a_mapped_device_that_is_absent_keeps_its_block_and_name() {
+        let mut m = RoutingMap::default();
+        m = m
+            .with_blocks(
+                &[Some(Assign {
+                    entity_id: R24,
+                    stream_index: 3,
+                })],
+                MAP_WIDTH,
+            )
+            .unwrap();
+        m.set_name(R24, None, "StudioLive 24R");
+        m.set_name(R24, Some(3), "Send 17-24");
+        // Only the 16R is on the network now.
+        let info = channel_map_info(Some(&m), &[dev(R16, "16R", 8)], vec![], true);
+        assert!(info.saved);
+        assert_eq!(info.blocks[0].as_deref(), Some("0x000a92fffe040001:3"));
+        let s = info
+            .sources
+            .iter()
+            .find(|s| s.key == "0x000a92fffe040001:3")
+            .unwrap();
+        assert!(!s.connected);
+        assert_eq!(s.device, "StudioLive 24R");
+        assert_eq!(s.stream, "Send 17-24");
+        // The new 16R takes nothing: it is only offered.
+        assert!(info.blocks.iter().skip(1).all(Option::is_none));
+    }
+
+    #[test]
+    fn source_keys_round_trip_full_64_bit_ids() {
+        let k = source_key(0xffff_ffff_ffff_fffe, 7);
+        assert_eq!(
+            parse_source_key(&k),
+            Some(Assign {
+                entity_id: 0xffff_ffff_ffff_fffe,
+                stream_index: 7
+            })
+        );
+        assert_eq!(parse_source_key("nonsense"), None);
+    }
 
     /// A daemon the user switched OFF has exited for a good reason. Restarting
     /// it would fight them -- and `stop_audio` clears the intent BEFORE it

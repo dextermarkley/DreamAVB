@@ -173,11 +173,28 @@ impl fmt::Display for RouteError {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RoutingMap {
     routes: Vec<Route>,
+    /// Display names remembered for devices (`None` key) and their streams,
+    /// so a mapped device that is not connected still shows by name. Labels
+    /// only: nothing routes by them.
+    names: std::collections::BTreeMap<(u64, Option<u16>), String>,
 }
 
 impl RoutingMap {
     pub fn routes(&self) -> &[Route] {
         &self.routes
+    }
+
+    /// Remember a display name for a device (`stream = None`) or one of its
+    /// streams. Empty names are ignored.
+    pub fn set_name(&mut self, entity_id: u64, stream: Option<u16>, name: &str) {
+        let n = clean_name(name);
+        if !n.is_empty() {
+            self.names.insert((entity_id, stream), n);
+        }
+    }
+
+    pub fn name(&self, entity_id: u64, stream: Option<u16>) -> Option<&str> {
+        self.names.get(&(entity_id, stream)).map(String::as_str)
     }
 
     /// Add a route. Refused, with nothing changed, if it is empty, too wide,
@@ -301,6 +318,31 @@ impl RoutingMap {
                 warnings.push(format!("line {}: no '=' in {line:?}", i + 1));
                 continue;
             };
+            if k.trim() == "name" {
+                // name=0xENTITY:-:text (device) or name=0xENTITY:INDEX:text
+                let mut it = v.splitn(3, ':');
+                let (Some(e), Some(s), Some(text)) = (it.next(), it.next(), it.next()) else {
+                    warnings.push(format!("line {}: malformed name {:?}", i + 1, v.trim()));
+                    continue;
+                };
+                let e = e.trim();
+                let Ok(entity) = u64::from_str_radix(e.strip_prefix("0x").unwrap_or(e), 16) else {
+                    warnings.push(format!("line {}: malformed name {:?}", i + 1, v.trim()));
+                    continue;
+                };
+                let stream = match s.trim() {
+                    "-" => None,
+                    n => match n.parse() {
+                        Ok(n) => Some(n),
+                        Err(_) => {
+                            warnings.push(format!("line {}: malformed name {:?}", i + 1, v.trim()));
+                            continue;
+                        }
+                    },
+                };
+                map.set_name(entity, stream, text);
+                continue;
+            }
             let direction = match k.trim() {
                 "input" => Direction::Input,
                 "output" => Direction::Output,
@@ -333,8 +375,87 @@ impl RoutingMap {
             s.push_str(&r.to_line());
             s.push('\n');
         }
+        for ((e, st), n) in &self.names {
+            let st = st.map_or_else(|| "-".to_string(), |i| i.to_string());
+            s.push_str(&format!("name=0x{e:016x}:{st}:{n}\n"));
+        }
         s
     }
+}
+
+fn clean_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Channels in one block of the app's channel-map screen: one whole AVB
+/// stream. The grid is `width / BLOCK_CHANNELS` blocks.
+pub const BLOCK_CHANNELS: u16 = 8;
+
+/// What one input block carries: a device's stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Assign {
+    pub entity_id: u64,
+    pub stream_index: u16,
+}
+
+impl RoutingMap {
+    /// The input grid: entry `b` is what DreamAVB inputs
+    /// `b*8+1 .. b*8+8` carry, from whole-stream input routes that sit on a
+    /// block boundary. Routes the grid cannot show are left out of it and kept
+    /// as they are by [`with_blocks`](Self::with_blocks).
+    pub fn input_blocks(&self, width: u16) -> Vec<Option<Assign>> {
+        let mut out = vec![None; usize::from(width / BLOCK_CHANNELS)];
+        for r in self.routes.iter().filter(|r| is_block_route(r)) {
+            if let Some(slot) = out.get_mut(usize::from(r.first / BLOCK_CHANNELS)) {
+                *slot = Some(Assign {
+                    entity_id: r.entity_id,
+                    stream_index: r.stream_index,
+                });
+            }
+        }
+        out
+    }
+
+    /// A new map with the input grid replaced by `blocks`. Every route the
+    /// grid does not show (outputs, partial or unaligned hand-edited routes)
+    /// and every remembered name is carried over unchanged. Refused, with
+    /// nothing returned, if the result would overlap or route one stream to
+    /// two blocks.
+    pub fn with_blocks(&self, blocks: &[Option<Assign>], width: u16) -> Result<Self, RouteError> {
+        let mut next = RoutingMap {
+            routes: Vec::new(),
+            names: self.names.clone(),
+        };
+        for r in self.routes.iter().filter(|r| !is_block_route(r)) {
+            next.add(*r, width)?;
+        }
+        for (b, a) in blocks.iter().enumerate() {
+            let Some(a) = a else { continue };
+            next.add(
+                Route {
+                    direction: Direction::Input,
+                    first: (b as u16).saturating_mul(BLOCK_CHANNELS),
+                    entity_id: a.entity_id,
+                    stream_index: a.stream_index,
+                    stream_channel: 0,
+                    count: BLOCK_CHANNELS,
+                },
+                width,
+            )?;
+        }
+        Ok(next)
+    }
+}
+
+fn is_block_route(r: &Route) -> bool {
+    r.direction == Direction::Input
+        && r.stream_channel == 0
+        && r.count == BLOCK_CHANNELS
+        && r.first.is_multiple_of(BLOCK_CHANNELS)
 }
 
 /// `~/Library/Application Support/DreamAVB/routing.txt`.
@@ -455,6 +576,86 @@ mod tests {
     use super::*;
 
     const R16: u64 = 0x000a_92ff_fe03_3ba9;
+
+    #[test]
+    fn blocks_round_trip_and_keep_what_the_grid_cannot_show() {
+        let mut m = RoutingMap::default();
+        m.add(whole(64, R16, 1), 128).unwrap();
+        // A hand-edited single-channel route and an output route.
+        let odd = Route {
+            direction: Direction::Input,
+            first: 120,
+            entity_id: R16,
+            stream_index: 9,
+            stream_channel: 3,
+            count: 1,
+        };
+        m.add(odd, 128).unwrap();
+        let mut out = whole(0, R16, 1);
+        out.direction = Direction::Output;
+        m.add(out, 128).unwrap();
+        m.set_name(R16, None, "StudioLive 16R");
+
+        let mut blocks = m.input_blocks(128);
+        assert_eq!(blocks.len(), 16);
+        assert_eq!(
+            blocks[8],
+            Some(Assign {
+                entity_id: R16,
+                stream_index: 1
+            })
+        );
+        assert!(blocks[15].is_none(), "the 1-channel route is not a block");
+
+        // The user moves stream 1 from block 8 to block 0 and adds stream 2.
+        blocks[8] = None;
+        blocks[0] = Some(Assign {
+            entity_id: R16,
+            stream_index: 1,
+        });
+        blocks[1] = Some(Assign {
+            entity_id: R16,
+            stream_index: 2,
+        });
+        let next = m.with_blocks(&blocks, 128).unwrap();
+        assert_eq!(next.channel_for(Direction::Input, R16, 1, 0), Some(0));
+        assert_eq!(next.channel_for(Direction::Input, R16, 2, 0), Some(8));
+        assert!(next.routes().contains(&odd));
+        assert!(next.routes().contains(&out));
+        assert_eq!(next.name(R16, None), Some("StudioLive 16R"));
+        // The original is untouched until the caller saves the new one.
+        assert_eq!(m.channel_for(Direction::Input, R16, 1, 0), Some(64));
+    }
+
+    #[test]
+    fn a_grid_that_routes_one_stream_twice_is_refused() {
+        let blocks = vec![
+            Some(Assign {
+                entity_id: R16,
+                stream_index: 1,
+            }),
+            Some(Assign {
+                entity_id: R16,
+                stream_index: 1,
+            }),
+        ];
+        assert!(matches!(
+            RoutingMap::default().with_blocks(&blocks, 128),
+            Err(RouteError::SourceAlreadyRouted(_))
+        ));
+    }
+
+    #[test]
+    fn names_round_trip_and_cannot_break_lines() {
+        let mut m = RoutingMap::default();
+        m.add(whole(0, R16, 1), 128).unwrap();
+        m.set_name(R16, None, "Studio\nLive: 16R");
+        m.set_name(R16, Some(1), "Send 1-8");
+        let (back, w) = RoutingMap::parse(&m.to_text(), 128);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(back.name(R16, None), Some("Studio Live: 16R"));
+        assert_eq!(back.name(R16, Some(1)), Some("Send 1-8"));
+    }
 
     #[test]
     fn no_saved_map_keeps_the_single_device_layout() {

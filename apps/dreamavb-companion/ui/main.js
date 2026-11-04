@@ -301,6 +301,208 @@ el("audio").addEventListener("change", async (ev) => {
   }
 });
 
+// ---- Channel map -----------------------------------------------------------
+//
+// The grid of 8-channel input blocks. Edits are local until Save; nothing is
+// written by opening the screen, polling, or a device coming or going.
+let mapInfo = null; // last snapshot from the backend
+let mapDraft = null; // the user's edits: array of source key or null
+let mapSaving = false;
+
+function mapSummary(info) {
+  const used = info.blocks.filter((b) => b).length;
+  const devices = new Set(info.sources.filter((s) => s.connected).map((s) => s.device));
+  const absent = info.blocks.filter((b) => {
+    const s = info.sources.find((x) => x.key === b);
+    return b && s && !s.connected;
+  }).length;
+  let txt = `${used} of ${info.blocks.length} input blocks assigned`;
+  txt += ` · ${devices.size} device${devices.size === 1 ? "" : "s"} found`;
+  if (absent) txt += ` · ${absent} waiting for a device`;
+  if (!info.saved) txt += " · default layout";
+  el("mapSummary").textContent = txt;
+}
+
+async function refreshMapSummary() {
+  if (mapDraft) return; // editing: leave the screen alone
+  try {
+    mapInfo = await invoke("get_channel_map");
+    mapSummary(mapInfo);
+  } catch (e) {
+    el("mapSummary").textContent = String(e);
+  }
+}
+
+function mapDirty() {
+  return mapDraft && mapInfo && mapDraft.some((k, i) => k !== mapInfo.blocks[i]);
+}
+
+function paintMap() {
+  const info = mapInfo;
+  const list = el("mapList");
+  list.innerHTML = "";
+  const n = info.block_channels;
+  // Group sources by device for the dropdowns.
+  const byDevice = new Map();
+  for (const s of info.sources) {
+    if (!byDevice.has(s.device)) byDevice.set(s.device, []);
+    byDevice.get(s.device).push(s);
+  }
+  mapDraft.forEach((key, i) => {
+    const row = document.createElement("div");
+    row.className = "map-row";
+    const ch = document.createElement("span");
+    ch.className = "ch";
+    ch.textContent = `${i * n + 1}–${(i + 1) * n}`;
+    const sel = document.createElement("select");
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = "— none —";
+    sel.appendChild(none);
+    for (const [device, srcs] of byDevice) {
+      const g = document.createElement("optgroup");
+      g.label = device;
+      for (const s of srcs) {
+        const o = document.createElement("option");
+        o.value = s.key;
+        // Device name on every option: a closed <select> shows only the
+        // option text, and "Send 1-8" alone is ambiguous with two devices.
+        o.textContent = `${s.device} · ${s.stream}` + (s.connected ? "" : " (not connected)");
+        // A stream already on another block cannot be picked twice; the
+        // user clears it there first. Nothing is moved for them.
+        const elsewhere = mapDraft.findIndex((k, j) => j !== i && k === s.key);
+        if (elsewhere >= 0) {
+          o.disabled = true;
+          o.textContent += ` — on ${elsewhere * n + 1}–${(elsewhere + 1) * n}`;
+        }
+        // Only whole 8-channel streams fit a block.
+        if (s.channels !== n) {
+          o.disabled = true;
+          o.textContent += ` (${s.channels} ch)`;
+        }
+        g.appendChild(o);
+      }
+      sel.appendChild(g);
+    }
+    sel.value = key || "";
+    const src = info.sources.find((s) => s.key === key);
+    sel.classList.toggle("absent", !!(src && !src.connected));
+    sel.classList.toggle("changed", key !== info.blocks[i]);
+    if (src && !src.connected) sel.title = `${src.device} is not connected; these inputs are silent until it returns`;
+    sel.addEventListener("change", () => {
+      mapDraft[i] = sel.value || null;
+      discardArmed = false;
+      el("mapCancel").textContent = "Cancel";
+      el("mapMsg").textContent = "";
+      el("mapMsg").classList.remove("warn");
+      paintMap();
+    });
+    row.append(ch, sel);
+    list.appendChild(row);
+  });
+
+  const note = el("mapNote");
+  if (!info.sources.length) {
+    note.textContent = "No AVB devices found yet. Start audio once so DreamAVB can look for them.";
+    note.classList.add("warn");
+  } else if (!info.saved) {
+    note.textContent = "This is the default layout. Nothing is saved until you press Save.";
+    note.classList.remove("warn");
+  } else {
+    note.textContent = "New devices appear in the lists without taking any inputs.";
+    note.classList.remove("warn");
+  }
+  for (const w of info.warnings || []) {
+    note.textContent += ` · ${w}`;
+    note.classList.add("warn");
+  }
+  // Saving an unchanged default is allowed: it makes the layout explicit.
+  el("mapSave").disabled = mapSaving || !(mapDirty() || !info.saved);
+}
+
+async function openMap() {
+  try {
+    mapInfo = await invoke("get_channel_map");
+  } catch (e) {
+    showError(String(e));
+    return;
+  }
+  mapDraft = mapInfo.blocks.slice();
+  discardArmed = false;
+  el("mapCancel").textContent = "Cancel";
+  el("mapMsg").textContent = "";
+  el("mapMsg").classList.remove("warn");
+  el("mapRestart").style.display = "none";
+  document.querySelector(".frame").classList.add("mapping");
+  paintMap();
+}
+
+function closeMap() {
+  mapDraft = null;
+  document.querySelector(".frame").classList.remove("mapping");
+  refreshMapSummary();
+}
+
+el("mapOpen").addEventListener("click", openMap);
+// Unsaved edits need a second press to discard, shown in the panel (the
+// webview's confirm() dialog is not reliable here).
+let discardArmed = false;
+el("mapCancel").addEventListener("click", () => {
+  if (mapDirty() && !discardArmed) {
+    discardArmed = true;
+    el("mapCancel").textContent = "Discard changes";
+    el("mapMsg").textContent = "You have unsaved changes.";
+    el("mapMsg").classList.add("warn");
+    return;
+  }
+  discardArmed = false;
+  el("mapCancel").textContent = "Cancel";
+  closeMap();
+});
+
+el("mapSave").addEventListener("click", async () => {
+  mapSaving = true;
+  el("mapSave").disabled = true;
+  const msg = el("mapMsg");
+  try {
+    mapInfo = await invoke("set_channel_map", { blocks: mapDraft });
+    mapDraft = mapInfo.blocks.slice();
+    discardArmed = false;
+    el("mapCancel").textContent = "Done";
+    msg.classList.remove("warn");
+    if (mapInfo.audio_running) {
+      msg.textContent = "Saved. It takes effect when audio restarts.";
+      el("mapRestart").style.display = "";
+    } else {
+      msg.textContent = "Saved. It takes effect when audio starts.";
+    }
+  } catch (e) {
+    // Refused (e.g. a stream on two blocks): nothing was written.
+    msg.textContent = `Not saved: ${e}`;
+    msg.classList.add("warn");
+  } finally {
+    mapSaving = false;
+    paintMap();
+  }
+});
+
+el("mapRestart").addEventListener("click", async () => {
+  // Explicit: restarting audio interrupts it for a few seconds.
+  const b = el("mapRestart");
+  b.disabled = true;
+  try {
+    await invoke("stop_audio");
+    paintAudio(await invoke("start_audio"));
+    el("mapMsg").textContent = "Audio restarted with the new map.";
+    b.style.display = "none";
+  } catch (e) {
+    el("mapMsg").textContent = `Restart failed: ${e}`;
+    el("mapMsg").classList.add("warn");
+  } finally {
+    b.disabled = false;
+  }
+});
+
 el("link").addEventListener("click", () => {
   invoke("open_project_page");
 });
@@ -446,4 +648,8 @@ el("autoSelectNic").addEventListener("change", async (ev) => {
   setInterval(() => {
     if (el("stats").classList.contains("open")) refreshStats();
   }, 1000);
+  // The device report changes when the daemon starts; poll gently. Never
+  // touches the screen while the map is being edited (see mapDraft).
+  refreshMapSummary();
+  setInterval(refreshMapSummary, 5000);
 })();
