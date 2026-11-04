@@ -5569,7 +5569,9 @@ fn talker_loop(
                 Level::Info,
                 "clock",
                 &format!(
-                    "role={} servo={} gm={} (ours={}) btca(won={} lost={}) mastertx(ann={} sync={} fu={} ts_lost={}){}",
+                    "role={} servo={} gm={} (ours={}) btca(won={} lost={}) mastertx(ann={} sync={} fu={} ts_lost={}) \
+                     link(asCapable={} delay_raw={:?} delay_comp={:?} nrr={:?} our_turnaround={:?} max={:?} \
+                     req_rx={} resp_tx={} fu_tx={} resp_ts_fail={} lost={} sync_rx={} ann_rx={}){}",
                     st.port_state.name(),
                     st.servo_state.name(),
                     st.gm_identity,
@@ -5580,6 +5582,19 @@ fn talker_loop(
                     c.sync_tx,
                     c.follow_up_tx,
                     c.sync_tx_ts_lost,
+                    st.as_capable,
+                    st.path_delay_raw_ns.mean.map(|v| v.round() as i64),
+                    st.path_delay_comp_ns.mean.map(|v| v.round() as i64),
+                    st.nrr_systim,
+                    st.responder_turnaround_ns.mean.map(|v| v.round() as i64),
+                    st.responder_turnaround_max_ns.map(|v| v.round() as i64),
+                    c.pdelay_req_rx,
+                    c.pdelay_resp_tx,
+                    c.pdelay_resp_fu_tx,
+                    c.pdelay_resp_ts_fail,
+                    c.lost_responses,
+                    c.sync_rx,
+                    c.announce_rx,
                     if crf_talker.is_some() {
                         format!(
                             " crf(pdus={crf_pdus} refused={crf_refused} no_anchor={crf_skipped_no_clock} reanchors={crf_reanchors})"
