@@ -3599,6 +3599,10 @@ fn talker_loop(
     // Longest single loop pass since the last PDU send, for the burst log.
     let mut max_pass_ns: u64 = 0;
     let mut pass_start_ns: u64 = 0;
+    // Section start times within a pass (index 0 unused), and those of the
+    // longest pass since the last send (index 0 = its length).
+    let mut pass_marks: [u64; 8] = [0; 8];
+    let mut worst_marks: [u64; 8] = [0; 8];
     // When the talker armed, so the summary can report rates over the window
     // frames were actually being sent in rather than over the whole run, which
     // includes discovery, the AEM reads and the gPTP lock wait.
@@ -3888,13 +3892,20 @@ fn talker_loop(
         if let Some(f) = ctl_tx_queue.pop_front() {
             let _ = dext.send(f.bytes(), false, 0);
         }
-        // Loop-pass timing for the late-talker log.
+        // Loop-pass timing for the late-talker log, with where the longest
+        // pass spent its time (offsets of each section from the pass start).
         {
             let t = ns_since(start);
             if pass_start_ns != 0 {
-                max_pass_ns = max_pass_ns.max(t.saturating_sub(pass_start_ns));
+                let len = t.saturating_sub(pass_start_ns);
+                if len > max_pass_ns {
+                    max_pass_ns = len;
+                    worst_marks = pass_marks.map(|m| m.saturating_sub(pass_start_ns));
+                    worst_marks[0] = len;
+                }
             }
             pass_start_ns = t;
+            pass_marks = [0; 8];
         }
         if shutdown_requested() {
             break;
@@ -4953,6 +4964,7 @@ fn talker_loop(
         // second at most, so 1 ms is ample. RX is NOT throttled: frames are
         // fed in from the drain above on every pass, so a Pdelay response is
         // never delayed by this.
+        pass_marks[1] = ns_since(start);
         if ns_since(last_gptp_service) >= 1_000_000 {
             gptp.service_no_rx(dext, log, now_mach())?;
             last_gptp_service = now_mach();
@@ -5123,6 +5135,7 @@ fn talker_loop(
             }
         }
         // Run the MRP timers and put whatever they produced on the wire.
+        pass_marks[2] = ns_since(start);
         srp.poll(srp_now(), &mut srp_out);
         while let Some(f) = srp_out.pop() {
             let _ = dext.send(f.bytes(), false, 0);
@@ -5435,6 +5448,7 @@ fn talker_loop(
             last_gptp_push = now_mach();
         }
 
+        pass_marks[3] = ns_since(start);
         // ---- Inbound audio (duplex) -----------------------------------------
         //
         // Deliberately BEFORE the TX readiness gate below. That gate waits for
@@ -5544,6 +5558,7 @@ fn talker_loop(
             }
         }
 
+        pass_marks[4] = ns_since(start);
         // ---- Readiness gate -------------------------------------------------
         //
         // A Milan talker must not stream on a clock that is not locked to the
@@ -5744,6 +5759,7 @@ fn talker_loop(
                 );
             }
         }
+        pass_marks[5] = ns_since(start);
         // ---- clock role: who is grandmaster, and how BTCA decided ---------
         //
         // Reported periodically because it is the only visible evidence of the
@@ -6043,6 +6059,7 @@ fn talker_loop(
             last_clock_pub = now_mach();
         }
 
+        pass_marks[6] = ns_since(start);
         // ---- Media clock (CRF) tick ----------------------------------------
         //
         // BEFORE the audio pacing gate below, which `continue`s on a tick that
@@ -6238,10 +6255,19 @@ fn talker_loop(
                                 "play",
                                 &format!(
                                     "talker late: retired {retire} interval(s) ({} us) at \
-                                     t={:.3}s; longest loop pass since the last send {} us",
+                                     t={:.3}s; longest loop pass since the last send {} us \
+                                     (section starts, us: gptp {} srp {} inbound {} gate {} \
+                                     role {} crf {} tx {})",
                                     retire * pdu_interval_ns / 1000,
                                     ns_since(start) as f64 / 1e9,
                                     max_pass_ns / 1000,
+                                    worst_marks[1] / 1000,
+                                    worst_marks[2] / 1000,
+                                    worst_marks[3] / 1000,
+                                    worst_marks[4] / 1000,
+                                    worst_marks[5] / 1000,
+                                    worst_marks[6] / 1000,
+                                    worst_marks[7] / 1000,
                                 ),
                             );
                         }
@@ -6280,6 +6306,7 @@ fn talker_loop(
         }
 
         // Drain exactly one PDU's worth of frames from the output ring.
+        pass_marks[7] = ns_since(start);
         let got = consumer.read_into(&mut sample_scratch, spf);
         if got < spf {
             // Underrun: the plug-in has not produced this PDU yet. Send silence
@@ -6501,6 +6528,7 @@ fn talker_loop(
         // than sent as a burst.
         next_pdu_ns = elapsed.saturating_add(MIN_PDU_SPACING_NS);
         max_pass_ns = 0;
+        worst_marks = [0; 8];
     }
 
     // Tell the 16R we are going before we stop answering. Without this it
@@ -6890,10 +6918,13 @@ const RX_AUDIO_MAX_BATCHES_PER_PASS: usize = 128;
 /// bound the oldest timestamps would be too close to now to be accepted, so
 /// those intervals are retired instead.
 ///
-/// Half the presentation offset, so a caught-up PDU still arrives at least
-/// half the offset ahead of its presentation time: 8 intervals (1 ms) at the
-/// 2 ms offset.
-const MAX_CATCHUP_INTERVALS: u64 = avb_audioring::TALKER_PRESENTATION_OFFSET_NS / 2 / 125_000;
+/// Three quarters of the presentation offset, so a caught-up PDU still
+/// arrives at least 0.5 ms ahead of its presentation time: 12 intervals
+/// (1.5 ms) at the 2 ms offset. Half (1 ms) was too little: the I210 dext is
+/// occasionally descheduled for ~1.5 ms (its RX ring filled, hw_rqdpc0
+/// counted drops), our sends block behind it, and retiring the 12 late
+/// intervals dropped lock on every sink of both mixers.
+const MAX_CATCHUP_INTERVALS: u64 = avb_audioring::TALKER_PRESENTATION_OFFSET_NS * 3 / 4 / 125_000;
 
 /// Minimum spacing between intervals on the wire, on the Mac clock.
 ///
@@ -8804,9 +8835,9 @@ mod talker_tests {
     fn pacing_catches_up_small_lateness_and_retires_large() {
         let i = 125_000u64;
         let t = 10_000_000_000u64;
-        // The bound is half the 2 ms offset, pinned to its literal value.
-        assert_eq!(MAX_CATCHUP_INTERVALS, 8);
-        // Up to 7 intervals late: send them all, retire nothing.
+        // The bound is 3/4 of the 2 ms offset, pinned to its literal value.
+        assert_eq!(MAX_CATCHUP_INTERVALS, 12);
+        // Up to 11 intervals late: send them all, retire nothing.
         for late in 0..MAX_CATCHUP_INTERVALS {
             assert_eq!(
                 pacing_decision(Some(t - late * i), t, i),
@@ -8816,8 +8847,8 @@ mod talker_tests {
         }
         // At or past the bound: those timestamps are too close to now; retire.
         assert_eq!(
-            pacing_decision(Some(t - 8 * i), t, i),
-            Pace::Send { retire: 8 }
+            pacing_decision(Some(t - 12 * i), t, i),
+            Pace::Send { retire: 12 }
         );
         assert_eq!(
             pacing_decision(Some(t - 40 * i), t, i),
