@@ -257,6 +257,12 @@ constexpr uint32_t kFtqReset            = 0x5c00;
 
 // ---------------------------------------------------------------------------
 // GRC
+// RX RISC CPU (tg3 RX_CPU_BASE). The 0x5400 AVB classifier block is in its
+// address space; Apple's HaltCpu writes STATE=0xffffffff then MODE=HALT.
+constexpr uint32_t kRxCpuMode           = 0x5000;
+constexpr uint32_t  kRxCpuModeHalt      = 0x00000400;
+constexpr uint32_t kRxCpuState          = 0x5004;
+
 constexpr uint32_t kGrcMode             = 0x6800;
 constexpr uint32_t  kGrcWswapNonFrm     = 0x00000004;
 constexpr uint32_t  kGrcBswapData       = 0x00000010;

@@ -784,19 +784,43 @@ static bool resetHw(IV * v, uint64_t initFlags)
 // read-only observation of Apple's driver (docs/bcm-rx-timestamp-investigation.md).
 static void programAvbRxRules(IV * v)
 {
+    // Experiment (2026-11-04): the 0x5400 block lives in the RX CPU's address
+    // space (tg3 RX_CPU at 0x5000) and read back 0 when written with the CPU
+    // running. Halt the RX CPU first, exactly as Apple's HaltCpu does (STATE
+    // = all-ones, MODE = HALT), write the config, then release it, and log
+    // the readbacks so we can see whether halting makes the writes stick.
+    const uint32_t savedMode = rd(v, bcm::kRxCpuMode);
+    const uint32_t savedState = rd(v, bcm::kRxCpuState);
+    const uint32_t savedPc = rd(v, 0x501c);
+    LOG("AVB RX rules: RX CPU before halt mode 0x%08x state 0x%08x pc 0x%08x", savedMode,
+        savedState, savedPc);
+    wr(v, bcm::kRxCpuState, 0xffffffff);
+    wr(v, bcm::kRxCpuMode, savedMode | bcm::kRxCpuModeHalt);
+    bool halted = pollUs(v, 5000, 50,
+                         [&] { return (rd(v, bcm::kRxCpuMode) & bcm::kRxCpuModeHalt) != 0; });
+    LOG("AVB RX rules: RX CPU halt requested, halted=%d mode 0x%08x", halted,
+        rd(v, bcm::kRxCpuMode));
+
     LOG("AVB RX rules: replaying %u Apple classifier write(s)", kAvbRxRuleWriteCount);
+    uint32_t stuck = 0;
     for (uint32_t i = 0; i < kAvbRxRuleWriteCount && ok(v); i++) {
         const uint32_t off = kAvbRxRuleWrites[i].off;
         const uint32_t val = kAvbRxRuleWrites[i].val;
         const uint32_t before = rd(v, off);
         wr(v, off, val);
         const uint32_t after = rd(v, off);
-        LOG("AVB RX rule[%u]: 0x%04x 0x%08x -> wrote 0x%08x -> 0x%08x", i, off, before, val, after);
+        if (after == val) {
+            stuck++;
+        }
+        LOG("AVB RX rule[%u]: 0x%04x 0x%08x -> wrote 0x%08x -> 0x%08x%s", i, off, before, val,
+            after, after == val ? " (stuck)" : "");
     }
-    // The EAV clock the timestamps are counted against (read-only), so the log
-    // shows it running.
-    LOG("AVB RX rules done: EAV_REF_CLK 0x%08x, RX_PTP_CTL 0x%08x", rd(v, bcm::kEavRefClkLsb),
-        rd(v, bcm::kRxPtpCtl));
+    LOG("AVB RX rules: %u of %u writes stuck while halted", stuck, kAvbRxRuleWriteCount);
+
+    // Release the RX CPU: restore its original mode (clears HALT).
+    wr(v, bcm::kRxCpuMode, savedMode & ~bcm::kRxCpuModeHalt);
+    LOG("AVB RX rules done: RX CPU mode 0x%08x, EAV_REF_CLK 0x%08x, RX_PTP_CTL 0x%08x",
+        rd(v, bcm::kRxCpuMode), rd(v, bcm::kEavRefClkLsb), rd(v, bcm::kRxPtpCtl));
 }
 
 // tg3_abort_hw order for a 5705_PLUS part (RCVLSC/DMAC/MBFREE/BUFMGR/MEMARB
