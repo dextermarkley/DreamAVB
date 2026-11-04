@@ -32,6 +32,7 @@ pub const BCM_SNAPSHOT_WINDOWS: &[(u32, u32)] = &[
     (0x3600, 0x3700),
     (0x4800, 0x4900),
     (0x4c00, 0x4d00),
+    (0x5000, 0x5700),
     (0x6800, 0x6a00),
 ];
 
@@ -799,11 +800,11 @@ impl StreamFilter {
 
 #[cfg(test)]
 mod tests {
-    /// Pinned to `kSnapWindows` / `kSnapWords` in Tg3Logic.hpp (640 words).
+    /// Pinned to `kSnapWindows` / `kSnapWords` in Tg3Logic.hpp (1088 words).
     #[test]
     fn bcm_snapshot_windows_match_the_dext() {
         let words: u32 = BCM_SNAPSHOT_WINDOWS.iter().map(|(a, b)| (b - a) / 4).sum();
-        assert_eq!(words, 640);
+        assert_eq!(words, 1088);
         assert_eq!(READ_SNAPSHOT_FLAG & 0xffff_ffff, 0);
         // Never the MAC statistics block (counters may clear on read).
         assert!(BCM_SNAPSHOT_WINDOWS

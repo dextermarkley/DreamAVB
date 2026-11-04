@@ -222,9 +222,13 @@ struct SnapWindow {
     uint32_t start;
     uint32_t end;  // exclusive
 };
+// 0x5000-0x5700 added 2026-11-04: BCM5701Enet::startAVB programs an RX-rule /
+// classifier block at 0x5410-0x561c (incl. ethertype 0x88F7 at 0x5494) that
+// the tg3 path never touches and that is how Apple routes gPTP frames for RX
+// timestamping. The earlier windows missed it.
 constexpr SnapWindow kSnapWindows[] = {
     {0x0400u, 0x0700u}, {0x2000u, 0x2100u}, {0x2400u, 0x2500u}, {0x3600u, 0x3700u},
-    {0x4800u, 0x4900u}, {0x4c00u, 0x4d00u}, {0x6800u, 0x6a00u},
+    {0x4800u, 0x4900u}, {0x4c00u, 0x4d00u}, {0x5000u, 0x5700u}, {0x6800u, 0x6a00u},
 };
 constexpr uint32_t snapWindowWords(const SnapWindow& w) { return (w.end - w.start) / 4u; }
 constexpr uint32_t kSnapWords = [] {

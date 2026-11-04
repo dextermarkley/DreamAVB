@@ -74,3 +74,67 @@ collection, whose kexts cannot be unloaded. So the only ways to hand our dext
 the device are re-enumeration (a replug, which gives our dext a fresh,
 unconfigured chip) or a reboot, neither of which preserves Apple's register
 state. Observing Apple's configuration from the chip is not possible this way.
+
+## Breakthrough: Apple's AVB register block at 0x5400-0x561c (2026-11-04)
+
+Extracted `AppleBCM5701Ethernet` (x86_64) from the boot kernel collection
+(`/System/Library/KernelCollections/BootKernelExtensions.kc`, fileset entry
+`com.apple.iokit.AppleBCM5701Ethernet` at file offset 39919616) and
+disassembled it read-only with capstone. Only register offsets and values are
+taken from it, never code. Raw dumps in `.agents/tmp/re-avb.txt`.
+
+`BCM5701Enet::startAVB()` writes a block of registers the tg3-documented path
+NEVER touches. Each write is guarded by two flag bytes (`+0x3d9` bit 0 and
+`+0x7b0` bit 0, i.e. "AVB supported && not suspended"); the register base is
+`ivars+0x118` (BAR0). The writes, in order:
+
+| Offset | Value | Likely meaning |
+|---|---|---|
+| 0xd20 | gPTP clock hi window (masked `& 0xffff8000`) | CPMU/clock, via `+0x118[0xd20]` |
+| 0x5c8 | `(serdes-serdes) & 0xf8000` | clock window |
+| 0x5410 | 0x8400000c | RX rule/classifier element |
+| 0x5494 | 0x88f7ffff | **ethertype 0x88F7 (gPTP/AVTP) match** |
+| 0x5414 | 0x84006002 | RX rule element |
+| 0x5494 | 0x013fffff | rule mask (second write) |
+| 0x5418 | 0x84006002 | RX rule element |
+| 0x5498 | 0x0140ffff | rule mask |
+| 0x5500 | 5 | queue/config |
+| 0x5504 | 0xa | |
+| 0x5508 | 0x10 | |
+| 0x550c | 0x20 | |
+| 0x5510 | 0x40 | |
+| 0x5608 | 0 | |
+| 0x560c | 0xe0 | |
+| 0x5610 | 0 | |
+| 0x5614 | 0xe1 | |
+| 0x5618 | 0x25 | |
+| 0x561c | 0xe4e3a2 | |
+| 0x560 | 0xe | MAC-block config |
+
+`setupAVB()` also sets two timing constants (0x1e848 = 125000, 0x3d090 =
+250000 ns) through helper calls, calls four sub-helpers, and reads the TX
+timestamp at 0x5c0/0x5c4 into `ivars+0x2cf8`.
+
+`BCM5701EnetClock::takeCrossTimestamp()` reads the free-running EAV clock at
+**0x6900 (LSB) / 0x6904 (MSB)** between two `mach_absolute_time` fences — the
+same EAV block Phase 0 already used. So the CLOCK is the known EAV block; the
+missing piece is the **0x5400-0x561c RX classifier/rule block** that routes
+gPTP (ethertype 0x88F7) frames so their RX timestamps latch. The tg3
+`RX_PTP_CTL` at 0x6c8 is NOT how Apple does RX timestamps on this chip.
+
+### Gap in snapshot 1
+
+The power-on snapshot windows did not include 0x5000-0x5700, so we never saw
+this block's reset state. The snapshot has been widened to cover it, so the
+next capture under our own driver (power-on) can be compared against these
+Apple-written values to confirm which writes are the live difference.
+
+### Next
+
+1. Capture the 0x5400-0x5620 block (added to the snapshot).
+2. Disassemble `updateAVBStreamFilters`, `setRealtimeReceiveQueueFilter` and
+   `read/regWrInd` to resolve the rule-element encoding (0x84006002, the
+   0x5494 ethertype/mask pair) and the queue config at 0x5500-0x5618.
+3. In the dext, program the 0x5400 block for ethertype 0x88F7 after GRC time
+   sync enable, reading each register first and logging every write, then
+   check whether RX timestamps latch (the Phase 0 G3 gate).

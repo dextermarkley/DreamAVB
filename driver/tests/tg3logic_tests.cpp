@@ -202,7 +202,7 @@ static void testFrameAndComposites() {
 // indexed, and nothing in the MAC statistics block (0x800+) that may clear
 // on read.
 static void testSnapshot() {
-    CHECK(kSnapWords == (0x300u + 0x100u * 5u + 0x200u) / 4u);
+    CHECK(kSnapWords == (0x300u + 0x100u * 5u + 0x700u + 0x200u) / 4u);
     CHECK(snapIndex(0x0400) == 0);
     CHECK(snapIndex(0x06fc) == 0x300 / 4 - 1);
     CHECK(snapIndex(0x2000) == 0x300 / 4);
@@ -211,6 +211,9 @@ static void testSnapshot() {
     CHECK(snapIndex(0x05c0) >= 0);  // TX timestamp LSB
     CHECK(snapIndex(0x6800) >= 0);  // GRC_MODE
     CHECK(snapIndex(0x6928) >= 0);  // EAV correction
+    CHECK(snapIndex(0x5494) >= 0);  // Apple RX-rule ethertype 0x88F7
+    CHECK(snapIndex(0x5410) >= 0);  // Apple RX-rule element
+    CHECK(snapIndex(0x4d00) == -1); // gap between windows still excluded
     CHECK(snapIndex(0x69fc) == static_cast<int32_t>(kSnapWords) - 1);
     CHECK(snapIndex(0x0800) == -1);  // MAC statistics: never captured
     CHECK(snapIndex(0x0700) == -1);
