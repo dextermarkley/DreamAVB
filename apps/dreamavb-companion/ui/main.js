@@ -64,7 +64,14 @@ function paintStatus(st) {
     case "pending":
       dot.classList.add("pending");
       main.textContent = "Activating…";
-      sub.textContent = "Waiting for approval";
+      sub.textContent = st.summary || "Waiting for approval";
+      power.checked = true;
+      break;
+    case "releasing":
+      dot.classList.add("pending");
+      main.textContent = "Releasing…";
+      sub.textContent =
+        st.summary || "Waiting for macOS to release the I210";
       power.checked = true;
       break;
     case "fault":

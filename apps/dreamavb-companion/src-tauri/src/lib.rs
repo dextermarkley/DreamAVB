@@ -44,6 +44,8 @@ pub enum DriverState {
     DefaultDriver,
     /// Activating / waiting on approval.
     Pending,
+    /// DreamAVB asked macOS to release the I210, but it is still attached.
+    Releasing,
     /// DreamAVB owns the NIC and the stack is running.
     Active,
     /// A fault was reported by the dext.
@@ -323,16 +325,46 @@ async fn enable_driver(bsd_name: String) -> Result<Status, String> {
             "{bsd_name} is not a DreamAVB-supported interface (only the Intel I210 is)"
         ));
     }
+    DEACTIVATION_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
     run_installer("activate")?;
     Ok(current_status())
 }
 
-/// Disable DreamAVB: deactivate the dext so the OS default driver reclaims the
-/// NIC. This is the "give control back" action.
+/// Disable DreamAVB and hand the I210 back to the OS default driver.
+///
+/// The managed daemon owns DriverKit user clients, so it must leave first.
+/// A completed system-extension request is not itself evidence that the kernel
+/// detached an always-matched dext; wait for the observed handoff and surface
+/// the required physical/reboot follow-up when macOS defers it.
 #[tauri::command]
 async fn disable_driver() -> Result<Status, String> {
+    let _ = stop_audio().await?;
     run_installer("deactivate")?;
-    Ok(current_status())
+    DEACTIVATION_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    wait_for_driver_release()
+}
+
+const DRIVER_RELEASE_WAIT: Duration = Duration::from_secs(6);
+const DRIVER_RELEASE_POLL: Duration = Duration::from_millis(100);
+static DEACTIVATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn wait_for_driver_release() -> Result<Status, String> {
+    let deadline = Instant::now() + DRIVER_RELEASE_WAIT;
+    loop {
+        let status = current_status();
+        if status.state == DriverState::DefaultDriver {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "DreamAVB stopped managed audio, but macOS has not released the matched I210 \
+                 DriverKit extension. Unplug and replug the Thunderbolt I210 adapter or reboot; \
+                 the UI will show Hands off once the kernel detaches the dext."
+                    .into(),
+            );
+        }
+        std::thread::sleep(DRIVER_RELEASE_POLL);
+    }
 }
 
 /// Current driver ownership state (reads `systemextensionsctl` + a probe).
@@ -348,6 +380,8 @@ enum DextSysextState {
     Absent,
     /// Activated but not yet enabled/matched — mid-approval.
     Activating,
+    /// macOS has begun uninstalling the extension but has not released it.
+    Deactivating,
     /// Activated and enabled — our dext is in control.
     Enabled,
 }
@@ -366,24 +400,24 @@ fn dext_sysext_state() -> DextSysextState {
 /// Classify the dext's records in `systemextensionsctl list` output.
 ///
 /// The list can hold SEVERAL records for one bundle id (an old version waiting
-/// to uninstall beside a new one awaiting approval). Taking the first line
-/// containing `[activated enabled]` could therefore report Active off a stale
-/// version while the current one is still pending (review M4). A terminated /
-/// uninstalling record is ignored entirely, and the pending state only wins
-/// when NO live record is enabled. Pure, so it is unit-testable.
+/// to uninstall beside a new one awaiting approval). A live enabled record
+/// wins. Otherwise preserve a terminating record as a release-in-progress
+/// state rather than collapsing it to Absent while the kernel may still own the
+/// PCI device. Pure, so it is unit-testable.
 fn classify_sysext(text: &str) -> DextSysextState {
     let mut pending = false;
+    let mut terminating = false;
     for line in text
         .lines()
         .filter(|l| l.contains("com.avbaudio.installer.i210"))
     {
         let l = line.to_lowercase();
-        // A record on its way out says nothing about who owns the NIC now.
-        if l.contains("terminated") || l.contains("uninstall") {
-            continue;
-        }
         if l.contains("[activated enabled]") {
             return DextSysextState::Enabled;
+        }
+        if l.contains("terminated") || l.contains("uninstall") {
+            terminating = true;
+            continue;
         }
         if l.contains("activated") || l.contains("waiting") {
             pending = true;
@@ -391,15 +425,29 @@ fn classify_sysext(text: &str) -> DextSysextState {
     }
     if pending {
         DextSysextState::Activating
+    } else if terminating {
+        DextSysextState::Deactivating
     } else {
         DextSysextState::Absent
     }
 }
 
 fn current_status() -> Status {
+    // A successful deactivation is the observable handoff, not the request
+    // callback. While a requested or reported release still has an attached
+    // service, expose that fact instead of letting the next poll paint Active.
+    let state = dext_sysext_state();
+    let release_requested = DEACTIVATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+        || state == DextSysextState::Deactivating;
+    if release_requested {
+        if dext_owns_i210() {
+            return status_for(DextSysextState::Deactivating, false, None);
+        }
+        DEACTIVATION_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     // Hands-off is the safe default: only a positive signal flips us to Active,
     // so a read failure never falsely claims the driver owns the NIC.
-    let state = dext_sysext_state();
     let faulted = state == DextSysextState::Enabled && probe_fault();
     let nic = if state == DextSysextState::Enabled {
         list_nics().into_iter().find(|n| n.supported)
@@ -436,6 +484,11 @@ fn status_for(state: DextSysextState, faulted: bool, nic: Option<Nic>) -> Status
             state: DriverState::Pending,
             nic: None,
             summary: "Activating — waiting for approval".into(),
+        },
+        DextSysextState::Deactivating => Status {
+            state: DriverState::Releasing,
+            nic: None,
+            summary: "Releasing I210 — waiting for macOS to detach the DriverKit extension".into(),
         },
         DextSysextState::Absent => Status {
             state: DriverState::DefaultDriver,
@@ -1821,6 +1874,10 @@ mod tests {
             DriverState::Pending
         );
         assert_eq!(
+            status_for(DextSysextState::Deactivating, false, None).state,
+            DriverState::Releasing
+        );
+        assert_eq!(
             status_for(DextSysextState::Enabled, false, Some(nic_i210())).state,
             DriverState::Active
         );
@@ -1903,6 +1960,18 @@ mac            64:4b:f0:12:73:b8   timebase 125/3
             DextSysextState::Absent
         );
         assert_eq!(classify_sysext(""), DextSysextState::Absent);
+    }
+
+    #[test]
+    fn terminating_extension_is_reported_as_releasing_not_hands_off() {
+        let terminating = "\
+*   *   8NG8NMGYVF  com.avbaudio.installer.i210 (284.21.58/284.21.58) \
+AVBI210Driver [terminated waiting to uninstall on reboot]";
+        assert_eq!(
+            classify_sysext(terminating),
+            DextSysextState::Deactivating,
+            "a terminating record has not yet returned the I210 to the OS"
+        );
     }
 
     /// The I210 is matched on PCI identity, and nothing else ever is (the
