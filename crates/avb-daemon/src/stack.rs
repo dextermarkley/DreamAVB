@@ -5860,7 +5860,15 @@ fn talker_loop(
         let mut tx_staged_len = 0usize;
         for i in 0..out_streams.len() {
             let (first_ch, dst) = match out_streams.get(i) {
-                Some(o) => (o.first_ch, stream_dest_mac(o.stream_id)),
+                // Only a stream some listener has reserved goes on the wire.
+                // An SRP talker transmits a stream only while a Listener Ready
+                // (or Ready Failed) is registered for it (IEEE 802.1Q 35.2.4.4,
+                // Milan v1.2 §5.4.3). An unreserved stream is unregistered
+                // multicast to a bridge: 8000 frames/s of it per stream, which
+                // the MOTU switch answered by stopping gPTP Sync on our port
+                // and tearing down every reservation within a second.
+                Some(o) if o.ready => (o.first_ch, stream_dest_mac(o.stream_id)),
+                Some(_) => continue,
                 None => break,
             };
             // Gather this stream's channels out of the full-width ring frame,
