@@ -81,6 +81,51 @@ pub fn gap_is_real(d: i128, seq_step: Option<u8>, spf: usize) -> bool {
     }
 }
 
+/// First ring channel of each of `n` slots of `ch` channels in a ring of
+/// `total` channels. `placement[i]` is the user's channel map for slot `i`;
+/// a missing or `None` entry keeps the legacy `i * ch`. `None` if any slot
+/// would run past the ring or two slots would overlap: the caller refuses to
+/// build the ring rather than move a stream somewhere the user did not put it.
+pub fn slot_firsts(
+    placement: &[Option<u32>],
+    n: usize,
+    ch: usize,
+    total: usize,
+) -> Option<Vec<usize>> {
+    let firsts: Vec<usize> = (0..n)
+        .map(|i| {
+            placement
+                .get(i)
+                .copied()
+                .flatten()
+                .map_or(i * ch, |f| f as usize)
+        })
+        .collect();
+    let mut used = vec![false; total];
+    for &f in &firsts {
+        let span = used.get_mut(f..f.checked_add(ch)?)?;
+        if span.iter().any(|&u| u) {
+            return None;
+        }
+        span.fill(true);
+    }
+    Some(firsts)
+}
+
+/// The ring header's channel map: channel `k` -> (slot, channel in slot), or
+/// `(u16::MAX, u16::MAX)` for a channel no bound slot covers.
+pub fn ring_channel_map(firsts: &[usize], ch: usize, total: usize) -> Vec<(u16, u16)> {
+    (0..total)
+        .map(|k| {
+            firsts
+                .iter()
+                .enumerate()
+                .find(|&(_, &f)| k >= f && k < f + ch)
+                .map_or((u16::MAX, u16::MAX), |(s, &f)| (s as u16, (k - f) as u16))
+        })
+        .collect()
+}
+
 /// The inbound audio path: AAF PDUs in, shm input ring out.
 pub struct ListenerRx {
     ring: Option<avb_audioring::ShmProducer>,
@@ -170,6 +215,11 @@ pub struct ListenerRx {
     per_slot_frames: Vec<u64>,
     /// Per-slot (seq, ts) of the previous packet, for the jump diagnostic.
     last_seen: Vec<Option<(u8, u32)>>,
+    /// Per `expected` slot: the first ring channel from the user's channel
+    /// map, or `None` for the legacy `i * channels` placement.
+    placement: Vec<Option<u32>>,
+    /// See [`ListenerRx::bind_nothing`].
+    bind_none: bool,
     /// Packets whose sequence number skipped forward (packets missing).
     seq_gap: u64,
     /// Packets OLDER than the slot's previous one (reordered delivery).
@@ -190,6 +240,16 @@ impl ListenerRx {
         Self::with_streams(Vec::new())
     }
 
+    /// Bind no stream at all: the user's channel map routes nothing from this
+    /// device. Distinct from [`new`](Self::new), whose empty list means "bind
+    /// the first stream seen" and would put unmapped audio on the inputs.
+    pub fn bind_nothing() -> Self {
+        Self {
+            bind_none: true,
+            ..Self::new()
+        }
+    }
+
     /// Bind `expected` streams in ring-channel order, so slot `i` lands on
     /// channels `i * channels_per_stream ..`.
     ///
@@ -198,7 +258,17 @@ impl ListenerRx {
     /// packets drive the media clock and the sequential frame counter, and the
     /// others are placed relative to it.
     pub fn with_streams(expected: Vec<u64>) -> Self {
+        Self::with_placed_streams(expected.into_iter().map(|id| (id, None)).collect())
+    }
+
+    /// Bind streams at explicit ring channels: `(stream_id, first_channel)`,
+    /// where `first_channel` comes from the user's channel map. A `None`
+    /// keeps the legacy placement, slot `i` at `i * channels_per_stream`.
+    pub fn with_placed_streams(placed: Vec<(u64, Option<u32>)>) -> Self {
+        let (expected, placement): (Vec<u64>, Vec<Option<u32>>) = placed.into_iter().unzip();
         Self {
+            bind_none: false,
+            placement,
             ring: None,
             mclk: None,
             expected,
@@ -358,7 +428,7 @@ impl ListenerRx {
         // Build the ring on the first AAF packet from a stream we expect.
         // Geometry comes from the packet, never a literal.
         if self.ring.is_none() {
-            if !self.expected.is_empty() && !self.expected.contains(&sid) {
+            if self.bind_none || (!self.expected.is_empty() && !self.expected.contains(&sid)) {
                 self.non_primary_pdus += 1;
                 self.non_primary_streams.insert(sid);
                 return Placement::NotPrimary;
@@ -696,34 +766,41 @@ impl ListenerRx {
         // as silence, which is honest: the device has those channels, this
         // session is just not carrying them.
         let total_ch = avb_audioring::DEVICE_CHANNELS as usize;
+        // Where each slot lands: the user's channel map, else slot i at i*ch.
+        let Some(firsts) = slot_firsts(&self.placement, slots.len(), ch, total_ch) else {
+            log.log(
+                Level::Error,
+                "ring",
+                &format!(
+                    "channel placement {:?} does not fit {total_ch} channels of {ch}-channel \
+                     streams without overlap; not creating the input ring",
+                    self.placement
+                ),
+            );
+            return;
+        };
         let cfg = avb_audioring::RingConfig {
             channels: total_ch as u32,
             valid_bits: depth,
             nominal_rate_hz: rate,
             capacity_frames: consts.capacity_frames as u32,
             // One slot per expected stream, each occupying its own contiguous
-            // block of ring channels. Slot order is `expected`'s order, which
-            // is the 16R's STREAM_OUTPUT index order, so ring channels 1-8
-            // really are the device's "Send 1-8".
+            // block of ring channels starting where the channel map put it.
             streams: slots
                 .iter()
-                .enumerate()
-                .map(|(i, &id)| avb_audioring::StreamSlot {
+                .zip(&firsts)
+                .map(|(&id, &first)| avb_audioring::StreamSlot {
                     stream_id: id,
-                    first_channel: (i * ch) as u32,
+                    first_channel: first as u32,
                     channels: ch as u32,
                     bit_depth: depth,
                 })
                 .collect(),
-            // The full width, by notional slot: channel k belongs to slot
-            // k / ch at that slot's channel k % ch, whether or not the slot is
-            // bound in this session.
-            channel_map: (0..total_ch)
-                .map(|k| ((k / ch.max(1)) as u16, (k % ch.max(1)) as u16))
-                .collect(),
+            channel_map: ring_channel_map(&firsts, ch, total_ch),
         };
-        let prod_streams: Vec<(usize, usize, u32)> = (0..slots.len())
-            .map(|i| (i * ch, ch, u32::from(pdu.hdr.bit_depth.max(24))))
+        let prod_streams: Vec<(usize, usize, u32)> = firsts
+            .iter()
+            .map(|&first| (first, ch, u32::from(pdu.hdr.bit_depth.max(24))))
             .collect();
         match avb_audioring::ShmProducer::create(
             &cfg,
@@ -762,27 +839,25 @@ impl ListenerRx {
                         consts.capacity_frames,
                     ),
                 );
-                for (i, id) in slots.iter().enumerate() {
+                for (i, (id, first)) in slots.iter().zip(&firsts).enumerate() {
                     log.log(
                         Level::Info,
                         "ring",
                         &format!(
-                            "  slot {i}: stream 0x{id:016x} -> ring channels {}..{}",
-                            i * ch + 1,
-                            (i + 1) * ch
+                            "  slot {i}: stream 0x{id:016x} -> DreamAVB inputs {}..{}",
+                            first + 1,
+                            first + ch
                         ),
                     );
                 }
-                if slots.len() < avb_audioring::STREAMS_PER_DIRECTION as usize {
-                    log.log(
-                        Level::Info,
-                        "ring",
-                        &format!(
-                            "  ring channels {}..{total_ch} belong to unbound streams and read as silence",
-                            slots.len() * ch + 1
-                        ),
-                    );
-                }
+                log.log(
+                    Level::Info,
+                    "ring",
+                    &format!(
+                        "  {} of {total_ch} inputs carry no bound stream and read as silence",
+                        total_ch - slots.len() * ch
+                    ),
+                );
             }
             Err(e) => {
                 log.log(
@@ -902,6 +977,41 @@ mod tests {
         assert_eq!(rx.assumed(), (0, 0));
         assert_eq!(rx.max_offset_frames(), 0);
         assert!(rx.recovered_clock().is_none());
+    }
+
+    #[test]
+    fn legacy_placement_is_slot_times_width() {
+        assert_eq!(
+            slot_firsts(&[], 8, 8, 128),
+            Some((0..8).map(|i| i * 8).collect())
+        );
+    }
+
+    #[test]
+    fn mapped_placement_puts_a_stream_where_the_user_said() {
+        // 16R streams on inputs 65.. and 1..: the user's order, not slot order.
+        let p = [Some(64), Some(0), None];
+        assert_eq!(slot_firsts(&p, 3, 8, 128), Some(vec![64, 0, 16]));
+    }
+
+    #[test]
+    fn placement_that_overlaps_or_overflows_is_refused_not_moved() {
+        assert_eq!(slot_firsts(&[Some(0), Some(4)], 2, 8, 128), None);
+        assert_eq!(slot_firsts(&[Some(124)], 1, 8, 128), None);
+        // A legacy slot colliding with a mapped one is refused too.
+        assert_eq!(slot_firsts(&[None, Some(0)], 2, 8, 128), None);
+    }
+
+    #[test]
+    fn channel_map_marks_unrouted_channels() {
+        let m = ring_channel_map(&[64, 0], 8, 128);
+        assert_eq!(m.len(), 128);
+        assert_eq!(m[0], (1, 0));
+        assert_eq!(m[7], (1, 7));
+        assert_eq!(m[8], (u16::MAX, u16::MAX));
+        assert_eq!(m[64], (0, 0));
+        assert_eq!(m[71], (0, 7));
+        assert_eq!(m[72], (u16::MAX, u16::MAX));
     }
 
     /// A multi-stream configuration keeps the caller's order: slot i is

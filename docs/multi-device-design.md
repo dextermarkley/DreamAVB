@@ -104,17 +104,37 @@ sinks, connection state }`) sharing one dext, one gPTP service and one ring
 pair. ADP runs continuously: an `ENTITY_AVAILABLE` for a mapped device starts
 its session; `ENTITY_DEPARTING` or timeout ends it and silences its channels.
 
-## Open decisions
+## Decisions (2026-11-04)
 
-1. Fixed device width (recommended: 128 in / 128 out) versus growing it with
-   the user's sign-off.
-2. A new unmapped device: show and wait for assignment, or auto-assign to free
-   channels and notify.
-3. Per-channel mapping, or whole streams (8 channels) at an offset first.
-4. Outputs: map them now too, or inputs only for the first version.
-5. Clock: which device's stream (or gPTP) drives the media clock when several
-   are present; proposed: a user-chosen "clock device", defaulting to the
-   first mapped device, never switching without telling the user.
+1. **Fixed 128 in / 128 out.** Done: `avb_audioring::DEVICE_CHANNELS = 128`.
+2. **New devices appear silently.** Nothing is auto-assigned; the user maps a
+   device by opening the app.
+3. **Whole 8-channel streams first.** The map model already supports single
+   channels (`count`, `stream_channel`) for later.
+4. **Outputs stay with the DAW for now.** Output channels keep the pre-map
+   layout (channel block `i` -> the device's sink `i`). The map model has a
+   `Direction::Output` so output routes can be added without a format change.
+
+Still open: which device's stream drives the media clock when several are
+present (proposed: a user-chosen clock device, never switched silently).
+
+### No saved map = today's layout
+
+Until the user saves a map, `routing.txt` does not exist and the daemon uses
+the pre-map layout (the device's streams on inputs 1-64). Nothing is written
+on the user's behalf. Once a map is saved, exactly the mapped streams are
+bound; an empty saved map binds nothing.
+
+### Status
+
+- Done: rename; map model and persistence (`avb-config::routing`); 128-wide
+  rings and device; input placement from the map in the daemon
+  (`input_placement`, `slot_firsts`), verified on the 16R by mapping stream 1
+  to inputs 65-72 and stream 2 to 1-8; discovery no longer refuses to start
+  with several devices on the link and chooses deterministically
+  (`choose_device`: a mapped device, else the lowest entity id).
+- Next: publish discovered devices and their streams for the app; mapping UI;
+  then per-device sessions so more than one device streams at once.
 
 ## Planned order of work
 

@@ -1416,14 +1416,15 @@ mod tests {
     /// A HAL device's channel count is fixed when the device is published, so
     /// the two ends cannot negotiate: if they disagree the attach below
     /// refuses the ring and the result is silence, not an error the user sees.
-    /// Asserted against the shared constant AND against the literal 64, so
+    /// Asserted against the shared constant AND against the literal 128, so
     /// changing either one alone fails here rather than on a hardware run.
     #[test]
     fn the_device_width_matches_the_rings_the_daemon_creates() {
         assert_eq!(DEVICE_CHANNELS, avb_audioring::DEVICE_CHANNELS);
-        assert_eq!(DEVICE_CHANNELS, 64);
+        // Fixed at 128 each way: two 64-channel devices' worth.
+        assert_eq!(DEVICE_CHANNELS, 128);
         assert_eq!(avb_audioring::CHANNELS_PER_STREAM, 8);
-        assert_eq!(avb_audioring::STREAMS_PER_DIRECTION, 8);
+        assert_eq!(avb_audioring::STREAMS_PER_DIRECTION, 16);
         // The ASBD the device publishes must describe that same width, or
         // CoreAudio reads past the end of every frame we hand it.
         let a = device_asbd(DEVICE_RATE);

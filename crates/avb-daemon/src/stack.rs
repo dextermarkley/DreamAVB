@@ -2714,6 +2714,47 @@ fn talker_loop(
             );
             return Err(Exit::TalkerNotFound);
         }
+        // The user's channel map decides which of these streams are bound
+        // and on which DreamAVB inputs. With no saved map, the pre-map layout.
+        let in_ch = in_fmt.aaf().map_or(0, |a| a.channels);
+        let width = avb_audioring::DEVICE_CHANNELS as u16;
+        let (routing, rwarn) = avb_config::routing::RoutingMap::load_if_present(width);
+        for w in &rwarn {
+            log.log(Level::Warn, "routing", w);
+        }
+        let entity = u64::from_be_bytes(listener_id.0);
+        let sources: Vec<(u16, u16)> = uid_kept.iter().map(|&u| (u, in_ch)).collect();
+        let placed =
+            avb_config::routing::input_placement(routing.as_ref(), entity, &sources, width);
+        log.log(
+            Level::Info,
+            "routing",
+            &format!(
+                "{} for device 0x{entity:016x}: {} of {} input stream(s) mapped{}",
+                if routing.is_some() {
+                    "channel map"
+                } else {
+                    "no saved channel map, default layout"
+                },
+                placed.len(),
+                sources.len(),
+                placed
+                    .iter()
+                    .map(|(u, f)| format!(" [stream {u} -> inputs {}-{}]", f + 1, f + in_ch))
+                    .collect::<String>(),
+            ),
+        );
+        let mut kept_uids = Vec::with_capacity(placed.len());
+        let mut kept: Vec<(u64, Option<u32>)> = Vec::with_capacity(placed.len());
+        for &(u, first) in &placed {
+            if let Some(pos) = uid_kept.iter().position(|&x| x == u) {
+                if let Some(&id) = ids.get(pos) {
+                    kept_uids.push(u);
+                    kept.push((id, Some(u32::from(first))));
+                }
+            }
+        }
+        let (uid_kept, ids) = (kept_uids, kept);
         log.log(
             Level::Info,
             "acmp",
@@ -3594,7 +3635,14 @@ fn talker_loop(
     // stream, and the dext only delivers frames matching an installed filter.
     // Multi-slot in duplex (one slot per 16R audio source, in its own
     // descriptor-index order), single-stream otherwise.
-    let mut lrx = crate::listenerrx::ListenerRx::with_streams(inbound_stream_ids.clone());
+    // An empty list in duplex means the channel map routes nothing from this
+    // device: bind nothing, rather than the "first stream seen" behaviour an
+    // empty list means to `record`.
+    let mut lrx = if duplex && inbound_stream_ids.is_empty() {
+        crate::listenerrx::ListenerRx::bind_nothing()
+    } else {
+        crate::listenerrx::ListenerRx::with_placed_streams(inbound_stream_ids.clone())
+    };
     // Dext RX filter entries: (stream_id, dest_mac, vlan).
     let mut in_filter: Vec<(u64, [u8; 6], u16)> = Vec::new();
     // Stream ids we have already declared Listener Ready for.
@@ -7550,6 +7598,18 @@ fn discover_listener(
     let mut table = EntityTable::new(our_id);
     let mut last_discover = MachTicks(0);
     let mut peer_adp_dumped = false;
+    let mut first_seen_ns: Option<u64> = None;
+    // Devices in the user's channel map, preferred when several are present.
+    let mapped: Vec<u64> = {
+        let (m, _) =
+            avb_config::routing::RoutingMap::load_if_present(avb_audioring::DEVICE_CHANNELS as u16);
+        let mut v: Vec<u64> = m
+            .map(|m| m.routes().iter().map(|r| r.entity_id).collect())
+            .unwrap_or_default();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
     loop {
         if shutdown_requested() {
             return Err(Exit::Interrupted);
@@ -7596,22 +7656,45 @@ fn discover_listener(
                 }
             }
         }
-        // With --listener we wait for THAT entity; otherwise the sole entity on
-        // the wire. Either way we return its MAC alongside its id.
+        // With --listener we wait for THAT entity. Otherwise every talker
+        // entity seen during a settle window after the first one appears, and
+        // a deterministic choice among them (`choose_device`): never "whoever
+        // answered first", which would swap devices on the user's inputs
+        // depending on timing.
+        let candidates: Vec<Eui64> = match table.sole_talker() {
+            Ok(Some(id)) => vec![id],
+            Ok(None) => Vec::new(),
+            Err(ids) => ids,
+        };
+        if want_id.is_none() && !candidates.is_empty() && first_seen_ns.is_none() {
+            first_seen_ns = Some(ns_since(start));
+        }
+        let settled =
+            first_seen_ns.is_some_and(|t| ns_since(start).saturating_sub(t) >= DISCOVERY_SETTLE_NS);
         let resolved = match want_id {
             Some(id) => table.get(id).map(|e| (id, e.mac)),
-            None => match table.sole_talker() {
-                Ok(Some(id)) => table.get(id).map(|e| (id, e.mac)),
-                Err(ids) => {
+            None if settled => {
+                let ids: Vec<u64> = candidates.iter().map(|e| u64::from_be_bytes(e.0)).collect();
+                let (choice, why) = choose_device(&ids, &mapped);
+                if ids.len() > 1 {
                     log.log(
-                        Level::Error,
+                        Level::Info,
                         "adp",
-                        &format!("{} entities discovered; pass --listener <id>", ids.len()),
+                        &format!(
+                            "{} AVB devices on the link ({}); using 0x{choice:016x} ({why}). \
+                             This build streams with one device at a time.",
+                            ids.len(),
+                            ids.iter()
+                                .map(|i| format!("0x{i:016x}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
                     );
-                    return Err(Exit::TalkerNotFound);
                 }
-                Ok(None) => None,
-            },
+                let id = Eui64::from_u64(choice);
+                table.get(id).map(|e| (id, e.mac))
+            }
+            None => None,
         };
         if let Some((id, mac)) = resolved {
             log.log(
@@ -7635,6 +7718,26 @@ fn discover_listener(
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+/// How long discovery keeps listening after the first device answers, so a
+/// second device's reply is in before one is chosen. Our ENTITY_DISCOVER is
+/// answered immediately; 1.5 s also covers a device answering slowly.
+const DISCOVERY_SETTLE_NS: u64 = 1_500_000_000;
+
+/// Which of several AVB devices this run streams with, deterministically.
+///
+/// A device in the user's channel map wins (the lowest entity id if several
+/// are mapped); otherwise the lowest entity id. Never "whoever answered
+/// first", so the same devices give the same choice on every start.
+fn choose_device(candidates: &[u64], mapped: &[u64]) -> (u64, &'static str) {
+    if let Some(&id) = candidates.iter().filter(|c| mapped.contains(c)).min() {
+        return (id, "it is in your channel map");
+    }
+    (
+        candidates.iter().copied().min().unwrap_or(0),
+        "lowest entity id; none is in your channel map",
+    )
 }
 
 /// Issue `CONNECT_RX_COMMAND` to the 16R (as listener), binding its
@@ -7864,6 +7967,19 @@ mod talker_tests {
             pacing_decision(Some(t - MAX_BEHIND_NS - 1), t, i),
             Pace::Reanchor
         );
+    }
+
+    #[test]
+    fn device_choice_is_deterministic_and_prefers_the_map() {
+        let r16 = 0x000a_92ff_fe03_3ba9;
+        let r24 = 0x000a_92ff_fe04_0001;
+        // Same answer whatever order the devices answered in.
+        assert_eq!(choose_device(&[r24, r16], &[]).0, r16);
+        assert_eq!(choose_device(&[r16, r24], &[]).0, r16);
+        // A mapped device wins even with a higher id.
+        assert_eq!(choose_device(&[r16, r24], &[r24]).0, r24);
+        // A mapped device that is absent does not stop a choice.
+        assert_eq!(choose_device(&[r16], &[r24]).0, r16);
     }
 
     #[test]

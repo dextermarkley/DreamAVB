@@ -28,9 +28,9 @@ pub use shm::{ShmProducer, ShmRing, SHM_NAME, SHM_NAME_OUT};
 
 /// The DreamAVB device's full channel width, in ONE place.
 ///
-/// The 16R exposes eight 8-channel AAF streams in each direction ("Send 1-8"
-/// .. "Send 57-64" and the matching "Return" sinks), so the device is 64
-/// channels wide each way.
+/// 128 each way: room for a 16R (64) plus a 24R or another 64-channel device,
+/// mapped onto these channels by the user's channel map. Fixed, never grown at
+/// runtime, so a DAW's channel list does not change when devices come and go.
 ///
 /// This is shared rather than defined per crate because the two ends MUST
 /// agree and cannot negotiate: a HAL device's channel count is fixed when the
@@ -40,7 +40,7 @@ pub use shm::{ShmProducer, ShmRing, SHM_NAME, SHM_NAME_OUT};
 /// must not be able to drift. The daemon always creates rings this wide
 /// regardless of how many streams are actually bound; the channels belonging
 /// to an unbound stream are simply never written and read as silence.
-pub const DEVICE_CHANNELS: u32 = 64;
+pub const DEVICE_CHANNELS: u32 = 128;
 
 /// Channels carried by one AVB stream, and therefore by one ring slot.
 pub const CHANNELS_PER_STREAM: u32 = 8;
@@ -79,7 +79,8 @@ const _: () = {
         "the device width must be a whole number of streams, or a slot's \
          channel range would run past the end of a frame"
     );
-    assert!(STREAMS_PER_DIRECTION == 8);
+    assert!(STREAMS_PER_DIRECTION == 16);
+    assert!(STREAMS_PER_DIRECTION as usize <= layout::MAX_STREAMS);
 };
 
 /// The media-clock model carried in the ring's clock block (§10.6). Mirrors

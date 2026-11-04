@@ -363,6 +363,29 @@ impl RoutingMap {
         }
     }
 
+    /// Like [`load`](Self::load), but `None` when no map has ever been saved.
+    ///
+    /// The distinction matters: no file means the user has never mapped
+    /// anything, so the daemon keeps the pre-map behaviour (see
+    /// [`input_placement`]); an EMPTY saved map means the user cleared it, and
+    /// nothing is bound.
+    pub fn load_if_present(width: u16) -> (Option<Self>, Vec<String>) {
+        let Some(path) = routing_path() else {
+            return (None, vec!["HOME is unset; no channel map".into()]);
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(t) => {
+                let (m, w) = Self::parse(&t, width);
+                (Some(m), w)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (None, Vec::new()),
+            Err(e) => (
+                None,
+                vec![format!("could not read {}: {e}", path.display())],
+            ),
+        }
+    }
+
     /// Write atomically (temp file + rename), like `Config::save`.
     pub fn save(&self) -> io::Result<PathBuf> {
         let path = routing_path()
@@ -377,11 +400,97 @@ impl RoutingMap {
     }
 }
 
+/// Which of one device's streams to bind on the input side, and the first
+/// DreamAVB input each lands on.
+///
+/// `sources` is the device's bindable streams as `(stream_index, channels)`
+/// in its own AEM order. Returns `(stream_index, first_channel)` for the
+/// streams to bind.
+///
+/// - `map` is `None` (the user has never saved a map): the pre-map layout,
+///   stream `i` of the list on inputs `i * channels ..`, as far as it fits.
+///   This keeps a single-device setup working unchanged.
+/// - `map` is `Some`: exactly the streams that have a whole-stream input
+///   route for this device. Anything unmapped is not bound, so a new device
+///   appears without taking any inputs until the user maps it.
+pub fn input_placement(
+    map: Option<&RoutingMap>,
+    entity_id: u64,
+    sources: &[(u16, u16)],
+    width: u16,
+) -> Vec<(u16, u16)> {
+    match map {
+        None => {
+            let mut out = Vec::new();
+            let mut next: u32 = 0;
+            for &(idx, ch) in sources {
+                if next + u32::from(ch) > u32::from(width) {
+                    break;
+                }
+                out.push((idx, next as u16));
+                next += u32::from(ch);
+            }
+            out
+        }
+        Some(m) => sources
+            .iter()
+            .filter_map(|&(idx, ch)| {
+                m.routes()
+                    .iter()
+                    .find(|r| {
+                        r.direction == Direction::Input
+                            && r.entity_id == entity_id
+                            && r.stream_index == idx
+                            && r.stream_channel == 0
+                            && r.count == ch
+                    })
+                    .map(|r| (idx, r.first))
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const R16: u64 = 0x000a_92ff_fe03_3ba9;
+
+    #[test]
+    fn no_saved_map_keeps_the_single_device_layout() {
+        let srcs: Vec<(u16, u16)> = (1..=8).map(|i| (i, 8)).collect();
+        let p = input_placement(None, R16, &srcs, 128);
+        assert_eq!(p.first(), Some(&(1, 0)));
+        assert_eq!(p.last(), Some(&(8, 56)));
+        assert_eq!(p.len(), 8);
+        // Only what fits.
+        assert_eq!(input_placement(None, R16, &srcs, 20).len(), 2);
+    }
+
+    #[test]
+    fn a_saved_map_binds_only_mapped_streams_where_mapped() {
+        let mut m = RoutingMap::default();
+        m.add(whole(64, R16, 2), 128).unwrap();
+        m.add(whole(0, R16, 5), 128).unwrap();
+        let srcs: Vec<(u16, u16)> = (1..=8).map(|i| (i, 8)).collect();
+        assert_eq!(
+            input_placement(Some(&m), R16, &srcs, 128),
+            vec![(2, 64), (5, 0)]
+        );
+        // Another device with no routes binds nothing: it shows up silently.
+        assert!(input_placement(Some(&m), 0x99, &srcs, 128).is_empty());
+        // An empty saved map (user cleared it) binds nothing either.
+        assert!(input_placement(Some(&RoutingMap::default()), R16, &srcs, 128).is_empty());
+    }
+
+    #[test]
+    fn a_route_whose_width_no_longer_matches_the_stream_is_not_used() {
+        let mut m = RoutingMap::default();
+        m.add(whole(0, R16, 1), 128).unwrap();
+        // The device now reports stream 1 as 4 channels: do not bind it into
+        // an 8-channel route.
+        assert!(input_placement(Some(&m), R16, &[(1, 4)], 128).is_empty());
+    }
     const R24: u64 = 0x000a_92ff_fe04_0001;
     const W: u16 = 128;
 
