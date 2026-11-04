@@ -117,7 +117,7 @@ Use these checks:
 1. The companion should show **Audio running** and a daemon PID.
 2. DreamAVB should show the I210 as active, not faulted.
 3. In UC Surface, `AVB-Audio Mac` should appear as an online source and the
-   `Mac→16R` source banks should be selectable. Do not change UC Control
+   `DreamAVB out` source banks should be selectable. Do not change UC Control
    routing merely to repeat this check; the established Channel 1 settings are
    already correct.
 4. In Audio MIDI Setup or a DAW, select **DreamAVB** as the desired

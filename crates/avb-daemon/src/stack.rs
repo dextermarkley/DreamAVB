@@ -2692,164 +2692,278 @@ fn talker_loop(
             ),
         }
     }
+    // ---- Which devices this run streams with --------------------------------
+    //
+    // With no saved channel map: only the device discovery chose (the
+    // pre-map, one-device behaviour). With a saved map: every device on the
+    // link that the map routes, ordered by its lowest mapped input. A mapped
+    // device that is absent simply has no session; its channels stay where
+    // the map put them and read as silence.
+    let map_width = avb_audioring::DEVICE_CHANNELS as u16;
+    let (routing, rwarn) = avb_config::routing::RoutingMap::load_if_present(map_width);
+    for w in &rwarn {
+        log.log(Level::Warn, "routing", w);
+    }
+    let present: Vec<u64> = seen_devices
+        .iter()
+        .map(|(id, _, _)| u64::from_be_bytes(id.0))
+        .collect();
+    let session_ids = avb_config::routing::session_devices(
+        routing.as_ref(),
+        u64::from_be_bytes(listener_id.0),
+        &present,
+    );
+    let mut devs: Vec<(avb_core::Eui64, avb_core::MacAddr)> = session_ids
+        .iter()
+        .filter_map(|&e| {
+            seen_devices
+                .iter()
+                .find(|(id, _, _)| u64::from_be_bytes(id.0) == e)
+                .map(|&(id, mac, _)| (id, mac))
+        })
+        .collect();
+    if devs.is_empty() {
+        devs.push((listener_id, listener_mac));
+    }
+    log.log(
+        Level::Info,
+        "routing",
+        &format!(
+            "streaming with {} device(s): {}",
+            devs.len(),
+            devs.iter()
+                .map(|(id, _)| format!("0x{:016x}", u64::from_be_bytes(id.0)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
+    // The first session device is the "primary": the media-clock (CRF) sink,
+    // the clock-domain diagnostics and the legacy single-device log lines.
+    let (listener_id, listener_mac) = devs.first().copied().unwrap_or((listener_id, listener_mac));
     let peers = AecpPeers {
         our_mac,
         our_id,
         target: listener_id,
         target_mac: listener_mac,
     };
-    let (stream_format, sink_uids) =
-        derive_talker_format(log, dext, peers, listener_uid, listener_timeout_ns)?;
+
+    // ---- Outbound: one of our streams per device sink -----------------------
+    //
+    // How many streams the ATTACHED dext can carry: its TX token bucket was
+    // sized for 8 class A streams before ABI v5. Read from the dext, never
+    // assumed from our own build, because a dext upgrade only takes effect
+    // once the device re-enumerates.
+    let tx_stream_limit: usize = if dext
+        .device()
+        .info()
+        .map(|i| avb_dext::abi::abi_tx_streams(i.abi_version))
+        .unwrap_or(8)
+        >= 16
+    {
+        16
+    } else {
+        8
+    };
+    struct OutPlan {
+        listener: avb_core::Eui64,
+        listener_mac: avb_core::MacAddr,
+        sink_uid: u16,
+        first_ch: usize,
+    }
+    let mut stream_format: Option<avb_avtp::stream_format::StreamFormat> = None;
+    let mut plans: Vec<OutPlan> = Vec::new();
+    for (di, &(id, mac)) in devs.iter().enumerate() {
+        let p = AecpPeers {
+            our_mac,
+            our_id,
+            target: id,
+            target_mac: mac,
+        };
+        let uid_choice = if devs.len() == 1 { listener_uid } else { None };
+        let (f, sinks) = match derive_talker_format(log, dext, p, uid_choice, listener_timeout_ns) {
+            Ok(x) => x,
+            Err(e) if di == 0 => return Err(e),
+            Err(_) => {
+                log.log(
+                    Level::Warn,
+                    "routing",
+                    &format!(
+                        "device 0x{:016x}: could not read its sinks, so nothing is sent to it",
+                        u64::from_be_bytes(id.0)
+                    ),
+                );
+                continue;
+            }
+        };
+        match stream_format {
+            None => stream_format = Some(f),
+            Some(sf) if sf == f => {}
+            Some(sf) => {
+                log.log(
+                    Level::Warn,
+                    "routing",
+                    &format!(
+                        "device 0x{:016x} wants format 0x{:016x} but this run streams 0x{:016x}; \
+                         nothing is sent to it",
+                        u64::from_be_bytes(id.0),
+                        f.0,
+                        sf.0
+                    ),
+                );
+                continue;
+            }
+        }
+        let block = f.aaf().map_or(8, |a| a.channels);
+        let firsts = avb_config::routing::output_firsts(
+            routing.as_ref(),
+            u64::from_be_bytes(id.0),
+            sinks.len(),
+            block,
+            map_width,
+        );
+        for (k, &sink_uid) in sinks.iter().enumerate() {
+            let Some(&first) = firsts.get(k) else { break };
+            if plans.len() >= tx_stream_limit {
+                log.log(
+                    Level::Warn,
+                    "play",
+                    &format!(
+                        "the attached dext carries at most {tx_stream_limit} outbound streams; \
+                         device 0x{:016x} sink {sink_uid} gets nothing until the updated dext is \
+                         attached (replug the adapter after `avb-installer activate`)",
+                        u64::from_be_bytes(id.0)
+                    ),
+                );
+                break;
+            }
+            plans.push(OutPlan {
+                listener: id,
+                listener_mac: mac,
+                sink_uid,
+                first_ch: usize::from(first),
+            });
+        }
+    }
+    let stream_format = stream_format.ok_or(Exit::TalkerNotFound)?;
     let fmt: AafFormat = stream_format.aaf().ok_or(Exit::DextFault)?;
     let hz = fmt.nsr_hz().ok_or(Exit::DextFault)? as u64;
     let spf = usize::from(fmt.spf);
     let channels = usize::from(fmt.channels);
 
-    // Which of the 16R's STREAM_OUTPUT sources we listen to, for duplex.
-    //
-    // ALL of its AAF audio sources, read from its AEM. Index 0 is `Send CRF`,
-    // its media-clock source, so a hardcoded 0 asked for a stream with no
-    // audio at all; binding only one of the eight audio sources kept 8 of the
-    // device's 64 channels. The stream ids come from GET_STREAM_INFO in
-    // descriptor-index order, which is what makes the inbound channel map
-    // reproducible: ring channels 1-8 are the device's "Send 1-8" on every
-    // run, not whichever stream's packet arrived first.
+    // ---- Inbound: each device's sources, placed by the channel map ----------
     let (inbound_uids, inbound_stream_ids) = if duplex {
-        let (in_fmt, mut uids) = derive_inbound_sources(log, dext, peers, listener_timeout_ns)?;
-        if !all_inbound_streams {
-            // --single-inbound-stream: ONE source, 8 of the 64 channels.
-            uids.truncate(1);
+        let mut all_uids: Vec<(avb_core::Eui64, u16)> = Vec::new();
+        let mut all_ids: Vec<(u64, Option<u32>)> = Vec::new();
+        for (di, &(id, mac)) in devs.iter().enumerate() {
+            let p = AecpPeers {
+                our_mac,
+                our_id,
+                target: id,
+                target_mac: mac,
+            };
+            let entity = u64::from_be_bytes(id.0);
+            let (in_fmt, mut uids) = match derive_inbound_sources(log, dext, p, listener_timeout_ns)
+            {
+                Ok(x) => x,
+                Err(e) if di == 0 && devs.len() == 1 => return Err(e),
+                Err(_) => {
+                    log.log(
+                        Level::Warn,
+                        "routing",
+                        &format!("device 0x{entity:016x}: no inbound sources read; nothing received from it"),
+                    );
+                    continue;
+                }
+            };
+            if !all_inbound_streams {
+                uids.truncate(1);
+                log.log(
+                    Level::Info,
+                    "duplex",
+                    "binding ONE inbound source per device because --single-inbound-stream was given",
+                );
+            }
+            let ids_by_index = read_stream_ids(log, dext, p, &uids, listener_timeout_ns)?;
+            let in_ch = in_fmt.aaf().map_or(0, |a| a.channels);
+            let sources: Vec<(u16, u16)> = uids
+                .iter()
+                .filter(|u| ids_by_index.contains_key(u))
+                .map(|&u| (u, in_ch))
+                .collect();
+            let placed =
+                avb_config::routing::input_placement(routing.as_ref(), entity, &sources, map_width);
             log.log(
                 Level::Info,
-                "duplex",
-                "binding ONE inbound source (8 of the 16R's 64 channels) because \
-                 --single-inbound-stream was given",
-            );
-        }
-        let ids_by_index = read_stream_ids(log, dext, peers, &uids, listener_timeout_ns)?;
-        // Keep only the sources whose id the 16R actually told us: a slot
-        // whose stream id we had to invent could never match an arriving
-        // packet, and would sit in the channel map as permanent silence.
-        let mut uid_kept: Vec<u16> = Vec::new();
-        let mut ids: Vec<u64> = Vec::new();
-        for u in &uids {
-            match ids_by_index.get(u) {
-                Some(&id) => {
-                    uid_kept.push(*u);
-                    ids.push(id);
-                }
-                None => log.log(
-                    Level::Warn,
-                    "duplex",
-                    &format!(
-                        "16R STREAM_OUTPUT {u} did not report a stream id, so it cannot be bound \
-                         — its 8 channels will be absent rather than silent-but-mapped"
-                    ),
+                "routing",
+                &format!(
+                    "{} for device 0x{entity:016x}: {} of {} input stream(s) mapped{}",
+                    if routing.is_some() {
+                        "channel map"
+                    } else {
+                        "no saved channel map, default layout"
+                    },
+                    placed.len(),
+                    sources.len(),
+                    placed
+                        .iter()
+                        .map(|(u, f)| format!(" [stream {u} -> inputs {}-{}]", f + 1, f + in_ch))
+                        .collect::<String>(),
                 ),
-            }
-        }
-        if ids.is_empty() {
-            log.log(
-                Level::Error,
-                "duplex",
-                "no 16R audio source reported a stream id, so nothing can be bound inbound",
             );
-            return Err(Exit::TalkerNotFound);
-        }
-        // The user's channel map decides which of these streams are bound
-        // and on which DreamAVB inputs. With no saved map, the pre-map layout.
-        let in_ch = in_fmt.aaf().map_or(0, |a| a.channels);
-        let width = avb_audioring::DEVICE_CHANNELS as u16;
-        let (routing, rwarn) = avb_config::routing::RoutingMap::load_if_present(width);
-        for w in &rwarn {
-            log.log(Level::Warn, "routing", w);
-        }
-        let entity = u64::from_be_bytes(listener_id.0);
-        let sources: Vec<(u16, u16)> = uid_kept.iter().map(|&u| (u, in_ch)).collect();
-        let placed =
-            avb_config::routing::input_placement(routing.as_ref(), entity, &sources, width);
-        log.log(
-            Level::Info,
-            "routing",
-            &format!(
-                "{} for device 0x{entity:016x}: {} of {} input stream(s) mapped{}",
-                if routing.is_some() {
-                    "channel map"
-                } else {
-                    "no saved channel map, default layout"
-                },
-                placed.len(),
-                sources.len(),
-                placed
-                    .iter()
-                    .map(|(u, f)| format!(" [stream {u} -> inputs {}-{}]", f + 1, f + in_ch))
-                    .collect::<String>(),
-            ),
-        );
-        let mut kept_uids = Vec::with_capacity(placed.len());
-        let mut kept: Vec<(u64, Option<u32>)> = Vec::with_capacity(placed.len());
-        for &(u, first) in &placed {
-            if let Some(pos) = uid_kept.iter().position(|&x| x == u) {
-                if let Some(&id) = ids.get(pos) {
-                    kept_uids.push(u);
-                    kept.push((id, Some(u32::from(first))));
+            for &(u, first) in &placed {
+                if let Some(&sid) = ids_by_index.get(&u) {
+                    all_uids.push((id, u));
+                    all_ids.push((sid, Some(u32::from(first))));
                 }
             }
         }
-        let (uid_kept, ids) = (kept_uids, kept);
         log.log(
             Level::Info,
             "acmp",
             if bind_sinks {
-                "connection management: acting as CONTROLLER — we bind the \
-                 listener's sinks over ACMP (§5.5.2.4 Controller Bind). With \
-                 the dext owning the NIC exclusively, no other controller on \
-                 this machine can reach the AVB link: Apple's ATDECC needs \
-                 Apple's AVB stack, and UC Surface is on a different \
-                 interface. Pass --no-bind-sinks if another controller owns \
-                 the assignments."
+                "connection management: acting as CONTROLLER — we bind each device's \
+                 sinks over ACMP (§5.5.2.4 Controller Bind)"
             } else {
-                "connection management: pure Milan TALKER (--no-bind-sinks) — \
-                 declaring our streams over SRP and answering PROBE_TX, \
-                 binding nothing. Something else must bind the listener's \
-                 sinks or no audio will be routed (§5.5.1.2, §5.5.2.7)."
+                "connection management: pure Milan TALKER (--no-bind-sinks) — declaring our \
+                 streams over SRP and answering PROBE_TX, binding nothing"
             },
         );
         log.log(
             Level::Info,
             "duplex",
             &format!(
-                "inbound: {} stream(s) from 16R STREAM_OUTPUT {uid_kept:?}, format 0x{:016x}, {} channels",
-                ids.len(),
-                in_fmt.0,
-                ids.len() * usize::from(in_fmt.aaf().map(|a| a.channels).unwrap_or(0)),
+                "inbound: {} stream(s) from {} device(s)",
+                all_ids.len(),
+                devs.len()
             ),
         );
-        (uid_kept, ids)
+        (all_uids, all_ids)
     } else {
         (Vec::new(), Vec::new())
     };
 
-    // The outbound stream set: one of OUR STREAM_OUTPUTs per 16R audio sink,
-    // in the sink's own descriptor-index order.
+    // The outbound stream set: one of OUR STREAM_OUTPUTs per device sink.
     //
-    // `out_streams[i]` owns output-ring channels `i * channels ..`, the same
-    // layout the AEM describes and the TX gather uses — one ordering, so what
-    // a controller reads, what the ring holds and what goes on the wire cannot
-    // disagree.
+    // `out_streams[i]` owns output-ring channels `first_ch ..`, from the
+    // channel map (outputs follow each device's input blocks), and is bound
+    // to `sink_uid` on device `listener`.
     struct OutStream {
-        /// Our STREAM_OUTPUT unique id, which is also the ring slot index.
+        /// Our STREAM_OUTPUT unique id.
         uid: u16,
         stream_id: StreamId,
-        /// The 16R STREAM_INPUT sink this stream is bound to.
+        /// The device this stream goes to, and its STREAM_INPUT sink.
+        listener: avb_core::Eui64,
+        listener_mac: avb_core::MacAddr,
         sink_uid: u16,
+        /// First output-ring channel this stream carries.
+        first_ch: usize,
         /// The packetizer for this stream.
         talker: AafTalker,
-        /// The 16R has answered this stream's Talker Advertise with Ready.
+        /// The device has answered this stream's Talker Advertise with Ready.
         ready: bool,
     }
-    let mut out_streams: Vec<OutStream> = Vec::with_capacity(sink_uids.len());
-    for (i, &sink_uid) in sink_uids.iter().enumerate() {
+    let mut out_streams: Vec<OutStream> = Vec::with_capacity(plans.len());
+    for (i, pl) in plans.iter().enumerate() {
         let Ok(uid) = u16::try_from(i) else { break };
         let stream_id = StreamId::from_parts(our_mac, uid);
         let Some(talker) = AafTalker::new(stream_id, fmt) else {
@@ -2863,7 +2977,10 @@ fn talker_loop(
         out_streams.push(OutStream {
             uid,
             stream_id,
-            sink_uid,
+            listener: pl.listener,
+            listener_mac: pl.listener_mac,
+            sink_uid: pl.sink_uid,
+            first_ch: pl.first_ch,
             talker,
             ready: false,
         });
@@ -2871,6 +2988,20 @@ fn talker_loop(
     if out_streams.is_empty() {
         log.log(Level::Error, "play", "no outbound stream to transmit");
         return Err(Exit::DextFault);
+    }
+    for o in &out_streams {
+        log.log(
+            Level::Info,
+            "routing",
+            &format!(
+                "  our stream {}: DreamAVB outputs {}..{} -> device 0x{:016x} sink {}",
+                o.uid,
+                o.first_ch + 1,
+                o.first_ch + channels,
+                u64::from_be_bytes(o.listener.0),
+                o.sink_uid
+            ),
+        );
     }
     let our_stream_id = out_streams
         .first()
@@ -2936,17 +3067,18 @@ fn talker_loop(
         capacity_frames: 65_536,
         streams: out_streams
             .iter()
-            .enumerate()
-            .map(|(i, s)| avb_audioring::StreamSlot {
+            .map(|s| avb_audioring::StreamSlot {
                 stream_id: s.stream_id.0,
-                first_channel: (i * channels) as u32,
+                first_channel: s.first_ch as u32,
                 channels: channels as u32,
                 bit_depth: u32::from(fmt.bit_depth),
             })
             .collect(),
-        channel_map: (0..out_total_ch)
-            .map(|k| ((k / channels.max(1)) as u16, (k % channels.max(1)) as u16))
-            .collect(),
+        channel_map: crate::listenerrx::ring_channel_map(
+            &out_streams.iter().map(|o| o.first_ch).collect::<Vec<_>>(),
+            channels,
+            out_total_ch,
+        ),
     };
     let out_ring = match avb_audioring::ShmRing::create_at(avb_audioring::SHM_NAME_OUT, &cfg) {
         Ok(r) => r,
@@ -2963,7 +3095,7 @@ fn talker_loop(
         Level::Info,
         "play",
         &format!(
-            "output ring {} created: {out_total_ch}-channel ring @ {} Hz, spf={}, {} of {} stream slot(s) transmitted (stream 0x{:016x} -> 16R sink {})",
+            "output ring {} created: {out_total_ch}-channel ring @ {} Hz, spf={}, {} of {} stream slot(s) transmitted (first: stream 0x{:016x} -> sink {})",
             avb_audioring::SHM_NAME_OUT,
             hz,
             spf,
@@ -2973,16 +3105,15 @@ fn talker_loop(
             listener_uid,
         ),
     );
-    if out_slots < avb_audioring::STREAMS_PER_DIRECTION as usize {
+    let untransmitted = out_total_ch.saturating_sub(out_slots * channels);
+    if untransmitted > 0 {
         log.log(
             Level::Warn,
             "play",
             &format!(
-                "output channels {}..{out_total_ch} are produced by CoreAudio and NOT transmitted: \
-                 only {out_slots} of {} talker stream(s) is built, so audio played to them goes \
-                 nowhere rather than to the 16R",
-                out_slots * channels + 1,
-                avb_audioring::STREAMS_PER_DIRECTION,
+                "{untransmitted} of {out_total_ch} output channels are produced by CoreAudio and \
+                 NOT transmitted: only {out_slots} talker stream(s) are built, so audio played to \
+                 an output no device is mapped to goes nowhere",
             ),
         );
     }
@@ -3012,6 +3143,13 @@ fn talker_loop(
         inbound_stream_ids.len(),
     )
     .ok_or(Exit::DextFault)?;
+    // Name each output by the DreamAVB outputs it really carries. The model
+    // names them positionally, which is wrong as soon as the channel map puts
+    // a device's block anywhere but straight after the previous one.
+    let mut model = model;
+    for (s, o) in model.streams.iter_mut().zip(&out_streams) {
+        s.object_name = format!("DreamAVB out {}-{}", o.first_ch + 1, o.first_ch + channels);
+    }
     // The CRF output joins the model only when we really transmit it. An
     // advertised media-clock stream we never send is a stream a controller can
     // bind and then wait on forever.
@@ -3082,7 +3220,7 @@ fn talker_loop(
             dext,
             our_mac,
             our_id,
-            listener_id,
+            o.listener,
             o.stream_id,
             o.sink_uid,
             connect_seq,
@@ -3468,10 +3606,21 @@ fn talker_loop(
     // alone would read every sink EXCEPT the one whose counters answer the
     // question this mode exists to ask: whether the 16R's MEDIA_LOCKED moves
     // when it receives our media clock.
-    let probe_sinks: Vec<u16> = {
-        let mut v: Vec<u16> = out_streams.iter().map(|o| o.sink_uid).collect();
-        if crf_talker.is_some() && !v.contains(&CRF_SINK_UID) {
-            v.push(CRF_SINK_UID);
+    //
+    // Keyed by device as well as sink: with two devices, sink 1 exists on
+    // both, and the media-clock sink is on the primary device only.
+    let primary_entity = u64::from_be_bytes(listener_id.0);
+    let probe_sinks: Vec<(avb_core::Eui64, avb_core::MacAddr, u16)> = {
+        let mut v: Vec<(avb_core::Eui64, avb_core::MacAddr, u16)> = out_streams
+            .iter()
+            .map(|o| (o.listener, o.listener_mac, o.sink_uid))
+            .collect();
+        if crf_talker.is_some()
+            && !v
+                .iter()
+                .any(|&(e, _, s)| e == listener_id && s == CRF_SINK_UID)
+        {
+            v.push((listener_id, listener_mac, CRF_SINK_UID));
         }
         v
     };
@@ -3484,13 +3633,18 @@ fn talker_loop(
     // says bound and the binding is empty. Trusting the flag made the connect
     // loop stop asking after one attempt, so the media clock was transmitted
     // for a whole run at exactly 500 PDU/s to a sink with no talker bound.
-    let expected_stream: std::collections::BTreeMap<u16, u64> = {
-        let mut m: std::collections::BTreeMap<u16, u64> = out_streams
+    let expected_stream: std::collections::BTreeMap<(u64, u16), u64> = {
+        let mut m: std::collections::BTreeMap<(u64, u16), u64> = out_streams
             .iter()
-            .map(|o| (o.sink_uid, o.stream_id.0))
+            .map(|o| {
+                (
+                    (u64::from_be_bytes(o.listener.0), o.sink_uid),
+                    o.stream_id.0,
+                )
+            })
             .collect();
         if crf_talker.is_some() {
-            m.insert(CRF_SINK_UID, crf_stream_id.0);
+            m.insert((primary_entity, CRF_SINK_UID), crf_stream_id.0);
         }
         m
     };
@@ -3527,7 +3681,7 @@ fn talker_loop(
     let mut last_sink_round_ns: u64 = 0;
     // Per sink: (consecutive CONNECT_RX attempts, ns_since(start) of the next
     // permitted attempt). Reset when the device reports it connected.
-    let mut sink_attempts: std::collections::BTreeMap<u16, (u32, u64)> =
+    let mut sink_attempts: std::collections::BTreeMap<(u64, u16), (u32, u64)> =
         std::collections::BTreeMap::new();
     const SINK_CONNECT_BACKOFF_BASE_NS: u64 = 1_000_000_000;
     const SINK_CONNECT_BACKOFF_MAX_NS: u64 = 30_000_000_000;
@@ -3536,7 +3690,8 @@ fn talker_loop(
     // acknowledges a binding, the controller "has no further involvement in
     // the connection process until an unbinding is desired". Entries are
     // never removed.
-    let mut sink_bind_done: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    let mut sink_bind_done: std::collections::BTreeSet<(u64, u16)> =
+        std::collections::BTreeSet::new();
     // ADP advertise state machine (Milan §5.6.3). `pending_advert_at` is the
     // DELAY state: Some(due) means TMR_DELAY is running and the
     // ENTITY_AVAILABLE goes out when it expires.
@@ -3562,7 +3717,7 @@ fn talker_loop(
     // watched banks "flash in and out" of UC Surface, and a controller
     // re-rendering mid-churn is the obvious way to produce that. So connect
     // until the device says it is connected, then stop asking and watch.
-    let mut sink_connected: std::collections::BTreeMap<u16, bool> =
+    let mut sink_connected: std::collections::BTreeMap<(u64, u16), bool> =
         std::collections::BTreeMap::new();
     // How many reconnects the watch triggered after an established binding
     // dropped. Nonzero means something really is unbinding us, which is worth
@@ -4172,8 +4327,9 @@ fn talker_loop(
                         Level::Info,
                         "aem",
                         &format!(
-                            "16R GET_COUNTERS status={st} type={dty:?} index={didx:?} \
+                            "0x{:016x} GET_COUNTERS status={st} type={dty:?} index={didx:?} \
                              counters_valid={} non-zero: [{}] ({} payload B)",
+                            u64::from_be_bytes(cmd.target_entity_id.0),
                             valid.map_or("?".to_string(), |v| format!("0x{v:08x}")),
                             nz.join(" "),
                             cmd.payload.len()
@@ -4209,6 +4365,11 @@ fn talker_loop(
                             .map(u64::from_be_bytes)
                     };
                     let didx = u16at(2);
+                    // The responder. With more than one device, sink numbers
+                    // repeat across devices, so every lookup below is keyed
+                    // by (entity, sink). AECP responses carry the responding
+                    // entity in target_entity_id (1722.1-2021 §9.2.1.1.7).
+                    let resp_ent = u64::from_be_bytes(cmd.target_entity_id.0);
                     let dmac = p
                         .get(28..34)
                         .map(|b| {
@@ -4221,13 +4382,15 @@ fn talker_loop(
                     // What WE send to that sink, for side-by-side comparison.
                     let ours = out_streams
                         .iter()
-                        .find(|o| Some(o.sink_uid) == didx)
+                        .find(|o| {
+                            Some(o.sink_uid) == didx && u64::from_be_bytes(o.listener.0) == resp_ent
+                        })
                         .map(|o| (o.stream_id.0, stream_dest_mac(o.stream_id)));
                     log.log(
                         Level::Info,
                         "aem",
                         &format!(
-                            "16R GET_STREAM_INFO status={} sink={didx:?} flags={} \
+                            "0x{resp_ent:016x} GET_STREAM_INFO status={} sink={didx:?} flags={} \
                              format={} stream_id={} dest_mac={dmac} vlan={:?} \
                              msrp_acc_lat={:?} msrp_failure_code={:?} flags_ex={} \
                              probing/acmp=0x{:02x} ({} payload B)",
@@ -4253,7 +4416,8 @@ fn talker_loop(
                         let yn = |b: u32| if fl & b != 0 { "yes" } else { "no" };
                         // Remember it, so the connect loop can stop asking.
                         let mut changed = false;
-                        if let Some(ix) = didx {
+                        if let Some(sink) = didx {
+                            let ix = (resp_ent, sink);
                             // A binding counts only when the device reports
                             // OUR stream id on that sink. The CONNECTED flag
                             // alone is not evidence: sink 0 sets it while
@@ -4274,7 +4438,8 @@ fn talker_loop(
                                     Level::Warn,
                                     "aem",
                                     &format!(
-                                        "sink {ix} reports CONNECTED but carries stream \
+                                        "device 0x{resp_ent:016x} sink {sink} reports \
+                                         CONNECTED but carries stream \
                                          0x{reported_sid:016x}, not the 0x{:016x} we bound \
                                          — treating it as UNBOUND and retrying, because the \
                                          flag describes the sink's saved state rather than a \
@@ -4297,7 +4462,8 @@ fn talker_loop(
                                     Level::Warn,
                                     "aem",
                                     &format!(
-                                        "sink {ix} was bound and is now UNBOUND — \
+                                        "device 0x{resp_ent:016x} sink {sink} was bound \
+                                         and is now UNBOUND — \
                                          NOT re-binding: an unbind is a \
                                          controller's deliberate act, and Milan \
                                          §5.5.1.4 makes re-establishment the \
@@ -4516,7 +4682,7 @@ fn talker_loop(
                                 Level::Info,
                                 "msrp",
                                 &format!(
-                                    "16R declared Listener Ready for our stream {} (0x{:016x}) — accepted",
+                                    "a device declared Listener Ready for our stream {} (0x{:016x}) — accepted",
                                     o.uid, o.stream_id.0
                                 ),
                             );
@@ -4555,7 +4721,7 @@ fn talker_loop(
                                 Level::Warn,
                                 "msrp",
                                 &format!(
-                                    "16R withdrew Listener Ready for our stream {} (0x{:016x})",
+                                    "a device withdrew Listener Ready for our stream {} (0x{:016x})",
                                     o.uid, o.stream_id.0
                                 ),
                             );
@@ -4588,8 +4754,11 @@ fn talker_loop(
                     talker: t,
                 } = ev
                 {
-                    // Never our own stream reflected back at us.
-                    if stream_id.0 != our_stream_id.0 {
+                    // Never one of our own streams reflected back at us. All
+                    // of ours (audio and CRF) carry our MAC in the top 48
+                    // bits of the stream id (1722-2016 §4.4.4.30), so the
+                    // prefix covers every one, not just the first.
+                    if stream_id.0 >> 16 != our_stream_id.0 >> 16 {
                         if let Some(code) = t.failure_code() {
                             // A Talker FAILED is not a usable advertise: the
                             // 16R is saying it will not stream this source.
@@ -4597,7 +4766,7 @@ fn talker_loop(
                                 Level::Warn,
                                 "srp",
                                 &format!(
-                                    "16R TALKER FAILED id=0x{:016x} code={code} — it refuses to stream this source to us",
+                                    "TALKER FAILED id=0x{:016x} code={code} — the device refuses to stream this source to us",
                                     stream_id.0
                                 ),
                             );
@@ -4626,7 +4795,7 @@ fn talker_loop(
                                     Level::Info,
                                     "srp",
                                     &format!(
-                                        "16R talker advertise: id=0x{:016x} dest={dmac:02x?} vid={ta_vid} -> declared Listener Ready",
+                                        "talker advertise: id=0x{:016x} dest={dmac:02x?} vid={ta_vid} -> declared Listener Ready",
                                         stream_id.0
                                     ),
                                 );
@@ -4754,17 +4923,18 @@ fn talker_loop(
             // media-clock sink is not in `out_streams`, so a loop over that
             // list alone would never retry the one bind the device had not
             // already saved from a previous run.
-            for (&sink_uid, &sid) in &expected_stream {
-                if sink_bind_done.contains(&sink_uid) {
+            for (&key, &sid) in &expected_stream {
+                let (dev_entity, sink_uid) = key;
+                if sink_bind_done.contains(&key) {
                     continue;
                 }
                 // Skip only on positive evidence. An unasked sink (absent) and
                 // one reported unbound both still need binding, so a probe
                 // that never answers cannot leave a sink unbound forever.
-                if sink_connected.get(&sink_uid) == Some(&true) {
+                if sink_connected.get(&key) == Some(&true) {
                     // Bound -- by us or by the device's own saved state. Done
                     // with it, permanently.
-                    sink_bind_done.insert(sink_uid);
+                    sink_bind_done.insert(key);
                     continue;
                 }
                 // Back off per sink, but ONLY against a sink the device has
@@ -4780,8 +4950,8 @@ fn talker_loop(
                 // narrower. Doubling from 1 s to a 30 s ceiling lets a
                 // transient failure recover promptly while a permanent one
                 // settles into a slow poll.
-                if sink_connected.get(&sink_uid) == Some(&false) {
-                    let st = sink_attempts.entry(sink_uid).or_insert((0u32, 0u64));
+                if sink_connected.get(&key) == Some(&false) {
+                    let st = sink_attempts.entry(key).or_insert((0u32, 0u64));
                     if ns_since(start) < st.1 {
                         continue;
                     }
@@ -4795,10 +4965,10 @@ fn talker_loop(
                             Level::Warn,
                             "acmp",
                             &format!(
-                                "sink {} still unbound after {} CONNECT_RX attempts \
-                                 against its own 'not connected' report — backing \
-                                 off to a slow retry",
-                                sink_uid, st.0
+                                "device 0x{:016x} sink {} still unbound after {} \
+                                 CONNECT_RX attempts against its own 'not connected' \
+                                 report — backing off to a slow retry",
+                                dev_entity, sink_uid, st.0
                             ),
                         );
                     }
@@ -4808,7 +4978,7 @@ fn talker_loop(
                     dext,
                     our_mac,
                     our_id,
-                    listener_id,
+                    avb_core::Eui64(dev_entity.to_be_bytes()),
                     avb_core::StreamId(sid),
                     sink_uid,
                     connect_seq,
@@ -4969,13 +5139,13 @@ fn talker_loop(
             if last_in_connect.0 == 0 || ns_since(last_in_connect) >= 1_000_000_000 {
                 use avb_avdecc::acmp::Acmpdu;
                 use avb_avdecc::constants::{acmp_msg, acmp_status};
-                for (sink_idx, &uid) in inbound_uids.iter().enumerate() {
+                for (sink_idx, &(dev, uid)) in inbound_uids.iter().enumerate() {
                     let pdu = Acmpdu {
                         message_type: acmp_msg::CONNECT_TX_COMMAND,
                         status: acmp_status::SUCCESS,
                         stream_id: avb_core::StreamId(0),
                         controller_entity_id: our_id,
-                        talker_entity_id: listener_id,
+                        talker_entity_id: dev,
                         listener_entity_id: our_id,
                         talker_unique_id: uid,
                         // OUR STREAM_INPUT index, which is the position in
@@ -5095,12 +5265,12 @@ fn talker_loop(
             sink_watch_verbose = diagnostic_round;
             sink_probes_done += 1;
             last_sink_round_ns = ns_since(start);
-            for &sink_uid in &probe_sinks {
+            for &(sink_dev, sink_mac, sink_uid) in &probe_sinks {
                 let mut pl = Vec::with_capacity(4);
                 pl.extend_from_slice(&avb_avdecc::constants::desc::STREAM_INPUT.to_be_bytes());
                 pl.extend_from_slice(&sink_uid.to_be_bytes());
                 let hdr = EthHeader {
-                    dst: peers.target_mac,
+                    dst: sink_mac,
                     src: our_mac,
                     vlan: None,
                     ethertype: avb_avtp::common::ETHERTYPE_AVTP,
@@ -5126,7 +5296,7 @@ fn talker_loop(
                     let q = avb_avdecc::aecp::AemPdu {
                         message_type: avb_avdecc::constants::aecp_msg::AEM_COMMAND,
                         status: avb_avdecc::constants::aecp_status::SUCCESS,
-                        target_entity_id: peers.target,
+                        target_entity_id: sink_dev,
                         controller_entity_id: our_id,
                         sequence_id: 0xC000 | sink_uid,
                         command_type: ct,
@@ -5689,13 +5859,13 @@ fn talker_loop(
         // dext in a single `send_batch` call below.
         let mut tx_staged_len = 0usize;
         for i in 0..out_streams.len() {
-            let (uid, dst) = match out_streams.get(i) {
-                Some(o) => (o.uid, stream_dest_mac(o.stream_id)),
+            let (first_ch, dst) = match out_streams.get(i) {
+                Some(o) => (o.first_ch, stream_dest_mac(o.stream_id)),
                 None => break,
             };
-            // Gather this stream's channels out of the 64-channel ring frame.
-            // Allocation-free: both buffers are sized once above.
-            let first_ch = usize::from(uid) * channels;
+            // Gather this stream's channels out of the full-width ring frame,
+            // starting at the channel the map gives it. Allocation-free: both
+            // buffers are sized once above.
             for f in 0..spf {
                 let src = f * frame_bytes + first_ch * 4;
                 let dst_off = f * stream_frame_bytes;
@@ -5733,7 +5903,7 @@ fn talker_loop(
             };
             match packed {
                 Ok(n) => {
-                    if uid == 0 && !tx_channel1_signal_dumped {
+                    if first_ch == 0 && !tx_channel1_signal_dumped {
                         let channel1_sample = stream_scratch
                             .as_chunks::<4>()
                             .0
@@ -5800,7 +5970,7 @@ fn talker_loop(
                     log.log(
                         Level::Error,
                         "play",
-                        &format!("packetize error on stream {uid}: {e:?}"),
+                        &format!("packetize error on stream {i}: {e:?}"),
                     );
                 }
             }
@@ -7780,8 +7950,18 @@ fn discover_listener(
         if want_id.is_none() && !candidates.is_empty() && first_seen_ns.is_none() {
             first_seen_ns = Some(ns_since(start));
         }
-        let settled =
-            first_seen_ns.is_some_and(|t| ns_since(start).saturating_sub(t) >= DISCOVERY_SETTLE_NS);
+        // Settled once the window has passed AND every device in the user's
+        // channel map has answered, or a longer bound has passed (a mapped
+        // device that is switched off must not stop the others streaming).
+        // Measured with a 16R and a 24R behind a MOTU switch: a 1.5 s window
+        // alone saw only one of them on most starts.
+        let all_mapped_seen = mapped
+            .iter()
+            .all(|m| candidates.iter().any(|c| u64::from_be_bytes(c.0) == *m));
+        let settled = first_seen_ns.is_some_and(|t| {
+            let waited = ns_since(start).saturating_sub(t);
+            waited >= DISCOVERY_SETTLE_NS && (all_mapped_seen || waited >= MAPPED_DEVICE_WAIT_NS)
+        });
         let resolved = match want_id {
             Some(id) => table.get(id).map(|e| (id, e.mac)),
             None if settled => {
@@ -7848,6 +8028,12 @@ type DiscoveredPeers = (
 /// second device's reply is in before one is chosen. Our ENTITY_DISCOVER is
 /// answered immediately; 1.5 s also covers a device answering slowly.
 const DISCOVERY_SETTLE_NS: u64 = 1_500_000_000;
+
+/// How long discovery waits for a device in the channel map that has not
+/// answered yet, before going ahead with the ones that have. ADP adverts come
+/// every few seconds (Milan TMR_ADVERTISE 5 s + up to 4 s delay), and our
+/// ENTITY_DISCOVER is repeated every 2 s.
+const MAPPED_DEVICE_WAIT_NS: u64 = 10_000_000_000;
 
 /// Which of several AVB devices this run streams with, deterministically.
 ///

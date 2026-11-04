@@ -25,7 +25,7 @@
 // that fallback an upgraded client would refuse the running dext in the window
 // between `avb-installer activate` and the reboot that actually loads it --
 // a PCI-matched dext does not terminate while it owns its device.
-#define AVB_ABI_VERSION 4u
+#define AVB_ABI_VERSION 5u
 #define AVB_ABI_VERSION_SEND_FRAMES 4u  // first version with kAvbSelSendFrames
 
 // AvbInfo.nic_kind
@@ -191,19 +191,19 @@ struct AvbRxBatch {
 // the stream reservation handshake could not complete (measured: 382 553 of
 // 441 373 frames dropped in one 60 s run).
 //
-// The PreSonus 16R exposes 8 AAF audio streams in each direction (8 channels
-// each, 64 channels total), so a full-width talker sends
-// AVB_TX_MAX_CLASS_A_STREAMS * 8000 = 64 000 frames/s. 80 000/s leaves
-// 16 000 frames/s that a stream can never take, against the ~100/s control
-// traffic actually needs.
+// DreamAVB talks to up to two devices of 8 AAF streams each (e.g. a 16R and a
+// 24R, 128 channels), so a full-width talker sends
+// AVB_TX_MAX_CLASS_A_STREAMS * 8000 = 128 000 frames/s. 160 000/s leaves
+// 32 000 frames/s that a stream can never take, against the ~100/s control
+// traffic actually needs. (ABI v5; v4 had 8 streams and 80 000/s.)
 //
 // HONEST NOTE on what this still bounds. At the old 20 000/s the ceiling also
 // bounded BANDWIDTH: 20 000 frames at the 1522 B maximum is ~243 Mbit/s, a
 // quarter of a 1 Gbit link. At 80 000/s that is no longer true (80 000 * 1522 B
 // would be ~974 Mbit/s, the whole link). It remains a real bound on what we
 // actually emit, because every frame this driver sends is a fixed, known size:
-// a 48 kHz / 8 ch / 6 spf / 32-bit AAF frame is 234 B, so 80 000/s is
-// ~150 Mbit/s, and the control frames are smaller still. A frame-count ceiling
+// a 48 kHz / 8 ch / 6 spf / 32-bit AAF frame is 234 B, so 160 000/s is
+// ~300 Mbit/s, and the control frames are smaller still. A frame-count ceiling
 // cannot bound bytes for a client that varies frame size; bounding bytes would
 // need a second byte-rate bucket, which is the right fix if this driver ever
 // carries a variable-size payload.
@@ -212,8 +212,8 @@ struct AvbRxBatch {
 // activate`): it is compiled in, not read from the client.
 //
 // Must divide 1e9 evenly (see the static_assert on kTxTokenNs).
-#define AVB_TX_MAX_CLASS_A_STREAMS 8u       // the 16R's AAF streams per direction
-#define AVB_TX_RATE_PER_SEC     80000u      // dext token bucket (SAF-6)
+#define AVB_TX_MAX_CLASS_A_STREAMS 16u      // two devices x 8 AAF streams (16R + 24R)
+#define AVB_TX_RATE_PER_SEC     160000u     // dext token bucket (SAF-6)
 #define AVB_TX_BURST            64u
 
 // kAvbSelSendFrames (ABI v4): one user->dext call carrying a whole class-A

@@ -13,7 +13,7 @@
 /// activate` and the reboot that loads the replacement the running dext is
 /// still the old one — a client that demanded v4 would be dead in that window.
 /// Compare against [`ABI_VERSION_SEND_FRAMES`] to pick the path instead.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// First ABI version with [`sel::SEND_FRAMES`]; below this, batch by looping.
 pub const ABI_VERSION_SEND_FRAMES: u32 = 4;
@@ -37,6 +37,20 @@ pub const fn abi_supported(v: u32) -> bool {
 /// Whether a dext reporting ABI `v` implements [`sel::SEND_FRAMES`].
 pub const fn abi_has_send_frames(v: u32) -> bool {
     v >= ABI_VERSION_SEND_FRAMES
+}
+
+/// First ABI whose TX ceiling carries two devices' streams (16 class A).
+pub const ABI_VERSION_TX16: u32 = 5;
+
+/// How many class A streams a dext reporting ABI `v` can transmit at once.
+/// v5 raised the token bucket from 80 000 to 160 000 frames/s; the layout is
+/// otherwise unchanged, so v3/v4 are still driven, at 8 streams.
+pub const fn abi_tx_streams(v: u32) -> u32 {
+    if v >= ABI_VERSION_TX16 {
+        16
+    } else {
+        8
+    }
 }
 
 /// `AvbInfo::nic_kind` values.
@@ -262,9 +276,10 @@ pub const CONSUMER_MEM_SIZE: u32 = 16384;
 /// S_max.
 pub const MAX_STREAMS: u32 = 16;
 pub const STEP_CLOCK_MAX_NS: i64 = 1_000_000_000;
-/// The 16R's AAF audio streams per direction (8 channels each, 64 total). The
-/// TX ceiling has to clear all of them at once.
-pub const TX_MAX_CLASS_A_STREAMS: u32 = 8;
+/// Class A streams we transmit at once: two devices of 8 AAF streams each
+/// (16R + 24R), the 128-channel DreamAVB width. The TX ceiling has to clear
+/// all of them at once.
+pub const TX_MAX_CLASS_A_STREAMS: u32 = 16;
 /// Dext TX token bucket (SAF-6). Shared across ALL transmitted frames, audio
 /// and control alike, so it must clear every SR class A stream we talk at once
 /// (8000 frames/s each, one per 125 us observation interval) with headroom
@@ -273,7 +288,7 @@ pub const TX_MAX_CLASS_A_STREAMS: u32 = 8;
 ///
 /// Changing this requires REINSTALLING the dext: it is compiled into the
 /// driver, not supplied by the client.
-pub const TX_RATE_PER_SEC: u32 = 80000;
+pub const TX_RATE_PER_SEC: u32 = 160000;
 // Compile-time, so the bound holds even if the test below is ever removed.
 // Mirrors the `static_assert`s in `driver/AVBShared.h` / `I210Logic.hpp`.
 const _: () = {
@@ -809,8 +824,13 @@ mod tests {
 
     #[test]
     fn selectors_match_header() {
-        assert_eq!(ABI_VERSION, 4);
+        assert_eq!(ABI_VERSION, 5);
         assert_eq!(ABI_VERSION_SEND_FRAMES, 4);
+        assert_eq!(ABI_VERSION_TX16, 5);
+        // An older dext still drives, at the old 8-stream ceiling.
+        assert_eq!(abi_tx_streams(3), 8);
+        assert_eq!(abi_tx_streams(4), 8);
+        assert_eq!(abi_tx_streams(5), 16);
         assert_eq!(sel::SHUTDOWN_DATAPATH, 9);
         assert_eq!(sel::STEP_CLOCK, 10);
         assert_eq!(sel::GET_COUNTERS, 11);
@@ -842,8 +862,8 @@ mod tests {
         assert_eq!(CONSUMER_MEM_SIZE, 16384);
         assert_eq!(MAX_STREAMS, 16);
         assert_eq!(STEP_CLOCK_MAX_NS, 1_000_000_000);
-        assert_eq!(TX_RATE_PER_SEC, 80000);
-        assert_eq!(TX_MAX_CLASS_A_STREAMS, 8);
+        assert_eq!(TX_RATE_PER_SEC, 160000);
+        assert_eq!(TX_MAX_CLASS_A_STREAMS, 16);
         assert_eq!(TX_BURST, 64);
         assert_eq!(RX_CLASS_COUNT, 7);
         assert_eq!(RXF_TS_HW, 1);

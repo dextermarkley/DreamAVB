@@ -26,7 +26,7 @@ static int gChecks = 0;
     } while (0)
 
 // ABI sizes and offsets (mirrored by the Rust abi.rs offset_of!/size_of tests).
-static_assert(AVB_ABI_VERSION == 4);
+static_assert(AVB_ABI_VERSION == 5);
 static_assert(sizeof(AvbInfo) == 60);
 static_assert(sizeof(AvbClockSample) == 24);
 static_assert(sizeof(AvbRxEntry) == 152);
@@ -55,8 +55,8 @@ static_assert(AVB_RX_SLOT_DATA_MAX == 1984 && AVB_RX_CTL_SLOTS == 512 && AVB_RX_
 static_assert(AVB_RX_CTL_OFFSET == 16384 && AVB_RX_AUDIO_OFFSET == 16384 + 512 * 2048);
 static_assert(AVB_RX_MEM_SIZE == 17842176u && AVB_CONSUMER_MEM_SIZE == 16384);
 static_assert(AVB_MAX_STREAMS == 16 && AVB_STEP_CLOCK_MAX_NS == 1000000000ll);
-static_assert(AVB_TX_RATE_PER_SEC == 80000 && AVB_TX_BURST == 64);
-static_assert(AVB_TX_MAX_CLASS_A_STREAMS == 8);
+static_assert(AVB_TX_RATE_PER_SEC == 160000 && AVB_TX_BURST == 64);
+static_assert(AVB_TX_MAX_CLASS_A_STREAMS == 16);
 // The ceiling must clear EVERY SR class A stream we talk at once (8000
 // frames/s each, one per 125 us) with headroom for control traffic, since the
 // bucket is shared across all TX. The 16R has 8 AAF streams per direction, so

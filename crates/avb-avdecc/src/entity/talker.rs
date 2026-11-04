@@ -284,9 +284,10 @@ pub fn talker_model(
         .map(|(i, &stream_id)| TalkerStream {
             stream_id,
             // Named by the channel range it carries, so a controller's view
-            // lines up with the 16R's own "Send 1-8" style labels.
+            // lines up with a mixer's own "Send 1-8" style labels. Positional;
+            // a caller that places streams elsewhere renames them.
             object_name: format!(
-                "Mac→16R {}-{}",
+                "DreamAVB out {}-{}",
                 i * usize::from(channels) + 1,
                 (i + 1) * usize::from(channels)
             ),
