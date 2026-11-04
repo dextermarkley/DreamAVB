@@ -86,7 +86,8 @@ define_class!(
         fn needs_user_approval(&self, _request: &OSSystemExtensionRequest) {
             println!(
                 "user approval required: open System Settings > General > Login Items & \
-                 Extensions > Driver Extensions and enable AVBI210Driver. Waiting..."
+                 Extensions > Driver Extensions and enable the AVB driver it lists (AVBI210Driver \
+                 or AVBBcmDriver). Waiting..."
             );
         }
 
