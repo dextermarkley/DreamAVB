@@ -63,3 +63,14 @@ provider re-matches to our dext with the chip still configured:
 
 If Apple's stop path resets the chip, the snapshot will show reset values
 again; that is itself an answer (Apple's state cannot be observed this way).
+
+### Result: Apple's driver cannot be evicted in place
+
+`sudo kmutil unload -c BCM5701Enet` (user, 2026-11-04) had no effect: the
+same `BCM5701Enet` instance (registry id 0x1000058b1) stayed attached and
+`com.apple.iokit.AppleBCM5701Ethernet` 11.0.0 stayed loaded. The kext has no
+bundle under `/System/Library/Extensions`; it lives in the boot kernel
+collection, whose kexts cannot be unloaded. So the only ways to hand our dext
+the device are re-enumeration (a replug, which gives our dext a fresh,
+unconfigured chip) or a reboot, neither of which preserves Apple's register
+state. Observing Apple's configuration from the chip is not possible this way.
