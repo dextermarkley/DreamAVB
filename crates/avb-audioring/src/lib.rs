@@ -45,6 +45,31 @@ pub const DEVICE_CHANNELS: u32 = 64;
 /// Channels carried by one AVB stream, and therefore by one ring slot.
 pub const CHANNELS_PER_STREAM: u32 = 8;
 
+/// The presentation offset our talker stamps: how far ahead of gPTP now each
+/// outbound AVTP timestamp is. It is all of the output path's latency beyond
+/// the IO buffer, so the CoreAudio plug-in reports exactly this to the HAL and
+/// the daemon stamps exactly this. One constant, so the two cannot disagree.
+///
+/// 2 ms, the Milan maximum (Baseline Interoperability Spec §7.2.1: a
+/// listener buffers up to 2 ms + 125 us + 1 us).
+///
+/// Smaller offsets are conformant but the 16R does not hold lock on them.
+/// Measured on the live 16R over 20 s per setting: at 1 ms and at 1.5 ms all
+/// eight sinks cycled MEDIA_LOCKED / MEDIA_UNLOCKED about once every 5 s with
+/// no new LATE_TIMESTAMP, and at 2 ms the lock counters did not move. Do not
+/// lower this to save latency without repeating that measurement.
+pub const TALKER_PRESENTATION_OFFSET_NS: u64 = 2_000_000;
+
+/// Output-ring frames the talker keeps queued at the LOW point of each write
+/// burst, i.e. the floor the queue is trimmed to. The rest of the queue is
+/// the IO buffer the HAL already counts. Shared so the plug-in reports exactly
+/// the queue the daemon maintains: 24 frames = 4 PDUs = 0.5 ms at 48 kHz.
+///
+/// Measured before the trim existed: a standing backlog of ~518 frames
+/// (10.8 ms) that nothing ever drained, because the plug-in writes and the
+/// talker reads at the same clock and keep whatever excess they start with.
+pub const OUTPUT_QUEUE_KEEP_FRAMES: u64 = 24;
+
 /// How many AVB streams make up the device's width in one direction.
 pub const STREAMS_PER_DIRECTION: u32 = DEVICE_CHANNELS / CHANNELS_PER_STREAM;
 

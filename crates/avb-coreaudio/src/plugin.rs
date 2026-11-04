@@ -55,7 +55,19 @@ const MANUFACTURER: &str = "AVB-Audio";
 /// round power-of-two keeps GetZeroTimeStamp arithmetic exact.
 const RING_FRAMES: u32 = 8192;
 const SAFETY_OFFSET: u32 = 0;
-const LATENCY: u32 = 0;
+
+/// `kAudioDevicePropertyLatency` for a scope: what lies between the IO buffer
+/// and the wire that the HAL cannot see. A DAW adds these to its buffer sizes
+/// for delay compensation, so an unreported frame here is a recording placed
+/// late by that frame.
+fn device_latency(scope: UInt32) -> u32 {
+    match scope {
+        x if x == kAudioObjectPropertyScopeInput => INPUT_LATENCY_FRAMES,
+        x if x == kAudioObjectPropertyScopeOutput => OUTPUT_LATENCY_FRAMES,
+        // Global/wildcard: the HAL asks per scope; report the larger.
+        _ => INPUT_LATENCY_FRAMES.max(OUTPUT_LATENCY_FRAMES),
+    }
+}
 
 /// Write a value of type `T` into `out_data` if there is room; set the written
 /// size. Returns the status.
@@ -537,9 +549,12 @@ pub extern "C" fn get_property_data(
             {
                 put(1u32, in_data_size, out_data_size, out_data)
             }
-            (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyLatency => {
-                put(LATENCY, in_data_size, out_data_size, out_data)
-            }
+            (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertyLatency => put(
+                device_latency(a.mScope),
+                in_data_size,
+                out_data_size,
+                out_data,
+            ),
             (K_DEVICE_OBJECT, s) if s == kAudioDevicePropertySafetyOffset => {
                 put(SAFETY_OFFSET, in_data_size, out_data_size, out_data)
             }
@@ -696,10 +711,98 @@ use avb_audioring::{Consumer, ShmRing};
 /// borrow of the ring held in the same struct).
 struct IoState {
     shm: ShmRing,
-    read_frame: u64,
+    /// Our read position. None until the first IO cycle, which is when the
+    /// IO buffer size (and so the cushion we need) is known.
+    read_frame: Option<u64>,
+    /// Inode of the input ring file this mapping came from. The daemon
+    /// unlinks and recreates the ring on every start, and our mapping of the
+    /// old inode stays valid, so without this the input device keeps reading a
+    /// deleted ring whose write frontier never moves: silence from the 16R
+    /// after any daemon restart, until coreaudiod itself restarts. Same defect
+    /// the output side had; see `out_ring_is_stale`.
+    ino: u64,
 }
 
 static IO: Mutex<Option<IoState>> = Mutex::new(None);
+
+/// The inode of the input ring path right now, or `None` if it is absent.
+fn in_ring_ino() -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(avb_audioring::SHM_NAME)
+        .ok()
+        .map(|m| m.ino())
+}
+
+/// Attach the daemon's input ring. The read position is set on the first IO
+/// cycle (see `input_cursor`).
+fn attach_in() -> Option<IoState> {
+    // Inode BEFORE mapping, so a swap between the two is caught next check.
+    let ino = in_ring_ino()?;
+    let shm = ShmRing::attach().ok()?;
+    Some(IoState {
+        shm,
+        read_frame: None,
+        ino,
+    })
+}
+
+/// Frames of cushion kept behind the input ring's write frontier, on top of
+/// one IO buffer. Measured: the daemon's write frontier stays within 30
+/// frames (0.62 ms) of an ideal 48 kHz line, and with a 128 cushion in REAPER
+/// at a 32-frame block the plug-in's lag never fell below 94 (34 below
+/// target). 64 (1.3 ms) is 2x the worst frontier lag. It replaced 128, and
+/// before that a fixed 2048-frame (43 ms) head start; it is in the round-trip
+/// latency once, so it is kept as small as the measured jitter allows.
+const INPUT_CUSHION_FRAMES: u64 = 64;
+
+/// Backlog beyond the target that is tolerated before snapping back.
+///
+/// Measured in REAPER at a 32-frame block through an aggregate device: the
+/// backlog grew once, during IO start, to ~1 470 frames and then sat there,
+/// because a 2 048-frame slack never fired. That was 1 310 frames (27 ms) of
+/// input latency nothing reported. 256 frames is 8x the daemon's measured
+/// delivery jitter, so it fires on a real backlog and not on jitter.
+const INPUT_RESYNC_SLACK_FRAMES: u64 = 256;
+
+/// Input latency reported to Core Audio: the cushion the plug-in keeps
+/// behind the newest received frame. The HAL already accounts for the IO
+/// buffer itself.
+const INPUT_LATENCY_FRAMES: u32 = INPUT_CUSHION_FRAMES as u32;
+
+/// Output latency reported to Core Audio: the AVB presentation offset the
+/// daemon's talker stamps, plus the output-ring floor it keeps queued ahead of
+/// each write, both read from the constants the daemon itself uses. 96 + 24 =
+/// 120 frames at 2 ms / 48 kHz.
+const OUTPUT_LATENCY_FRAMES: u32 =
+    (DEVICE_RATE * avb_audioring::TALKER_PRESENTATION_OFFSET_NS as f64 / 1e9) as u32
+        + avb_audioring::OUTPUT_QUEUE_KEEP_FRAMES as u32;
+
+/// Where to read the next input IO buffer from. `want` is the IO buffer size.
+///
+/// The target is `want + INPUT_CUSHION_FRAMES` behind the write frontier: the
+/// buffer the HAL is asking for, plus a cushion for delivery jitter. Snaps to
+/// the target on the first cycle and whenever the backlog has grown past it by
+/// more than the slack; otherwise keeps the running cursor, because moving it
+/// would skip or repeat audio. It never moves the cursor backwards, which
+/// would replay frames already delivered.
+fn input_cursor(write: u64, cursor: Option<u64>, want: u64) -> u64 {
+    let target = write.saturating_sub(want + INPUT_CUSHION_FRAMES);
+    match cursor {
+        None => target,
+        Some(c)
+            if write.saturating_sub(c)
+                > want + INPUT_CUSHION_FRAMES + INPUT_RESYNC_SLACK_FRAMES =>
+        {
+            target.max(c)
+        }
+        Some(c) => c,
+    }
+}
+
+/// True if the mapping we hold is not the ring the daemon is writing now.
+fn in_ring_is_stale(state: &IoState) -> bool {
+    in_ring_ino().is_none_or(|ino| ino != state.ino)
+}
 
 /// Output (playback) IO state (Phase 1b-2). The plug-in is the PRODUCER on the
 /// output ring: WriteMix hands us mixed f32 samples, we convert to S32 and
@@ -783,17 +886,16 @@ pub extern "C" fn start_io(
     // error — IO proceeds as silence and a later StartIO (after the daemon
     // starts) will attach.
     if let Ok(mut guard) = IO.lock() {
+        if guard.as_ref().is_some_and(in_ring_is_stale) {
+            *guard = None;
+        }
         if guard.is_none() {
-            match ShmRing::attach() {
-                Ok(shm) => {
-                    // Start a small margin behind the write frontier (see the
-                    // DoIO retry path) so the first reads have committed data.
-                    let w = Consumer::new(shm.ring()).write_frame();
-                    let read_frame = w.saturating_sub(2048);
-                    *guard = Some(IoState { shm, read_frame });
+            match attach_in() {
+                Some(state) => {
+                    *guard = Some(state);
                     oslog("[avb-coreaudio] IO: attached recovered-audio ring");
                 }
-                Err(_) => {
+                None => {
                     oslog("[avb-coreaudio] IO: daemon ring not present — silent");
                 }
             }
@@ -983,27 +1085,27 @@ pub extern "C" fn do_io_operation(
         }
     };
     if let Ok(mut guard) = IO.lock() {
+        // Once a second (not per cycle: a stat in the realtime path), drop a
+        // mapping of a ring the daemon has since replaced. The input device
+        // never stops IO while it is the default input, so StartIO alone
+        // would never notice a daemon restart.
+        if log_now && guard.as_ref().is_some_and(in_ring_is_stale) {
+            *guard = None;
+            oslog("[avb-coreaudio] IO: input ring was replaced — re-attaching");
+        }
         // Lazy attach-retry: StartIO may have run before the daemon created
         // the ring file, and attach is otherwise one-shot. Retry here so we
         // pick it up whenever the daemon appears — regardless of start order.
-        if guard.is_none() {
-            match ShmRing::attach() {
-                Ok(shm) => {
-                    // Start a small margin BEHIND the write frontier so the
-                    // first reads have committed data (avoids immediate
-                    // underrun) while keeping latency low. ~2048 fr ≈ 43 ms.
-                    let w = Consumer::new(shm.ring()).write_frame();
-                    let read_frame = w.saturating_sub(2048);
-                    *guard = Some(IoState { shm, read_frame });
+        // Throttled to once a second for the same reason.
+        if guard.is_none() && log_now {
+            match attach_in() {
+                Some(state) => {
+                    *guard = Some(state);
                     oslog("[avb-coreaudio] IO: attached ring (lazy retry in DoIO)");
                 }
-                Err(e) => {
-                    if log_now {
-                        let errno = std::io::Error::last_os_error();
-                        oslog(&format!(
-                            "[avb-coreaudio] DoIO attach FAILED: {e:?} errno={errno}"
-                        ));
-                    }
+                None => {
+                    let errno = std::io::Error::last_os_error();
+                    oslog(&format!("[avb-coreaudio] DoIO attach FAILED errno={errno}"));
                 }
             }
         }
@@ -1013,8 +1115,10 @@ pub extern "C" fn do_io_operation(
             // shared read_frame — the daemon never advances that, so reading it
             // would replay the whole backlog each cycle (= latency / no live
             // signal). read_into advances from here and we save it back.
-            let mut consumer = Consumer::with_read_frame(ring, state.read_frame);
             let want = io_buffer_frame_size as usize;
+            let write_now = Consumer::new(ring).write_frame();
+            let cursor = input_cursor(write_now, state.read_frame, want as u64);
+            let mut consumer = Consumer::with_read_frame(ring, cursor);
             let avail = consumer.available();
             let got = consumer.read_into(out, want);
             filled = got * frame_bytes;
@@ -1033,7 +1137,7 @@ pub extern "C" fn do_io_operation(
                 let f = s as f32 / 2_147_483_648.0_f32;
                 *chunk = f.to_le_bytes();
             }
-            state.read_frame = consumer.read_frame();
+            state.read_frame = Some(consumer.read_frame());
             if log_now {
                 // Publish the recovered media clock for GetZeroTimeStamp,
                 // which must not take this lock itself (see IN_RATE_BITS).
@@ -1041,7 +1145,7 @@ pub extern "C" fn do_io_operation(
                 oslog(&format!(
                     "[avb-coreaudio] read got={got} want={want} avail={avail} write={} cursor={}",
                     consumer.write_frame(),
-                    state.read_frame
+                    consumer.read_frame()
                 ));
             }
         }
@@ -1148,6 +1252,54 @@ fn f32_to_s32(f: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latency_is_reported_per_scope() {
+        // 2 ms at 48 kHz, pinned to the literal value.
+        // 2 ms presentation offset (96) + 24-frame output queue floor.
+        assert_eq!(device_latency(kAudioObjectPropertyScopeOutput), 120);
+        assert_eq!(device_latency(kAudioObjectPropertyScopeInput), 64);
+        assert_eq!(device_latency(kAudioObjectPropertyScopeGlobal), 120);
+    }
+
+    #[test]
+    fn a_startup_backlog_like_the_measured_one_is_snapped_back() {
+        // REAPER, 32-frame block: the backlog sat at ~1 470 frames.
+        let want = 32;
+        let w = 1_000_000;
+        assert_eq!(
+            input_cursor(w, Some(w - 1_470), want),
+            w - (want + INPUT_CUSHION_FRAMES)
+        );
+    }
+
+    #[test]
+    fn input_starts_one_buffer_plus_cushion_behind_not_43_ms() {
+        // 512-frame IO buffer: 512 + 64 = 576 frames (12 ms) behind, not the
+        // old fixed 2048 (43 ms).
+        assert_eq!(input_cursor(100_000, None, 512), 100_000 - 576);
+        // A small buffer gets a proportionally small delay.
+        assert_eq!(input_cursor(100_000, None, 32), 100_000 - 96);
+        // Near the start of the ring it cannot go negative.
+        assert_eq!(input_cursor(100, None, 512), 0);
+    }
+
+    #[test]
+    fn input_cursor_is_kept_until_the_backlog_grows_past_the_slack() {
+        let want = 512;
+        let target_lag = want + INPUT_CUSHION_FRAMES;
+        // Normal running: the cursor is untouched, so no audio is skipped.
+        assert_eq!(input_cursor(100_000, Some(99_300), want), 99_300);
+        let at_limit = 100_000 - (target_lag + INPUT_RESYNC_SLACK_FRAMES);
+        assert_eq!(input_cursor(100_000, Some(at_limit), want), at_limit);
+        // Past the slack (a stall): snap forward to the target.
+        assert_eq!(
+            input_cursor(100_000, Some(at_limit - 1), want),
+            100_000 - target_lag
+        );
+        // Never backwards, which would replay delivered frames.
+        assert_eq!(input_cursor(100_000, Some(99_900), want), 99_900);
+    }
 
     #[test]
     fn f32_s32_round_trip_and_clamp() {

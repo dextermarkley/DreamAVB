@@ -66,6 +66,21 @@ pub fn delta_frames(ref_ts: u32, ts: u32, frame_period_ns: f64) -> i128 {
     ((d_ns as f64) / frame_period_ns).round() as i128
 }
 
+/// Whether a forward timestamp jump of `d` frames is explained by packets
+/// lost from this stream: its sequence number advanced by `seq_step` and the
+/// jump is exactly that many packets of `spf` frames.
+///
+/// Measured on the live 16R: every "implausible" jump was 54, 60 or 78
+/// frames with the stream's sequence number skipping 9, 10 or 13, on all
+/// eight streams at once. Those are real losses, correctly stamped.
+pub fn gap_is_real(d: i128, seq_step: Option<u8>, spf: usize) -> bool {
+    match seq_step {
+        // 128..=255 is a sequence number going BACKWARDS, not a gap.
+        Some(step) if (2..128).contains(&step) => d == i128::from(step) * spf as i128,
+        _ => false,
+    }
+}
+
 /// The inbound audio path: AAF PDUs in, shm input ring out.
 pub struct ListenerRx {
     ring: Option<avb_audioring::ShmProducer>,
@@ -153,6 +168,13 @@ pub struct ListenerRx {
     /// Per-slot placed-frame counts, so a slot that binds and never delivers
     /// is visible rather than hidden in the total.
     per_slot_frames: Vec<u64>,
+    /// Per-slot (seq, ts) of the previous packet, for the jump diagnostic.
+    last_seen: Vec<Option<(u8, u32)>>,
+    /// Packets whose sequence number skipped forward (packets missing).
+    seq_gap: u64,
+    /// Packets OLDER than the slot's previous one (reordered delivery).
+    seq_back: u64,
+    seq_logged: u32,
 }
 
 impl Default for ListenerRx {
@@ -205,6 +227,10 @@ impl ListenerRx {
             max_advance_frames: 0,
             max_abs_delta_frames: 0,
             per_slot_frames: Vec::new(),
+            last_seen: Vec::new(),
+            seq_gap: 0,
+            seq_back: 0,
+            seq_logged: 0,
         }
     }
 
@@ -470,12 +496,37 @@ impl ListenerRx {
                         // that is plausible, otherwise by exactly one packet:
                         // a timestamp we do not believe must not move the
                         // timeline further than a real interval does.
-                        let adv = if d <= self.max_advance_frames {
+                        let seq_step = self
+                            .last_seen
+                            .get(slot)
+                            .copied()
+                            .flatten()
+                            .map(|(prev_seq, _)| pdu.hdr.stream.seq.wrapping_sub(prev_seq));
+                        let adv = if d <= self.max_advance_frames
+                            || gap_is_real(d, seq_step, self.spf)
+                        {
+                            // Either a normal advance, or packets really were
+                            // lost and this stream's own sequence number says
+                            // by exactly how many. Placing it at its timestamp
+                            // leaves the loss as an honest silent hole instead
+                            // of shifting every later frame early.
                             d
                         } else {
                             self.suspect_jumps += 1;
                             if let Some(c) = self.suspect_per_slot.get_mut(slot) {
                                 *c += 1;
+                            }
+                            if self.suspect_jumps <= 24 {
+                                log.log(
+                                    Level::Info,
+                                    "rxts",
+                                    &format!(
+                                        "forward jump: slot {slot} seq {} ts {ts} basis_ts {basis_ts} \
+                                         d {d} frames; this slot's previous (seq, ts) {:?}; arrival {arrival_ns}",
+                                        pdu.hdr.stream.seq,
+                                        self.last_seen.get(slot).copied().flatten(),
+                                    ),
+                                );
                             }
                             self.spf as i128
                         };
@@ -510,6 +561,45 @@ impl ListenerRx {
                 .unwrap_or(self.basis_frame);
             i128::from(f)
         };
+        if self.last_seen.len() <= slot {
+            self.last_seen.resize(slot + 1, None);
+        }
+        if let Some(l) = self.last_seen.get_mut(slot) {
+            if let Some((prev_seq, prev_ts)) = *l {
+                let step = pdu.hdr.stream.seq.wrapping_sub(prev_seq);
+                if step != 1 {
+                    // 1..=127 forward = packets missing in between; 128..=255
+                    // = this packet is OLDER than the last one (reordered).
+                    if step == 0 || step >= 128 {
+                        self.seq_back += 1;
+                    } else {
+                        self.seq_gap += 1;
+                    }
+                    if self.seq_logged < 16 {
+                        self.seq_logged += 1;
+                        log.log(
+                            Level::Info,
+                            "rxts",
+                            &format!(
+                                "slot {slot} seq {prev_seq} -> {} (step {step}) ts {prev_ts} -> {ts} \
+                                 arrival {arrival_ns}",
+                                pdu.hdr.stream.seq
+                            ),
+                        );
+                    }
+                }
+            }
+            *l = Some((pdu.hdr.stream.seq, ts));
+        }
+        log.log_rate_limited(
+            Level::Info,
+            "rxts",
+            "rx_gap_stats",
+            &format!(
+                "inbound so far: {} seq gaps, {} reordered, {} forward jumps, {} behind-groups",
+                self.seq_gap, self.seq_back, self.suspect_jumps, self.behind_groups
+            ),
+        );
         // Record where this slot's next packet continues from.
         if let Some(n) = self.next_frame.get_mut(slot) {
             *n = (frame.max(0) as u64).saturating_add(self.spf as u64);
@@ -718,6 +808,20 @@ mod tests {
     /// the same presentation time, so corresponding packets share a frame.
     /// This case must be exact: an error here offsets eight channels against
     /// the other fifty-six.
+    #[test]
+    fn a_jump_matching_the_sequence_gap_is_a_real_loss() {
+        // The three shapes logged on the 16R.
+        assert!(gap_is_real(54, Some(9), 6));
+        assert!(gap_is_real(60, Some(10), 6));
+        assert!(gap_is_real(78, Some(13), 6));
+        // A jump the sequence number does not explain is still suspect.
+        assert!(!gap_is_real(54, Some(1), 6));
+        assert!(!gap_is_real(54, Some(8), 6));
+        assert!(!gap_is_real(54, None, 6));
+        // A backwards sequence number never vouches for a forward jump.
+        assert!(!gap_is_real(54, Some(200), 6));
+    }
+
     #[test]
     fn the_same_timestamp_is_a_zero_offset() {
         let ts = 1_000_000_000u32;

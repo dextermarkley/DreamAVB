@@ -177,19 +177,16 @@ enum Command {
         /// media-clock stream, not audio).
         #[arg(long)]
         listener_uid: Option<u16>,
-        /// EXPERIMENTAL: bind EVERY one of the 16R's AAF audio sources, giving
-        /// a 64-channel input ring instead of 8.
+        /// Bind only the 16R's FIRST AAF audio source (8 channels) instead of
+        /// all of them (64 channels, the default).
         ///
-        /// Off by default and deliberately so. The data path works — all eight
-        /// streams place, per-slot frame counts stay within ~20 frames of each
-        /// other and the channel map is deterministic — but the cross-stream
-        /// timestamp alignment still shows a residual defect (about 15% of
-        /// packets reporting an implausible forward offset) that has not been
-        /// root-caused, and the CoreAudio plug-in pins its device at 8
-        /// channels and REFUSES a ring that disagrees. Until both are
-        /// resolved, turning this on gives a 64-channel ring that CoreAudio
-        /// will not attach to.
+        /// All sources are bound by default: the CoreAudio input device is 64
+        /// channels wide, and an unbound source's channels would read as
+        /// permanent silence.
         #[arg(long)]
+        single_inbound_stream: bool,
+        /// Accepted for compatibility; all sources are now bound by default.
+        #[arg(long, hide = true)]
         all_inbound_streams: bool,
         /// Do NOT act as the listener's controller — declare our streams over
         /// SRP and leave its sink assignments to someone else.
@@ -345,12 +342,14 @@ fn run() -> Result<(), Exit> {
             seconds,
             listener,
             listener_uid,
-            all_inbound_streams,
+            single_inbound_stream,
+            all_inbound_streams: _,
             no_bind_sinks,
             start_timeout,
             summary_out,
             crf,
         } => {
+            let all_inbound_streams = !single_inbound_stream;
             // `seconds` is optional here: the companion runs this until it
             // stops the process. 0 means "no limit" to the loop.
             if let Some(s) = seconds {
