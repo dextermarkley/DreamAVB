@@ -779,15 +779,15 @@ static bool resetHw(IV * v, uint64_t initFlags)
     return ok(v);
 }
 
-// Replay Apple's AVB RX classifier writes (bcm::kAvbRxRuleWrites). Read-first,
+// Replay Apple's AVB RX classifier writes (kAvbRxRuleWrites). Read-first,
 // log each. These offsets are outside the tg3-documented set; they come from
 // read-only observation of Apple's driver (docs/bcm-rx-timestamp-investigation.md).
 static void programAvbRxRules(IV * v)
 {
-    LOG("AVB RX rules: replaying %u Apple classifier write(s)", bcm::kAvbRxRuleWriteCount);
-    for (uint32_t i = 0; i < bcm::kAvbRxRuleWriteCount && ok(v); i++) {
-        const uint32_t off = bcm::kAvbRxRuleWrites[i].off;
-        const uint32_t val = bcm::kAvbRxRuleWrites[i].val;
+    LOG("AVB RX rules: replaying %u Apple classifier write(s)", kAvbRxRuleWriteCount);
+    for (uint32_t i = 0; i < kAvbRxRuleWriteCount && ok(v); i++) {
+        const uint32_t off = kAvbRxRuleWrites[i].off;
+        const uint32_t val = kAvbRxRuleWrites[i].val;
         const uint32_t before = rd(v, off);
         wr(v, off, val);
         const uint32_t after = rd(v, off);
