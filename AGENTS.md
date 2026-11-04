@@ -17,7 +17,9 @@ Start with `HANDOFF.md`. It has the current state, the resume point and the gate
 - Every change passes the gate in `HANDOFF.md`: fmt, clippy `-D warnings`, cargo test, C++ host tests, a dext build with 0 warnings, and `package.sh`.
 - Hardware claims must come from real probe or daemon output, never from reading code.
 - Implement from public specs and datasheets: IEEE 802.1AS, 802.1Q (MSRP/MVRP), 1722, 1722.1, Milan v1.2, and the Intel I210 datasheet 333016. GPL/LGPL code is for behavior reference only.
-- The I210 dext writes only documented registers and matches only 8086:1533 / subsystem 1ab6:0214. Never touch the Broadcom adapter or any other device. Back off if the device faults.
+- The I210 dext writes only documented registers and matches only 8086:1533 / subsystem 1ab6:0214. Back off if the device faults.
+- The Broadcom dext may drive the Apple Thunderbolt Gigabit adapter's BCM57762, and only that: 14e4:1682 / subsystem 106b:00f6. The user authorized taking it over from Apple's `BCM5701Enet` (2026-11-04); it is cabled only to the AVB network. Its registers are learned from public Broadcom documentation, behavior references (Linux tg3, GPL, never copied), and read-only observation of state Apple's driver leaves on the chip. A register outside those sources is read before it is ever written, and every such write is logged and recorded in the docs. Back off if the device faults.
+- Never touch any other device.
 - Never hardcode sample rates, channel counts or stream counts. Derive them from the 16R's AEM.
 
 ## Process
