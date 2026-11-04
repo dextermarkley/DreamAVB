@@ -3692,6 +3692,10 @@ fn talker_loop(
     // never removed.
     let mut sink_bind_done: std::collections::BTreeSet<(u64, u16)> =
         std::collections::BTreeSet::new();
+    // Stale bindings to our own older streams already released, as
+    // ((entity, sink), stream id), so each is released once per run.
+    let mut stale_released: std::collections::BTreeSet<((u64, u16), u64)> =
+        std::collections::BTreeSet::new();
     // ADP advertise state machine (Milan §5.6.3). `pending_advert_at` is the
     // DELAY state: Some(due) means TMR_DELAY is running and the
     // ENTITY_AVAILABLE goes out when it expires.
@@ -4073,6 +4077,101 @@ fn talker_loop(
                 let Some(acmp) = avb_avdecc::Acmpdu::decode(p.payload) else {
                     continue;
                 };
+                // A device's answer to OUR bind/unbind of its sink. Without
+                // it a refused bind is invisible: the sink just stays unbound
+                // and the retry backs off with no reason given.
+                if acmp.controller_entity_id == our_id
+                    && (acmp.message_type == avb_avdecc::constants::acmp_msg::CONNECT_RX_RESPONSE
+                        || acmp.message_type
+                            == avb_avdecc::constants::acmp_msg::DISCONNECT_RX_RESPONSE)
+                {
+                    let key = format!(
+                        "rx-resp-{:016x}-{}-{}-{}",
+                        u64::from_be_bytes(acmp.listener_entity_id.0),
+                        acmp.listener_unique_id,
+                        acmp.message_type,
+                        acmp.status,
+                    );
+                    log.log_rate_limited(
+                        Level::Info,
+                        "acmp",
+                        &key,
+                        &format!(
+                            "{} from 0x{:016x} sink {}: status {} (talker uid {}, stream \
+                             0x{:016x}, count {})",
+                            if acmp.message_type
+                                == avb_avdecc::constants::acmp_msg::CONNECT_RX_RESPONSE
+                            {
+                                "CONNECT_RX_RESPONSE"
+                            } else {
+                                "DISCONNECT_RX_RESPONSE"
+                            },
+                            u64::from_be_bytes(acmp.listener_entity_id.0),
+                            acmp.listener_unique_id,
+                            acmp.status,
+                            acmp.talker_unique_id,
+                            acmp.stream_id.0,
+                            acmp.connection_count,
+                        ),
+                    );
+                    continue;
+                }
+                // A device's answer to our GET_RX_STATE on its media-clock
+                // sink. If that sink is still bound to one of OUR streams
+                // while we send no media clock, the binding is left over from
+                // an older build, whose CRF stream used a uid that is an audio
+                // stream now. Release it once: the device otherwise keeps that
+                // uid as a clock stream and refuses it as audio elsewhere.
+                if acmp.controller_entity_id == our_id
+                    && acmp.message_type == avb_avdecc::constants::acmp_msg::GET_RX_STATE_RESPONSE
+                    && acmp.listener_unique_id == CRF_SINK_UID
+                {
+                    let dev = u64::from_be_bytes(acmp.listener_entity_id.0);
+                    let bound_ours = acmp.talker_entity_id == our_id && acmp.connection_count > 0;
+                    let sid = StreamId::from_parts(our_mac, acmp.talker_unique_id);
+                    log.log_rate_limited(
+                        Level::Info,
+                        "acmp",
+                        &format!("rx-state-{dev:016x}-{}-{bound_ours}", acmp.talker_unique_id),
+                        &format!(
+                            "device 0x{dev:016x} media-clock sink {CRF_SINK_UID}: status {} \
+                             talker 0x{:016x}/uid {} count {}",
+                            acmp.status,
+                            u64::from_be_bytes(acmp.talker_entity_id.0),
+                            acmp.talker_unique_id,
+                            acmp.connection_count,
+                        ),
+                    );
+                    if crf_talker.is_none()
+                        && bound_ours
+                        && stale_released.insert(((dev, CRF_SINK_UID), sid.0))
+                    {
+                        log.log(
+                            Level::Info,
+                            "acmp",
+                            &format!(
+                                "device 0x{dev:016x} sink {CRF_SINK_UID}: releasing its old \
+                                 media-clock binding to our uid {} (stream 0x{:016x}); we send \
+                                 no media clock and that uid carries audio now",
+                                acmp.talker_unique_id, sid.0
+                            ),
+                        );
+                        disconnect_listener(
+                            log,
+                            dext,
+                            our_mac,
+                            our_id,
+                            acmp.listener_entity_id,
+                            sid,
+                            CRF_SINK_UID,
+                            connect_seq,
+                        );
+                        connect_seq = connect_seq.wrapping_add(1);
+                        // Let the audio sink that was refused retry promptly.
+                        sink_attempts.retain(|&(e, _), _| e != dev);
+                    }
+                    continue;
+                }
                 // The 16R's persisted routes may name a retired CRF output
                 // rather than an audio stream. Log every incoming CONNECT_TX
                 // command's complete routing tuple before resolving its UID,
@@ -4447,6 +4546,45 @@ fn talker_loop(
                                         expected_stream.get(&ix).copied().unwrap_or(0),
                                     ),
                                 );
+                                // The sink holds one of OUR older streams (a
+                                // layout from before the channel map moved
+                                // this device's outputs). A Milan listener
+                                // keeps a binding until it is unbound, so a
+                                // bind to the new stream is ignored while it
+                                // stands. Release it once, then let the bind
+                                // retry below rebind the sink. Only our own
+                                // stream is ever released: a binding to any
+                                // other talker is someone else's routing.
+                                if let Some(&want) = expected_stream.get(&ix) {
+                                    if stale_own_binding(reported_sid, want, our_stream_id.0)
+                                        && stale_released.insert((ix, reported_sid))
+                                    {
+                                        log.log(
+                                            Level::Info,
+                                            "acmp",
+                                            &format!(
+                                                "device 0x{resp_ent:016x} sink {sink}: releasing \
+                                                 its old binding to our stream \
+                                                 0x{reported_sid:016x} so it can take \
+                                                 0x{want:016x}"
+                                            ),
+                                        );
+                                        disconnect_listener(
+                                            log,
+                                            dext,
+                                            our_mac,
+                                            our_id,
+                                            avb_core::Eui64(resp_ent.to_be_bytes()),
+                                            avb_core::StreamId(reported_sid),
+                                            sink,
+                                            connect_seq,
+                                        );
+                                        connect_seq = connect_seq.wrapping_add(1);
+                                        // Rebind promptly rather than after
+                                        // the slow-retry backoff.
+                                        sink_attempts.remove(&ix);
+                                    }
+                                }
                             }
                             let prev = sink_connected.insert(ix, now_conn);
                             changed = prev != Some(now_conn);
@@ -5306,6 +5444,20 @@ fn talker_loop(
                     if let Ok(frame) = TxFrame::build(&hdr, &q.encode(), false, 0) {
                         let _ = dext.send(frame.bytes(), false, 0);
                     }
+                }
+            }
+            // Ask each device which talker its media-clock sink is bound to.
+            // An older build used uid `out_streams.len()` (8 with one device)
+            // for its CRF stream and bound it there; that uid is an audio
+            // stream now, and a device still holding it as a clock binding
+            // refuses to take it as audio on another sink (status
+            // INCOMPATIBLE_REQUEST). The answer is handled with the other
+            // ACMP responses. Read-only: nothing changes unless the binding
+            // turns out to be one of OUR streams on a sink we do not use.
+            if crf_talker.is_none() {
+                for &(dev, _) in &devs {
+                    send_get_rx_state(dext, our_mac, our_id, dev, CRF_SINK_UID, connect_seq);
+                    connect_seq = connect_seq.wrapping_add(1);
                 }
             }
             if diagnostic_round {
@@ -8138,6 +8290,45 @@ fn connect_rx_pdu(
     }
 }
 
+/// Ask a listener which talker stream its sink `listener_uid` is bound to
+/// (ACMP GET_RX_STATE_COMMAND, 1722.1-2021 §8.2.2.6). Read-only.
+fn send_get_rx_state(
+    dext: &mut RealDext,
+    our_mac: avb_core::MacAddr,
+    our_id: avb_core::Eui64,
+    listener_id: avb_core::Eui64,
+    listener_uid: u16,
+    sequence_id: u16,
+) {
+    use crate::dextio::DextPort;
+    let pdu = avb_avdecc::acmp::Acmpdu {
+        message_type: avb_avdecc::constants::acmp_msg::GET_RX_STATE_COMMAND,
+        status: avb_avdecc::constants::acmp_status::SUCCESS,
+        controller_entity_id: our_id,
+        listener_entity_id: listener_id,
+        listener_unique_id: listener_uid,
+        sequence_id,
+        ..Default::default()
+    };
+    let hdr = avb_core::eth::EthHeader {
+        dst: avb_core::AVDECC_MULTICAST,
+        src: our_mac,
+        vlan: None,
+        ethertype: avb_avtp::common::ETHERTYPE_AVTP,
+    };
+    if let Ok(f) = avb_core::TxFrame::build(&hdr, &pdu.encode(), false, 0) {
+        let _ = dext.send(f.bytes(), false, 0);
+    }
+}
+
+/// Whether a sink's reported binding is a stale one of OURS that we may
+/// release: a nonzero stream id carrying our MAC in its top 48 bits
+/// (1722-2016 §4.4.4.30), and not the stream we want on that sink. A binding
+/// to any other talker is never ours to undo.
+fn stale_own_binding(reported_sid: u64, wanted_sid: u64, any_own_sid: u64) -> bool {
+    reported_sid != 0 && reported_sid != wanted_sid && reported_sid >> 16 == any_own_sid >> 16
+}
+
 /// Build the DISCONNECT_RX_COMMAND PDU (pure; unit-tested).
 ///
 /// Identical addressing to [`connect_rx_pdu`] — only `message_type` differs —
@@ -8232,6 +8423,22 @@ mod talker_tests {
         descriptor[88..90].copy_from_slice(&0u16.to_be_bytes());
         assert_eq!(ptp_port_range(&descriptor), Some((0, 1)));
         assert_eq!(ptp_port_range(&descriptor[..89]), None);
+    }
+
+    /// Only a binding to one of OUR other streams is released. Ours is
+    /// `0x644bf01273b8xxxx` (our MAC + unique id); the 16R's sink 1 held our
+    /// stream 0 while we wanted stream 8 there.
+    #[test]
+    fn stale_own_binding_releases_only_our_other_streams() {
+        let ours = 0x644b_f012_73b8_0000u64;
+        // Our old stream 0 on a sink that should carry our stream 8.
+        assert!(stale_own_binding(ours, ours | 8, ours | 3));
+        // Already the stream we want.
+        assert!(!stale_own_binding(ours | 8, ours | 8, ours));
+        // Empty binding (stream id 0): nothing to release.
+        assert!(!stale_own_binding(0, ours | 8, ours));
+        // Another talker's stream (the 24R's): never ours to undo.
+        assert!(!stale_own_binding(0x000a_9200_713d_0001, ours | 8, ours));
     }
 
     #[test]
