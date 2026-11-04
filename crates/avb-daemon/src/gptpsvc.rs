@@ -105,6 +105,13 @@ impl GptpService {
         // SYSTIM step), every Pdelay exchange looks like it straddles a step
         // and is discarded.
         let clock_gen = dext.clock_gen();
+        // Start the NIC clock at the rate the servo assumes: 0 ppb. TIMINCA
+        // survives a daemon exit, so without this a run inherits whatever the
+        // last servo applied (measured: -74.6 ppm, left by a holdover) while
+        // its own servo believes 0. Unlocked, our Pdelay answers then run
+        // 75 ppm off the network, and the MOTU switch never sent this port
+        // Sync again until it was power-cycled.
+        dext.adj_freq(0);
         Ok(Self {
             port: Port::new(PortConfig::i210(mac, tb), now, clock_gen),
             tb,

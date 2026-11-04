@@ -134,6 +134,16 @@ pub fn link_delay(t1: u64, t2_scaled: i128, t3_scaled: i128, t4: u64, nrr: f64) 
     (local * nrr - remote) / 2.0
 }
 
+/// The responder's t2 or t3 in scaled ns: its timestamp plus the
+/// correctionField of the message that carried it (802.1AS-2020: t2 from
+/// Pdelay_Resp, t3 from Pdelay_Resp_Follow_Up). Each correction belongs to
+/// its own timestamp; a 1588-style "subtract both from the turnaround" reads
+/// a bridge that fills both (the MOTU AVB switch sends ~29 us in each) as a
+/// link tens of microseconds negative.
+pub(crate) fn responder_time(ts_scaled: i128, correction: i64) -> i128 {
+    ts_scaled + i128::from(correction)
+}
+
 /// Our side of one Pdelay exchange (initiator).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Exchange {
@@ -142,7 +152,8 @@ pub(crate) struct Exchange {
     /// Raw TX timestamp and the generation of its SendFrame call.
     pub t1: Option<(u64, u32)>,
     pub t2: Option<i128>,
-    /// Pdelay_Resp correctionField (scaled ns), folded into t3.
+    /// Pdelay_Resp correctionField (scaled ns), already added to t2; kept
+    /// for diagnostics.
     pub resp_corr: i64,
     pub t3: Option<i128>,
     /// Raw RX timestamp and its generation.
@@ -359,6 +370,20 @@ mod tests {
     use super::*;
 
     const LAT: LatencyProfile = LatencyProfile::I210_1000;
+
+    /// Captured from the MOTU AVB switch: correctionField 29 008 ns on the
+    /// Pdelay_Resp and 29 016 ns on the Follow_Up. Its turnaround is the
+    /// timestamps' difference plus 8 ns, and the link stays positive.
+    #[test]
+    fn responder_corrections_apply_to_their_own_timestamps() {
+        let t1 = 1_000_000_000u64;
+        let rrt = scaled(t1 + 300 + 5_000_000_000);
+        let rot = rrt + scaled(70_000);
+        let t2 = responder_time(rrt, 29_008 << 16);
+        let t3 = responder_time(rot, 29_016 << 16);
+        let t4 = t1 + 300 + 70_008 + 300;
+        assert_eq!(link_delay(t1, t2, t3, t4, 1.0), 300.0);
+    }
 
     #[test]
     fn link_delay_formula() {

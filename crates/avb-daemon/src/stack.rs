@@ -2961,6 +2961,9 @@ fn talker_loop(
         talker: AafTalker,
         /// The device has answered this stream's Talker Advertise with Ready.
         ready: bool,
+        /// ns_since(start) when the listener declaration for this stream
+        /// last became Asking Failed, while it still is.
+        asking_failed_since: Option<u64>,
     }
     let mut out_streams: Vec<OutStream> = Vec::with_capacity(plans.len());
     for (i, pl) in plans.iter().enumerate() {
@@ -2983,6 +2986,7 @@ fn talker_loop(
             first_ch: pl.first_ch,
             talker,
             ready: false,
+            asking_failed_since: None,
         });
     }
     if out_streams.is_empty() {
@@ -3286,6 +3290,7 @@ fn talker_loop(
     // How long we wait for the servo before giving up, reusing the discovery
     // timeout rather than inventing a second knob.
     let lock_deadline_ns = opts.discover_timeout.saturating_mul(1_000_000_000);
+    let mut last_lock_wait_log_ns: u64 = 0;
 
     // ---- Clock source ------------------------------------------------------
     //
@@ -3696,6 +3701,13 @@ fn talker_loop(
     // ((entity, sink), stream id), so each is released once per run.
     let mut stale_released: std::collections::BTreeSet<((u64, u16), u64)> =
         std::collections::BTreeSet::new();
+    // Sinks already given their one stuck-reservation rebind this run.
+    let mut rebound_once: std::collections::BTreeSet<(u64, u16)> =
+        std::collections::BTreeSet::new();
+    // How long a bound sink may sit with its stream Asking Failed before we
+    // redo the bind once. Longer than an MSRP LeaveAll period (10-15 s) so a
+    // reservation still converging is left alone.
+    const STUCK_RESERVATION_REBIND_NS: u64 = 30_000_000_000;
     // ADP advertise state machine (Milan §5.6.3). `pending_advert_at` is the
     // DELAY state: Some(due) means TMR_DELAY is running and the
     // ENTITY_AVAILABLE goes out when it expires.
@@ -4625,6 +4637,50 @@ fn talker_loop(
                                     }
                                 }
                             }
+                            // Bound to the right stream, yet no listener
+                            // has a reservation for it for a while: the
+                            // device kept reservation state from an earlier
+                            // binding (seen on the 16R after a run that bound
+                            // its sinks to other streams of ours). Redo the
+                            // bind once: unbind, and the retry below rebinds.
+                            if now_conn && !rebound_once.contains(&ix) {
+                                let stuck = out_streams.iter().any(|o| {
+                                    u64::from_be_bytes(o.listener.0) == resp_ent
+                                        && o.sink_uid == sink
+                                        && o.asking_failed_since.is_some_and(|t| {
+                                            ns_since(start).saturating_sub(t)
+                                                >= STUCK_RESERVATION_REBIND_NS
+                                        })
+                                });
+                                if stuck {
+                                    rebound_once.insert(ix);
+                                    log.log(
+                                        Level::Warn,
+                                        "acmp",
+                                        &format!(
+                                            "device 0x{resp_ent:016x} sink {sink} is bound to \
+                                             0x{reported_sid:016x} but has had no reservation \
+                                             for {} s — unbinding once to rebind it",
+                                            STUCK_RESERVATION_REBIND_NS / 1_000_000_000
+                                        ),
+                                    );
+                                    disconnect_listener(
+                                        log,
+                                        dext,
+                                        our_mac,
+                                        our_id,
+                                        avb_core::Eui64(resp_ent.to_be_bytes()),
+                                        avb_core::StreamId(reported_sid),
+                                        sink,
+                                        connect_seq,
+                                    );
+                                    connect_seq = connect_seq.wrapping_add(1);
+                                    sink_bind_done.remove(&ix);
+                                    sink_attempts.remove(&ix);
+                                    sink_connected.insert(ix, false);
+                                    continue;
+                                }
+                            }
                             let prev = sink_connected.insert(ix, now_conn);
                             changed = prev != Some(now_conn);
                             if now_conn {
@@ -4848,21 +4904,43 @@ fn talker_loop(
                 // with eight advertised it can accept some and not others,
                 // and one flag would report the whole direction connected on
                 // the strength of a single acceptance.
-                SrpEvent::ListenerRegistered { stream_id, .. } => {
+                SrpEvent::ListenerRegistered { stream_id, decl } => {
                     if let Some(o) = out_streams
                         .iter_mut()
                         .find(|o| o.stream_id.0 == stream_id.0)
                     {
-                        if !o.ready {
-                            o.ready = true;
-                            log.log(
-                                Level::Info,
+                        // A talker sends on Ready or Ready Failed (some
+                        // listeners have a path), never on Asking Failed (no
+                        // listener has one): IEEE 802.1Q 35.2.4.4.
+                        let now_ready =
+                            matches!(decl, ListenerDecl::Ready | ListenerDecl::ReadyFailed);
+                        if now_ready != o.ready || !matches!(decl, ListenerDecl::Ready) {
+                            log.log_rate_limited(
+                                if matches!(decl, ListenerDecl::Ready) {
+                                    Level::Info
+                                } else {
+                                    Level::Warn
+                                },
                                 "msrp",
+                                &format!("listener-decl-{}-{decl:?}", o.uid),
                                 &format!(
-                                    "a device declared Listener Ready for our stream {} (0x{:016x}) — accepted",
-                                    o.uid, o.stream_id.0
+                                    "listener declaration {decl:?} for our stream {} (0x{:016x}){}",
+                                    o.uid,
+                                    o.stream_id.0,
+                                    match decl {
+                                        ListenerDecl::Ready => " — accepted",
+                                        ListenerDecl::ReadyFailed =>
+                                            " — some listeners have no reserved path",
+                                        _ => " — NO listener has a reserved path; not sending it",
+                                    }
                                 ),
                             );
+                        }
+                        o.ready = now_ready;
+                        if matches!(decl, ListenerDecl::AskingFailed) {
+                            o.asking_failed_since.get_or_insert(ns_since(start));
+                        } else {
+                            o.asking_failed_since = None;
                         }
                     }
                     // `StreamInfo` carries one stream, so the entity reports
@@ -4892,6 +4970,7 @@ fn talker_loop(
                         .iter_mut()
                         .find(|o| o.stream_id.0 == stream_id.0)
                     {
+                        o.asking_failed_since = None;
                         if o.ready {
                             o.ready = false;
                             log.log(
@@ -5635,7 +5714,7 @@ fn talker_loop(
                 &format!(
                     "role={} servo={} gm={} (ours={}) btca(won={} lost={}) mastertx(ann={} sync={} fu={} ts_lost={}) \
                      link(asCapable={} delay_raw={:?} delay_comp={:?} rtt={:?} peer_turnaround={:?} nrr={:?} our_turnaround={:?} max={:?} \
-                     req_rx={} resp_tx={} fu_tx={} resp_ts_fail={} lost={} sync_rx={} ann_rx={}){}",
+                     req_rx={} resp_tx={} fu_tx={} resp_ts_fail={} lost={} sync_rx={} ann_rx={} sig_rx={} sig_tx={} multi_resp={} ascap_edges={}){}",
                     st.port_state.name(),
                     st.servo_state.name(),
                     st.gm_identity,
@@ -5661,6 +5740,10 @@ fn talker_loop(
                     c.lost_responses,
                     c.sync_rx,
                     c.announce_rx,
+                    c.signaling_rx,
+                    c.signaling_tx,
+                    c.multiple_responders,
+                    c.ascapable_transitions,
                     if crf_talker.is_some() {
                         format!(
                             " crf(pdus={crf_pdus} refused={crf_refused} no_anchor={crf_skipped_no_clock} reanchors={crf_reanchors})"
@@ -5719,20 +5802,31 @@ fn talker_loop(
                     &format!("dropped {dropped} stale output-ring frames at arm"),
                 );
             } else {
-                if ns_since(start) >= lock_deadline_ns {
+                // Keep waiting rather than exiting. Exiting stops our Pdelay
+                // responder until the restarted daemon reaches this point
+                // again, seconds later; a bridge counts those as lost
+                // responses, drops asCapable on our port and stops sending
+                // Sync, so the next run cannot lock either. Seen with the
+                // MOTU AVB switch: every restart after a lock timeout found
+                // it silent, until it was power-cycled.
+                if ns_since(start) >= lock_deadline_ns
+                    && ns_since(start).saturating_sub(last_lock_wait_log_ns) >= lock_deadline_ns
+                {
+                    last_lock_wait_log_ns = ns_since(start);
                     let st = gptp.status();
                     log.log(
-                        Level::Error,
+                        Level::Warn,
                         "play",
                         &format!(
-                            "gPTP did not lock within {}s (state={} asCapable={} servo={}) — refusing to stream on an undisciplined clock",
-                            opts.discover_timeout,
+                            "gPTP not locked after {}s (state={} asCapable={} servo={}) — not \
+                             streaming on an undisciplined clock; still answering peer delay \
+                             and waiting for the network's Sync",
+                            ns_since(start) / 1_000_000_000,
                             st.port_state.name(),
                             st.as_capable,
                             st.servo_state.name(),
                         ),
                     );
-                    return Err(Exit::TalkerNotFound);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
@@ -5791,6 +5885,17 @@ fn talker_loop(
                 lrx.recovered_clock(),
                 recovered_ring.as_ref().and_then(|r| r.ring().read_clock()),
             );
+            // With several devices, Automatic means network time. The
+            // recovered clock comes from whichever device's stream arrived
+            // first, and a device on its own internal clock (the 24R was)
+            // runs at a different rate from the gPTP-paced talker: the output
+            // queue then drifts, gets trimmed, and clicks.
+            let recovered =
+                if devs.len() > 1 && clocksel.selected() == avb_config::ClockSource::Auto {
+                    None
+                } else {
+                    recovered
+                };
             let decision = clocksel.decide(
                 recovered,
                 st.gptp_ppm_vs_mach,

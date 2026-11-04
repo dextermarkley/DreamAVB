@@ -877,7 +877,12 @@ impl Port {
             x.discarded = true;
             return Err(DropReason::Malformed);
         };
-        x.t2 = Some(scaled(rrt));
+        // 802.1AS-2020: t2 = requestReceiptTimestamp + the Pdelay_Resp
+        // correctionField. NOT folded into t3: the 1588 equation subtracts
+        // both corrections from the turnaround, 802.1AS adds this one to t2.
+        // A bridge that carries a real value here (the MOTU AVB switch sends
+        // ~29 us in both) otherwise reads as a -29 us link.
+        x.t2 = Some(crate::pdelay::responder_time(scaled(rrt), h.correction));
         x.resp_corr = h.correction;
         match (meta.hw_ts, classify_rx_gen(meta.clock_gen, meta.step_ambig)) {
             (None, _) => self.c.rx_no_ts += 1,
@@ -912,8 +917,9 @@ impl Port {
         let Some(t3) = r.response_origin.to_ns() else {
             return Err(DropReason::Malformed);
         };
-        // t3 = responseOriginTimestamp + correctionFields (Resp_FU and Resp).
-        x.t3 = Some(scaled(t3) + i128::from(h.correction) + i128::from(x.resp_corr));
+        // t3 = responseOriginTimestamp + the Pdelay_Resp_Follow_Up
+        // correctionField (802.1AS-2020; the Resp correction went into t2).
+        x.t3 = Some(crate::pdelay::responder_time(scaled(t3), h.correction));
         self.complete_exchange(now);
         Ok(())
     }
