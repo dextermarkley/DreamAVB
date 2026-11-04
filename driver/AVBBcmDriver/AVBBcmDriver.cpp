@@ -78,6 +78,11 @@ struct AVBBcmDriver_IVars {
     uint32_t fault;              // AvbFault, latched
     uint32_t flags;              // AVB_FLAG_*
     uint8_t mac[6];
+    // Register state Apple's driver left, read at Start before any write
+    // (see kSnapWindows). Read back with kReadSnapshotFlag.
+    uint32_t snap[kSnapWords];
+    bool snapValid;
+    uint32_t snapMiscHostCtrl;   // config-space MISC_HOST_CTRL before Stage A
     struct mach_timebase_info tb;
 
     IODispatchQueue * queue;     // default queue (timer + user client calls)
@@ -325,6 +330,31 @@ static void setCommandBits(IV * v, uint16_t set, uint16_t clear)
 }
 
 // ---------------------------------------------------------------------------
+// Read-only capture of the windows in kSnapWindows, before Stage A writes
+// anything. Reads only: no register in these windows is written here. Only
+// for our own device (the match personality already restricts it; checked
+// again because this runs before Stage A's own identity check).
+static void takeSnapshot(IV * v)
+{
+    v->snapValid = false;
+    if (!isOurDevice(v->vendorDevice, v->subsys) || !ok(v)) {
+        LOG("snapshot: not our device or faulted; skipped");
+        return;
+    }
+    v->snapMiscHostCtrl = cfgRd32(v, bcm::kMiscHostCtrl);
+    uint32_t i = 0;
+    for (const auto & w : kSnapWindows) {
+        for (uint32_t off = w.start; off < w.end && i < kSnapWords; off += 4) {
+            v->snap[i++] = rdRaw(v, off);
+        }
+    }
+    v->snapValid = ok(v) && i == kSnapWords;
+    LOG("snapshot: %u words of Apple-left register state captured (valid=%d), "
+        "MISC_HOST_CTRL 0x%08x, RX_PTP_CTL 0x%08x, GRC_MODE 0x%08x, EAV_CTL 0x%08x",
+        i, v->snapValid, v->snapMiscHostCtrl, v->snap[snapIndex(0x06c8)],
+        v->snap[snapIndex(0x6800)], v->snap[snapIndex(0x6908)]);
+}
+
 // Stage A: time-sync enable (plan item 4). Writes exactly:
 //   MISC_HOST_CTRL (config), MEMARB_MODE |= ENABLE, GRC_MODE |= TIME_SYNC_ENABLE.
 
@@ -1121,6 +1151,7 @@ IMPL(AVBBcmDriver, Start)
         return ret;
     }
 
+    takeSnapshot(v);
     stageA(v);
     return kIOReturnSuccess;
 }
@@ -1339,6 +1370,24 @@ AVBBcmDriver::HandleUserMethod(uint64_t selector, IOUserClientMethodArguments * 
             return kIOReturnNotReady;
         }
         const uint64_t off = a->scalarInput[0];
+        if ((off & kReadSnapshotFlag) != 0) {
+            // The Start snapshot, not the live register.
+            const uint64_t o = off & ~kReadSnapshotFlag;
+            if (o == 0xffffffffull) {
+                // Pseudo-offset: config-space MISC_HOST_CTRL as captured.
+                a->scalarOutput[0] = v->snapMiscHostCtrl;
+                return v->snapValid ? kIOReturnSuccess : kIOReturnNotReady;
+            }
+            const int32_t idx = o < 0x100000000ull ? snapIndex(static_cast<uint32_t>(o)) : -1;
+            if (idx < 0) {
+                return kIOReturnBadArgument;
+            }
+            if (!v->snapValid) {
+                return kIOReturnNotReady;
+            }
+            a->scalarOutput[0] = v->snap[idx];
+            return kIOReturnSuccess;
+        }
         if (!isReadableRegOffset(off)) {
             return kIOReturnBadArgument;
         }

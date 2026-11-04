@@ -12,6 +12,7 @@
 //!
 //! Subcommands:
 //!   activate                          activate the I210 dext and wait for the result
+//!   activate [--dext i210|bcm57762]   activate a dext (default i210) and wait
 //!   deactivate [--dext i210|bcm57762] deactivate a dext (default i210) and wait
 //!   status                            print `systemextensionsctl list` lines for both dexts
 
@@ -670,14 +671,17 @@ fn plist_string(text: &str, key: &str) -> Option<String> {
 }
 
 fn usage() {
-    eprintln!("usage: avb-installer <activate | deactivate [--dext i210|bcm57762] | status>");
+    eprintln!(
+        "usage: avb-installer <activate [--dext i210|bcm57762] | deactivate [--dext i210|bcm57762] | status>"
+    );
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match argv.as_slice() {
-        ["activate"] => submit(Action::Activate, DEXT_I210),
+        ["activate"] | ["activate", "--dext", "i210"] => submit(Action::Activate, DEXT_I210),
+        ["activate", "--dext", "bcm57762"] => submit(Action::Activate, DEXT_BCM),
         ["deactivate"] | ["deactivate", "--dext", "i210"] => submit(Action::Deactivate, DEXT_I210),
         ["deactivate", "--dext", "bcm57762"] => submit(Action::Deactivate, DEXT_BCM),
         ["status"] => status(),

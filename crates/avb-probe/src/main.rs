@@ -53,6 +53,10 @@ enum Cmd {
     Info,
     /// Read-only dump of the Phase 0 registers.
     Regs,
+    /// Broadcom only: dump the register state Apple's driver left on the chip
+    /// (captured by the dext at Start, before its first write) next to the
+    /// live values. Read-only.
+    Snapshot,
     /// Print the dext counters (GetCounters; read-only, works without rings).
     Counters,
     /// G2a: sample the NIC clock and regress it against mach_absolute_time.
@@ -294,6 +298,36 @@ fn cmd_regs(dev: &Device, json: Option<&Path>) -> Result<()> {
         rec.insert((*name).into(), format!("0x{v:08x}").into());
     }
     emit(json, "regs", &rec)
+}
+
+fn cmd_snapshot(dev: &Device, json: Option<&Path>) -> Result<()> {
+    let mut rec = serde_json::Map::new();
+    let mhc = dev.read_snapshot_reg32(abi::BCM_SNAPSHOT_MISC_HOST_CTRL)?;
+    println!("config MISC_HOST_CTRL (as Apple left it) 0x{mhc:08x}");
+    rec.insert("misc_host_ctrl".into(), format!("0x{mhc:08x}").into());
+    let mut words = serde_json::Map::new();
+    let mut changed = 0usize;
+    for &(start, end) in abi::BCM_SNAPSHOT_WINDOWS {
+        println!("-- window 0x{start:04x}..0x{end:04x} (apple / live, * = differs)");
+        for off in (start..end).step_by(4) {
+            let apple = dev.read_snapshot_reg32(off)?;
+            let live = dev.read_reg32(off)?;
+            let mark = if apple != live { '*' } else { ' ' };
+            if apple != live {
+                changed += 1;
+            }
+            if apple != 0 || live != 0 {
+                println!("0x{off:04x} 0x{apple:08x} 0x{live:08x} {mark}");
+            }
+            words.insert(
+                format!("0x{off:04x}"),
+                serde_json::json!({"apple": apple, "live": live}),
+            );
+        }
+    }
+    println!("{changed} word(s) differ between Apple's state and now");
+    rec.insert("words".into(), words.into());
+    emit(json, "snapshot", &rec)
 }
 
 fn cmd_counters(dev: &Device, json: Option<&Path>) -> Result<()> {
@@ -922,6 +956,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Info => cmd_info(&dev, json).map(|_| ()),
         Cmd::Regs => cmd_regs(&dev, json),
+        Cmd::Snapshot => cmd_snapshot(&dev, json),
         Cmd::Counters => cmd_counters(&dev, json),
         Cmd::Clock {
             seconds,

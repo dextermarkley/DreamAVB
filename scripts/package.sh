@@ -12,10 +12,14 @@ set -euo pipefail
 ROOT="$(/bin/realpath "$(/usr/bin/dirname "$0")/..")"
 SCRATCH="$ROOT/.agents/tmp"
 BUILD="$ROOT/build"
-# Only the I210 dext is embedded and signed. The BCM dext is still built as a
-# compile-regression check but never packaged.
+# Both dexts are embedded and signed. The I210 one is what `avb-installer
+# activate` installs by default; the BCM one (Apple's Thunderbolt adapter,
+# user-authorized 2026-11-04) only with `activate --dext bcm57762`.
 DEXT_ID="com.avbaudio.installer.i210"
 DEXT_ENT="$ROOT/driver/AVBI210Driver/AVBI210Driver.entitlements"
+BCM_DEXT_ID="com.avbaudio.installer.bcm57762"
+BCM_DEXT_ENT="$ROOT/driver/AVBBcmDriver/AVBBcmDriver.entitlements"
+BCM_DEXT_BUILT="$BUILD/driver/Debug-driverkit/$BCM_DEXT_ID.dext"
 APP="$BUILD/AVBInstaller.app"
 # Optional provisioning profiles. A restricted entitlement is only AUTHORIZED
 # when a profile allowlisting it is embedded in the bundle; without them the
@@ -131,26 +135,32 @@ cp "$ROOT/target/release/avb-probe" "$APP/Contents/MacOS/avb-probe"
 cp "$ROOT/target/release/avb-daemon" "$APP/Contents/MacOS/avb-daemon"
 DEXT="$APP/Contents/Library/SystemExtensions/$DEXT_ID.dext"
 cp -R "$DEXT_BUILT" "$DEXT"
+BCM_DEXT="$APP/Contents/Library/SystemExtensions/$BCM_DEXT_ID.dext"
+cp -R "$BCM_DEXT_BUILT" "$BCM_DEXT"
 
 # DriverKit refuses to exec a non-arm64e platform binary (Phase 0 lesson).
-DEXT_EXE="$DEXT/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$DEXT/Info.plist")"
-ARCHS="$(/usr/bin/lipo -archs "$DEXT_EXE")"
-if [ "$ARCHS" != "arm64e" ]; then
-    echo "dext executable archs are '$ARCHS', expected exactly arm64e" >&2
-    exit 1
-fi
-echo "dext executable archs: $ARCHS"
+for d in "$DEXT" "$BCM_DEXT"; do
+    DEXT_EXE="$d/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$d/Info.plist")"
+    ARCHS="$(/usr/bin/lipo -archs "$DEXT_EXE")"
+    if [ "$ARCHS" != "arm64e" ]; then
+        echo "dext executable archs are '$ARCHS' in $d, expected exactly arm64e" >&2
+        exit 1
+    fi
+    echo "dext executable archs: $ARCHS ($(/usr/bin/basename "$d"))"
+done
 
 # sysextd only replaces an installed extension when the version increases.
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$DEXT/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$DEXT/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$BCM_DEXT/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$BCM_DEXT/Info.plist"
 
 for p in "$APP/Contents/Info.plist" "$DEXT/Info.plist" \
          "$ROOT/packaging/installer.entitlements" "$ROOT/packaging/probe.entitlements" \
          "$ROOT/packaging/daemon.entitlements" \
-         "$DEXT_ENT"; do
+         "$DEXT_ENT" "$BCM_DEXT/Info.plist" "$BCM_DEXT_ENT"; do
     /usr/bin/plutil -lint "$p"
 done
 
@@ -180,6 +190,8 @@ embed_profile "$APP_PROFILE" "$APP/Contents/embedded.provisionprofile" "app"
 echo "== sign (inside-out)"
 /usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none \
     --entitlements "$DEXT_ENT" "$DEXT"
+/usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none \
+    --entitlements "$BCM_DEXT_ENT" "$BCM_DEXT"
 /usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none -o runtime \
     --entitlements "$ROOT/packaging/probe.entitlements" "$APP/Contents/MacOS/avb-probe"
 /usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none -o runtime \
@@ -189,12 +201,13 @@ echo "== sign (inside-out)"
 
 echo "== verify"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
-for item in "$DEXT" "$APP/Contents/MacOS/avb-probe" "$APP/Contents/MacOS/avb-daemon" "$APP"; do
+for item in "$DEXT" "$BCM_DEXT" "$APP/Contents/MacOS/avb-probe" "$APP/Contents/MacOS/avb-daemon" "$APP"; do
     echo "-- entitlements: $item"
     /usr/bin/codesign -d --entitlements - "$item"
 done
 echo "-- dext IOKitPersonalities"
 /usr/bin/plutil -extract IOKitPersonalities xml1 -o - "$DEXT/Info.plist" | /usr/bin/plutil -p -
+/usr/bin/plutil -extract IOKitPersonalities xml1 -o - "$BCM_DEXT/Info.plist" | /usr/bin/plutil -p -
 echo "-- embedded system extensions"
 /bin/ls "$APP/Contents/Library/SystemExtensions"
 echo "packaged: $APP"

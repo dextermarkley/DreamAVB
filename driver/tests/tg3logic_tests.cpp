@@ -198,7 +198,39 @@ static void testFrameAndComposites() {
     std::printf("pass: ethertype / Stage B composite register values\n");
 }
 
+// The Apple-state snapshot covers exactly the listed windows, contiguously
+// indexed, and nothing in the MAC statistics block (0x800+) that may clear
+// on read.
+static void testSnapshot() {
+    CHECK(kSnapWords == (0x300u + 0x100u * 5u + 0x200u) / 4u);
+    CHECK(snapIndex(0x0400) == 0);
+    CHECK(snapIndex(0x06fc) == 0x300 / 4 - 1);
+    CHECK(snapIndex(0x2000) == 0x300 / 4);
+    CHECK(snapIndex(0x06c8) >= 0);  // RX_PTP_CTL
+    CHECK(snapIndex(0x06b0) >= 0);  // RX timestamp LSB
+    CHECK(snapIndex(0x05c0) >= 0);  // TX timestamp LSB
+    CHECK(snapIndex(0x6800) >= 0);  // GRC_MODE
+    CHECK(snapIndex(0x6928) >= 0);  // EAV correction
+    CHECK(snapIndex(0x69fc) == static_cast<int32_t>(kSnapWords) - 1);
+    CHECK(snapIndex(0x0800) == -1);  // MAC statistics: never captured
+    CHECK(snapIndex(0x0700) == -1);
+    CHECK(snapIndex(0x6a00) == -1);
+    CHECK(snapIndex(0x06c9) == -1);  // unaligned
+    CHECK(snapIndex(0x0000) == -1);
+    // Indices are unique and dense.
+    int32_t last = -1;
+    for (const auto& w : kSnapWindows) {
+        for (uint32_t off = w.start; off < w.end; off += 4) {
+            CHECK(snapIndex(off) == last + 1);
+            last = snapIndex(off);
+        }
+    }
+    CHECK((kReadSnapshotFlag & 0xffffffffull) == 0);
+    std::printf("pass: Apple-state snapshot windows\n");
+}
+
 int main() {
+    testSnapshot();
     testCorrection();
     testTxBd();
     testRxBd();

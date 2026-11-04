@@ -455,6 +455,24 @@ impl Device {
         Ok((out[0], out[1], out[2]))
     }
 
+    /// Read one word of the BCM dext's Start snapshot: the register state
+    /// Apple's driver left, captured before the dext wrote anything. `off`
+    /// must lie in [`crate::abi::BCM_SNAPSHOT_WINDOWS`];
+    /// [`crate::abi::BCM_SNAPSHOT_MISC_HOST_CTRL`] reads the captured
+    /// config-space MISC_HOST_CTRL. Only the Broadcom dext implements this.
+    pub fn read_snapshot_reg32(&self, off: u32) -> Result<u32> {
+        let mut out = [0u64; 1];
+        self.call(
+            sel::READ_REG32,
+            &[u64::from(off) | crate::abi::READ_SNAPSHOT_FLAG],
+            &[],
+            &mut out,
+            None,
+            "ReadReg32(snapshot)",
+        )?;
+        Ok(out[0] as u32)
+    }
+
     pub fn read_reg32(&self, off: u32) -> Result<u32> {
         if off >= self.profile.reg_read_limit || off & 3 != 0 {
             bail!("register offset 0x{off:x} out of range or unaligned");

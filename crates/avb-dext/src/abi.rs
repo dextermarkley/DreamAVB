@@ -15,6 +15,26 @@
 /// Compare against [`ABI_VERSION_SEND_FRAMES`] to pick the path instead.
 pub const ABI_VERSION: u32 = 5;
 
+/// `kAvbSelReadReg32` with this bit set in the offset reads the BCM dext's
+/// Start snapshot instead of the live register (`kReadSnapshotFlag` in
+/// `driver/AVBBcmDriver/Tg3Logic.hpp`).
+pub const READ_SNAPSHOT_FLAG: u64 = 1 << 32;
+
+/// Pseudo-offset for the snapshot's config-space MISC_HOST_CTRL.
+pub const BCM_SNAPSHOT_MISC_HOST_CTRL: u32 = 0xffff_ffff;
+
+/// The register windows the BCM dext captures at Start, `(start, end)` with
+/// `end` exclusive. Mirrors `kSnapWindows` in `Tg3Logic.hpp`.
+pub const BCM_SNAPSHOT_WINDOWS: &[(u32, u32)] = &[
+    (0x0400, 0x0700),
+    (0x2000, 0x2100),
+    (0x2400, 0x2500),
+    (0x3600, 0x3700),
+    (0x4800, 0x4900),
+    (0x4c00, 0x4d00),
+    (0x6800, 0x6a00),
+];
+
 /// First ABI version with [`sel::SEND_FRAMES`]; below this, batch by looping.
 pub const ABI_VERSION_SEND_FRAMES: u32 = 4;
 
@@ -779,6 +799,18 @@ impl StreamFilter {
 
 #[cfg(test)]
 mod tests {
+    /// Pinned to `kSnapWindows` / `kSnapWords` in Tg3Logic.hpp (640 words).
+    #[test]
+    fn bcm_snapshot_windows_match_the_dext() {
+        let words: u32 = BCM_SNAPSHOT_WINDOWS.iter().map(|(a, b)| (b - a) / 4).sum();
+        assert_eq!(words, 640);
+        assert_eq!(READ_SNAPSHOT_FLAG & 0xffff_ffff, 0);
+        // Never the MAC statistics block (counters may clear on read).
+        assert!(BCM_SNAPSHOT_WINDOWS
+            .iter()
+            .all(|&(a, b)| b <= 0x800 || a >= 0x900));
+    }
+
     use super::*;
     use std::mem::{offset_of, size_of};
 

@@ -209,6 +209,52 @@ constexpr bool isReadableRegOffset(uint64_t off) {
     return off < kBcmRegReadLimit && (off & 3u) == 0;
 }
 
+// ---------------------------------------------------------------------------
+// Apple-state snapshot: register windows READ (never written) at Start,
+// before Stage A's first write, to observe how Apple's BCM5701Enet left the
+// chip. Apple's driver gets working RX PTP timestamps on this part; the
+// tg3-documented RX path does not latch for us, so the configuration Apple
+// leaves behind is the evidence. Windows are standard register blocks (MAC
+// 0x400-0x6ff incl. TX/RX timestamp and RX_PTP_CTL, receive list placement,
+// receive BD initiator, CPMU, read/write DMA, GRC + EAV); the MAC statistics
+// block at 0x800 is excluded because its counters may clear on read.
+struct SnapWindow {
+    uint32_t start;
+    uint32_t end;  // exclusive
+};
+constexpr SnapWindow kSnapWindows[] = {
+    {0x0400u, 0x0700u}, {0x2000u, 0x2100u}, {0x2400u, 0x2500u}, {0x3600u, 0x3700u},
+    {0x4800u, 0x4900u}, {0x4c00u, 0x4d00u}, {0x6800u, 0x6a00u},
+};
+constexpr uint32_t snapWindowWords(const SnapWindow& w) { return (w.end - w.start) / 4u; }
+constexpr uint32_t kSnapWords = [] {
+    uint32_t n = 0;
+    for (const auto& w : kSnapWindows) {
+        n += snapWindowWords(w);
+    }
+    return n;
+}();
+
+// Index of `off` in the snapshot array, or -1 if it is not a captured,
+// aligned offset.
+constexpr int32_t snapIndex(uint32_t off) {
+    if ((off & 3u) != 0) {
+        return -1;
+    }
+    uint32_t base = 0;
+    for (const auto& w : kSnapWindows) {
+        if (off >= w.start && off < w.end) {
+            return static_cast<int32_t>(base + (off - w.start) / 4u);
+        }
+        base += snapWindowWords(w);
+    }
+    return -1;
+}
+
+// kAvbSelReadReg32 with this bit set in the offset argument reads the Start
+// snapshot instead of the live register.
+constexpr uint64_t kReadSnapshotFlag = 1ull << 32;
+
 // Little-endian u16 from a byte buffer (status block fields).
 constexpr uint16_t le16At(const uint8_t* p, uint32_t off) {
     return static_cast<uint16_t>(p[off] | (static_cast<uint16_t>(p[off + 1]) << 8));
