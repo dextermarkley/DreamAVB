@@ -195,6 +195,15 @@
       </div>
 
       <div class="card">
+        <div class="label">Output headroom</div>
+        <select id="headroom" title="How far ahead each packet is timestamped. More headroom rides out longer system stalls without a dropout, and adds the same amount of output latency."></select>
+        <div class="clock-eff" id="headroomEff">
+          <span id="headroomText">—</span>
+        </div>
+        <button id="headroomRestart" style="display: none; margin-top: 9px;">Restart audio to apply</button>
+      </div>
+
+      <div class="card">
         <div class="label">Preferences</div>
         <div class="toggle-row">
           <div class="state-text">

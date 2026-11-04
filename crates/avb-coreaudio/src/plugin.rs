@@ -69,10 +69,43 @@ const SAFETY_OFFSET: u32 = 0;
 fn device_latency(scope: UInt32) -> u32 {
     match scope {
         x if x == kAudioObjectPropertyScopeInput => INPUT_LATENCY_FRAMES,
-        x if x == kAudioObjectPropertyScopeOutput => OUTPUT_LATENCY_FRAMES,
+        x if x == kAudioObjectPropertyScopeOutput => output_latency_frames(),
         // Global/wildcard: the HAL asks per scope; report the larger.
-        _ => INPUT_LATENCY_FRAMES.max(OUTPUT_LATENCY_FRAMES),
+        _ => INPUT_LATENCY_FRAMES.max(output_latency_frames()),
     }
+}
+
+/// Output latency for the presentation offset the daemon is using: the user
+/// can change it (the companion's Headroom setting) and the daemon publishes
+/// the value in force in the output ring header. Falls back to the default
+/// when no daemon has published one.
+fn output_latency_frames() -> u32 {
+    output_latency_for(published_presentation_offset_ns())
+}
+
+fn output_latency_for(published_ns: Option<u64>) -> u32 {
+    match published_ns {
+        Some(ns) => {
+            (DEVICE_RATE * ns as f64 / 1e9) as u32 + avb_audioring::OUTPUT_QUEUE_KEEP_FRAMES as u32
+        }
+        None => OUTPUT_LATENCY_FRAMES,
+    }
+}
+
+/// The offset in the output ring header: from the ring IO already holds, or
+/// a short read-only attach when IO is not running. Never blocks on IO.
+fn published_presentation_offset_ns() -> Option<u64> {
+    if let Ok(guard) = OUT_IO.try_lock() {
+        if let Some(state) = guard.as_ref() {
+            if !out_ring_is_stale(state) {
+                return state.prod.ring().presentation_offset_ns();
+            }
+        }
+    }
+    avb_audioring::ShmRing::attach_ro_at(avb_audioring::SHM_NAME_OUT)
+        .ok()?
+        .ring()
+        .presentation_offset_ns()
 }
 
 /// Write a value of type `T` into `out_data` if there is room; set the written
@@ -1260,12 +1293,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn output_latency_follows_the_published_headroom() {
+        // No daemon published one: the default, 96 + 24.
+        assert_eq!(output_latency_for(None), 120);
+        // 3 ms headroom: 144 + 24.
+        assert_eq!(output_latency_for(Some(3_000_000)), 168);
+        assert_eq!(output_latency_for(Some(2_000_000)), OUTPUT_LATENCY_FRAMES);
+    }
+
+    #[test]
     fn latency_is_reported_per_scope() {
         // 2 ms at 48 kHz, pinned to the literal value.
         // 2 ms presentation offset (96) + 24-frame output queue floor.
-        assert_eq!(device_latency(kAudioObjectPropertyScopeOutput), 120);
+        // Output reads the live ring header (a running daemon may publish a
+        // non-default headroom), so it is pinned in
+        // `output_latency_follows_the_published_headroom` instead.
+        assert_eq!(OUTPUT_LATENCY_FRAMES, 120);
         assert_eq!(device_latency(kAudioObjectPropertyScopeInput), 64);
-        assert_eq!(device_latency(kAudioObjectPropertyScopeGlobal), 120);
+        assert!(device_latency(kAudioObjectPropertyScopeGlobal) >= 64);
     }
 
     #[test]

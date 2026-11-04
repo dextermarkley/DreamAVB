@@ -3471,8 +3471,36 @@ fn talker_loop(
     //
     // Shared with the CoreAudio plug-in, which reports it as output latency;
     // see `TALKER_PRESENTATION_OFFSET_NS` for why it stays at 2 ms.
-    let presentation_offset_ns = avb_audioring::TALKER_PRESENTATION_OFFSET_NS;
-    debug_assert!(presentation_offset_ns <= PRESENTATION_FLOOR_NS);
+    //
+    // The user can change it ("Headroom" in the companion app,
+    // `presentation_offset_us` in config.txt): more rides out longer stalls
+    // without a dropout, at the cost of the same amount of output latency.
+    // Read once per run; the plug-in learns it from the output ring header.
+    let presentation_offset_ns = u64::from(avb_config::Config::load().0.presentation_offset_us)
+        .saturating_mul(1_000)
+        .clamp(
+            *avb_audioring::PRESENTATION_OFFSET_RANGE_NS.start(),
+            *avb_audioring::PRESENTATION_OFFSET_RANGE_NS.end(),
+        );
+    let max_catchup = max_catchup_intervals(presentation_offset_ns);
+    // Tell the plug-in, which reports it to Core Audio as output latency.
+    out_ring
+        .ring()
+        .set_presentation_offset_ns(presentation_offset_ns);
+    log.log(
+        Level::Info,
+        "play",
+        &format!(
+            "output headroom (presentation offset) {} us; catch up to {max_catchup} late \
+             interval(s) before dropping audio{}",
+            presentation_offset_ns / 1_000,
+            if presentation_offset_ns > PRESENTATION_FLOOR_NS {
+                " — above the 2 ms Milan maximum; a listener may not buffer that far ahead"
+            } else {
+                ""
+            }
+        ),
+    );
 
     // Without this the loop is an ordinary timeshare thread: measured on this
     // machine it missed ~12 intervals a second (each one a dropped PDU and a
@@ -6215,6 +6243,7 @@ fn talker_loop(
             presentation_timeline.peek_next(pdu_interval_ns),
             pace_target,
             pdu_interval_ns,
+            max_catchup,
         ) {
             Pace::Wait => {
                 std::thread::sleep(std::time::Duration::from_micros(20));
@@ -6926,6 +6955,12 @@ const RX_AUDIO_MAX_BATCHES_PER_PASS: usize = 128;
 /// intervals dropped lock on every sink of both mixers.
 const MAX_CATCHUP_INTERVALS: u64 = avb_audioring::TALKER_PRESENTATION_OFFSET_NS * 3 / 4 / 125_000;
 
+/// [`MAX_CATCHUP_INTERVALS`] for a configured presentation offset: three
+/// quarters of it, so a caught-up PDU keeps a quarter of the headroom.
+fn max_catchup_intervals(presentation_offset_ns: u64) -> u64 {
+    (presentation_offset_ns * 3 / 4 / 125_000).max(1)
+}
+
 /// Minimum spacing between intervals on the wire, on the Mac clock.
 ///
 /// Measured: sending a late interval back to back with the next one (16
@@ -7004,7 +7039,7 @@ enum Pace {
 /// target. The grid itself is never moved for small jitter, which is what
 /// keeps a Milan listener's media lock: timestamps advance by exactly one
 /// interval per PDU.
-fn pacing_decision(next_ts: Option<u64>, target: u64, interval_ns: u64) -> Pace {
+fn pacing_decision(next_ts: Option<u64>, target: u64, interval_ns: u64, max_catchup: u64) -> Pace {
     let Some(next) = next_ts else {
         return Pace::Send { retire: 0 };
     };
@@ -7021,11 +7056,7 @@ fn pacing_decision(next_ts: Option<u64>, target: u64, interval_ns: u64) -> Pace 
         }
         let late = behind.checked_div(interval_ns).unwrap_or(0);
         Pace::Send {
-            retire: if late >= MAX_CATCHUP_INTERVALS {
-                late
-            } else {
-                0
-            },
+            retire: if late >= max_catchup { late } else { 0 },
         }
     }
 }
@@ -8814,19 +8845,37 @@ mod talker_tests {
         let i = 125_000u64;
         let t = 10_000_000_000u64;
         // Unanchored: send, and the timeline anchors itself at the target.
-        assert_eq!(pacing_decision(None, t, i), Pace::Send { retire: 0 });
+        assert_eq!(
+            pacing_decision(None, t, i, MAX_CATCHUP_INTERVALS),
+            Pace::Send { retire: 0 }
+        );
         // Due exactly now, or a hair late: send, no retire, no re-anchor.
-        assert_eq!(pacing_decision(Some(t), t, i), Pace::Send { retire: 0 });
-        assert_eq!(pacing_decision(Some(t - 1), t, i), Pace::Send { retire: 0 });
+        assert_eq!(
+            pacing_decision(Some(t), t, i, MAX_CATCHUP_INTERVALS),
+            Pace::Send { retire: 0 }
+        );
+        assert_eq!(
+            pacing_decision(Some(t - 1), t, i, MAX_CATCHUP_INTERVALS),
+            Pace::Send { retire: 0 }
+        );
         // A hair or a whole interval early: wait. This used to re-anchor,
         // shifting the grid by a fraction of an interval ~2 000 times a
         // second, and the 16R never locked.
-        assert_eq!(pacing_decision(Some(t + 1), t, i), Pace::Wait);
-        assert_eq!(pacing_decision(Some(t + i), t, i), Pace::Wait);
-        assert_eq!(pacing_decision(Some(t + MAX_AHEAD_NS), t, i), Pace::Wait);
+        assert_eq!(
+            pacing_decision(Some(t + 1), t, i, MAX_CATCHUP_INTERVALS),
+            Pace::Wait
+        );
+        assert_eq!(
+            pacing_decision(Some(t + i), t, i, MAX_CATCHUP_INTERVALS),
+            Pace::Wait
+        );
+        assert_eq!(
+            pacing_decision(Some(t + MAX_AHEAD_NS), t, i, MAX_CATCHUP_INTERVALS),
+            Pace::Wait
+        );
         // Far ahead of gPTP: the clock stepped back, start a new grid.
         assert_eq!(
-            pacing_decision(Some(t + MAX_AHEAD_NS + 1), t, i),
+            pacing_decision(Some(t + MAX_AHEAD_NS + 1), t, i, MAX_CATCHUP_INTERVALS),
             Pace::Reanchor
         );
     }
@@ -8840,24 +8889,24 @@ mod talker_tests {
         // Up to 11 intervals late: send them all, retire nothing.
         for late in 0..MAX_CATCHUP_INTERVALS {
             assert_eq!(
-                pacing_decision(Some(t - late * i), t, i),
+                pacing_decision(Some(t - late * i), t, i, MAX_CATCHUP_INTERVALS),
                 Pace::Send { retire: 0 },
                 "late={late}"
             );
         }
         // At or past the bound: those timestamps are too close to now; retire.
         assert_eq!(
-            pacing_decision(Some(t - 12 * i), t, i),
+            pacing_decision(Some(t - 12 * i), t, i, MAX_CATCHUP_INTERVALS),
             Pace::Send { retire: 12 }
         );
         assert_eq!(
-            pacing_decision(Some(t - 40 * i), t, i),
+            pacing_decision(Some(t - 40 * i), t, i, MAX_CATCHUP_INTERVALS),
             Pace::Send { retire: 40 }
         );
         // A long stall or a forward clock step: re-anchor instead of
         // discarding seconds of audio.
         assert_eq!(
-            pacing_decision(Some(t - MAX_BEHIND_NS - 1), t, i),
+            pacing_decision(Some(t - MAX_BEHIND_NS - 1), t, i, MAX_CATCHUP_INTERVALS),
             Pace::Reanchor
         );
     }

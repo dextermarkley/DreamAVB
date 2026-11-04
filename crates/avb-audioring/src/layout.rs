@@ -52,6 +52,11 @@ pub mod field {
     /// a reader that ignores it behaves exactly as before.
     pub const EFFECTIVE_CLOCK: usize = 44;
     pub const CONFIG_GENERATION: usize = 48;
+    /// The presentation offset the daemon's talker is stamping, in ns (u64),
+    /// so the plug-in reports the output latency actually in force. 0 means
+    /// never written (an older daemon): use the default. A previously unused
+    /// word, so the ring ABI version is unchanged.
+    pub const PRESENTATION_OFFSET_NS: usize = 56;
     pub const WRITE_FRAME: usize = 128;
     pub const READ_FRAME: usize = 256;
     /// Clock block (128 B): seq, pad, anchor_frame, anchor_mach,

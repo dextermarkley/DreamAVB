@@ -789,6 +789,75 @@ fn live_published_effective_clock() -> Option<EffectiveClock> {
 ///
 /// `async` so Tauri runs it off the main thread: reading the shared ring and
 /// reaping the supervised child are both process-level operations.
+/// Output headroom (the talker's presentation offset) for the UI: what is
+/// saved, what the running daemon is actually using, and the allowed range.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HeadroomInfo {
+    /// Saved setting, microseconds.
+    pub saved_us: u32,
+    /// What the running daemon published, microseconds. `None` when audio is
+    /// off or the daemon predates the setting.
+    pub active_us: Option<u32>,
+    pub default_us: u32,
+    pub min_us: u32,
+    pub max_us: u32,
+    /// The output latency the saved value implies, in ms at 48 kHz:
+    /// headroom plus the 0.5 ms output-queue floor.
+    pub output_latency_ms: f64,
+}
+
+fn headroom_info(saved_us: u32, active_us: Option<u32>) -> HeadroomInfo {
+    HeadroomInfo {
+        saved_us,
+        active_us,
+        default_us: avb_config::DEFAULT_PRESENTATION_OFFSET_US,
+        min_us: *avb_config::PRESENTATION_OFFSET_US_RANGE.start(),
+        max_us: *avb_config::PRESENTATION_OFFSET_US_RANGE.end(),
+        output_latency_ms: f64::from(saved_us) / 1000.0
+            + avb_audioring::OUTPUT_QUEUE_KEEP_FRAMES as f64 / 48.0,
+    }
+}
+
+/// The headroom the running daemon published in the output ring header.
+fn published_headroom_us() -> Option<u32> {
+    let shm = avb_audioring::ShmRing::attach_ro_at(avb_audioring::SHM_NAME_OUT).ok()?;
+    u32::try_from(shm.ring().presentation_offset_ns()? / 1_000).ok()
+}
+
+#[tauri::command]
+async fn get_headroom() -> HeadroomInfo {
+    let (cfg, _) = Config::load();
+    let running = {
+        let mut guard = match AUDIO.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        audio_status_locked(&mut guard).running
+    };
+    headroom_info(
+        cfg.presentation_offset_us,
+        running.then(published_headroom_us).flatten(),
+    )
+}
+
+/// Save a new headroom. It takes effect when audio next starts; the UI offers
+/// the restart, because restarting interrupts audio for a few seconds.
+#[tauri::command]
+async fn set_headroom(us: u32) -> Result<HeadroomInfo, String> {
+    if !avb_config::PRESENTATION_OFFSET_US_RANGE.contains(&us) {
+        return Err(format!(
+            "headroom {us} us is outside {}..={} us",
+            avb_config::PRESENTATION_OFFSET_US_RANGE.start(),
+            avb_config::PRESENTATION_OFFSET_US_RANGE.end()
+        ));
+    }
+    let (mut cfg, _) = Config::load();
+    cfg.presentation_offset_us = us;
+    cfg.save()
+        .map_err(|e| format!("could not save settings: {e}"))?;
+    Ok(get_headroom().await)
+}
+
 #[tauri::command]
 async fn get_clock_source() -> ClockSourceInfo {
     let (cfg, warnings) = Config::load();
@@ -1876,6 +1945,8 @@ pub fn run() {
             open_project_page,
             get_clock_source,
             set_clock_source,
+            get_headroom,
+            set_headroom,
             get_launch_at_login,
             set_launch_at_login,
             get_auto_select_nic,
@@ -1984,6 +2055,15 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headroom_info_reports_range_and_latency() {
+        let h = headroom_info(2_000, Some(2_000));
+        assert_eq!((h.min_us, h.max_us, h.default_us), (1_000, 5_000, 2_000));
+        // 2 ms headroom + 24 frames (0.5 ms) of output queue.
+        assert!((h.output_latency_ms - 2.5).abs() < 1e-9);
+        assert_eq!(headroom_info(3_000, None).active_us, None);
+    }
 
     const R16: u64 = 0x000a_92ff_fe03_3ba9;
     const R24: u64 = 0x000a_92ff_fe04_0001;

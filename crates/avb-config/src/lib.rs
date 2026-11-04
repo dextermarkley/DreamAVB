@@ -251,7 +251,7 @@ pub fn parse_bool(s: &str) -> Option<bool> {
 }
 
 /// The user-settable configuration.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
     pub clock_source: ClockSource,
     /// Start the companion app automatically at login. Default OFF: an audio
@@ -265,7 +265,32 @@ pub struct Config {
     /// (that stays an explicit user action), and it only acts when the choice
     /// is unambiguous (see [`auto_select_nic`]).
     pub auto_select_nic: bool,
+    /// Output headroom: how far ahead of now the talker stamps each AVB
+    /// presentation time, in microseconds. More headroom rides out longer
+    /// scheduling stalls without a dropout, at the cost of the same amount of
+    /// output latency. Default [`DEFAULT_PRESENTATION_OFFSET_US`]; values
+    /// outside [`PRESENTATION_OFFSET_US_RANGE`] are refused with a warning.
+    pub presentation_offset_us: u32,
 }
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            clock_source: ClockSource::default(),
+            launch_at_login: false,
+            auto_select_nic: false,
+            presentation_offset_us: DEFAULT_PRESENTATION_OFFSET_US,
+        }
+    }
+}
+
+/// Default output headroom, µs (the Milan maximum presentation offset).
+pub const DEFAULT_PRESENTATION_OFFSET_US: u32 = 2_000;
+
+/// Accepted output headroom, µs. Mirrors
+/// `avb_audioring::PRESENTATION_OFFSET_RANGE_NS`: below 1 ms the 16R did not
+/// hold lock; above 5 ms is well past a Milan listener's 2.126 ms buffer.
+pub const PRESENTATION_OFFSET_US_RANGE: std::ops::RangeInclusive<u32> = 1_000..=5_000;
 
 /// Why auto-select did not pick a NIC. Carries enough for the UI to explain
 /// itself without guessing.
@@ -384,6 +409,19 @@ impl Config {
                         cfg.auto_select_nic
                     )),
                 },
+                "presentation_offset_us" => match value.trim().parse::<u32>() {
+                    Ok(us) if PRESENTATION_OFFSET_US_RANGE.contains(&us) => {
+                        cfg.presentation_offset_us = us;
+                    }
+                    _ => warnings.push(format!(
+                        "line {}: presentation_offset_us {:?} is not {}..={} us; using {}",
+                        i + 1,
+                        value.trim(),
+                        PRESENTATION_OFFSET_US_RANGE.start(),
+                        PRESENTATION_OFFSET_US_RANGE.end(),
+                        cfg.presentation_offset_us
+                    )),
+                },
                 other => warnings.push(format!("line {}: unknown key {other:?}", i + 1)),
             }
         }
@@ -396,8 +434,12 @@ impl Config {
             "# DreamAVB settings. Written by the companion app; read by avb-daemon.\n\
              clock_source={}\n\
              launch_at_login={}\n\
-             auto_select_nic={}\n",
-            self.clock_source, self.launch_at_login, self.auto_select_nic
+             auto_select_nic={}\n\
+             presentation_offset_us={}\n",
+            self.clock_source,
+            self.launch_at_login,
+            self.auto_select_nic,
+            self.presentation_offset_us
         )
     }
 
@@ -425,6 +467,28 @@ pub mod routing;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_offset_parses_bounds_and_round_trips() {
+        assert_eq!(Config::default().presentation_offset_us, 2_000);
+        let (cfg, w) = Config::parse("presentation_offset_us=3000\n");
+        assert_eq!(cfg.presentation_offset_us, 3_000);
+        assert!(w.is_empty());
+        // Out of range and junk are refused, keeping the default.
+        for bad in ["500", "9000", "fast"] {
+            let (cfg, w) = Config::parse(&format!("presentation_offset_us={bad}\n"));
+            assert_eq!(cfg.presentation_offset_us, 2_000, "{bad}");
+            assert!(
+                w.iter().any(|m| m.contains("presentation_offset_us")),
+                "{bad}"
+            );
+        }
+        let c = Config {
+            presentation_offset_us: 2_500,
+            ..Config::default()
+        };
+        assert_eq!(Config::parse(&c.to_text()).0, c);
+    }
 
     #[test]
     fn tokens_round_trip() {
@@ -468,6 +532,7 @@ mod tests {
                     clock_source: ClockSource::NetworkGptp,
                     launch_at_login: launch,
                     auto_select_nic: auto,
+                    ..Config::default()
                 };
                 let (back, warnings) = Config::parse(&c.to_text());
                 assert_eq!(back, c, "launch={launch} auto={auto}");

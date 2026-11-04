@@ -58,7 +58,16 @@ pub const CHANNELS_PER_STREAM: u32 = 8;
 /// eight sinks cycled MEDIA_LOCKED / MEDIA_UNLOCKED about once every 5 s with
 /// no new LATE_TIMESTAMP, and at 2 ms the lock counters did not move. Do not
 /// lower this to save latency without repeating that measurement.
+///
+/// This is the DEFAULT. The user can change it (the companion app's
+/// "Headroom" setting, `presentation_offset_us` in config.txt) within
+/// [`PRESENTATION_OFFSET_RANGE_NS`]; the daemon publishes the value in force
+/// in the output ring header so the plug-in reports the matching latency.
 pub const TALKER_PRESENTATION_OFFSET_NS: u64 = 2_000_000;
+
+/// The presentation offsets the daemon accepts. Below 1 ms the 16R never
+/// held lock; above 5 ms is far past a Milan listener's 2.126 ms buffer.
+pub const PRESENTATION_OFFSET_RANGE_NS: std::ops::RangeInclusive<u64> = 1_000_000..=5_000_000;
 
 /// Output-ring frames the talker keeps queued at the LOW point of each write
 /// burst, i.e. the floor the queue is trimmed to. The rest of the queue is
@@ -129,6 +138,20 @@ mod tests {
         assert_eq!(r.load_u32(layout::field::CHANNELS), 4);
         assert_eq!(r.load_u32(layout::field::CAPACITY_FRAMES), 1024);
         assert_eq!(r.frame_bytes(), 16);
+    }
+
+    #[test]
+    fn presentation_offset_is_published_and_bounded() {
+        let r = AudioRing::new_anonymous(&test_config(256)).unwrap();
+        // Never written (an older daemon): no value, so readers use the default.
+        assert_eq!(r.presentation_offset_ns(), None);
+        r.set_presentation_offset_ns(3_000_000);
+        assert_eq!(r.presentation_offset_ns(), Some(3_000_000));
+        // Out of range is treated as not published.
+        r.set_presentation_offset_ns(50_000_000);
+        assert_eq!(r.presentation_offset_ns(), None);
+        // The default sits inside the accepted range.
+        assert!(PRESENTATION_OFFSET_RANGE_NS.contains(&TALKER_PRESENTATION_OFFSET_NS));
     }
 
     #[test]

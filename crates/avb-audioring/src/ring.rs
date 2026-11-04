@@ -326,6 +326,20 @@ impl AudioRing {
         self.store_u32(field::EFFECTIVE_CLOCK, code);
     }
 
+    /// Publish the presentation offset the talker stamps (writer = daemon).
+    pub fn set_presentation_offset_ns(&self, ns: u64) {
+        self.store_u64(field::PRESENTATION_OFFSET_NS, ns);
+    }
+
+    /// The published presentation offset, or `None` if no daemon wrote one
+    /// or the value is outside [`crate::PRESENTATION_OFFSET_RANGE_NS`].
+    pub fn presentation_offset_ns(&self) -> Option<u64> {
+        let v = self.load_u64(field::PRESENTATION_OFFSET_NS);
+        crate::PRESENTATION_OFFSET_RANGE_NS
+            .contains(&v)
+            .then_some(v)
+    }
+
     /// The published effective-clock code, or 0 if a daemon never wrote one.
     pub fn effective_clock(&self) -> u32 {
         self.load_u32(field::EFFECTIVE_CLOCK)

@@ -653,3 +653,86 @@ el("autoSelectNic").addEventListener("change", async (ev) => {
   refreshMapSummary();
   setInterval(refreshMapSummary, 5000);
 })();
+
+
+// ---- Output headroom --------------------------------------------------------
+//
+// The talker's presentation offset. Saved to config.txt; the daemon reads it
+// when audio starts, so a change needs an explicit restart (which interrupts
+// audio for a few seconds, hence a button rather than doing it silently).
+let headroomBuilt = false;
+let headroomApplying = false;
+
+function paintHeadroom(h) {
+  if (!h) return;
+  const sel = el("headroom");
+  if (!headroomBuilt) {
+    sel.innerHTML = "";
+    for (let us = h.min_us; us <= h.max_us; us += 250) {
+      const opt = document.createElement("option");
+      opt.value = String(us);
+      const ms = (us / 1000).toFixed(2).replace(/0$/, "");
+      opt.textContent = `${ms} ms${us === h.default_us ? " (default)" : ""}${us > 2000 ? " — above Milan's 2 ms" : ""}`;
+      sel.appendChild(opt);
+    }
+    headroomBuilt = true;
+  }
+  sel.value = String(h.saved_us);
+  const lat = h.output_latency_ms.toFixed(2);
+  let t = `Output latency ${lat} ms beyond the IO buffer.`;
+  const pending = h.active_us != null && h.active_us !== h.saved_us;
+  if (h.active_us != null) {
+    t += ` Running with ${(h.active_us / 1000).toFixed(2)} ms.`;
+  }
+  if (pending) t += " Restart audio to apply.";
+  el("headroomText").textContent = t;
+  el("headroomEff").classList.toggle("warn", pending);
+  el("headroomRestart").style.display = pending ? "" : "none";
+}
+
+async function refreshHeadroom() {
+  if (headroomApplying) return;
+  try {
+    paintHeadroom(await invoke("get_headroom"));
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+el("headroom").addEventListener("change", async (ev) => {
+  headroomApplying = true;
+  ev.target.disabled = true;
+  try {
+    paintHeadroom(await invoke("set_headroom", { us: Number(ev.target.value) }));
+  } catch (e) {
+    el("headroomText").textContent = `Not saved: ${e}`;
+    el("headroomEff").classList.add("warn");
+  } finally {
+    ev.target.disabled = false;
+    headroomApplying = false;
+  }
+});
+
+el("headroomRestart").addEventListener("click", async () => {
+  const b = el("headroomRestart");
+  b.disabled = true;
+  try {
+    await invoke("stop_audio");
+    paintAudio(await invoke("start_audio"));
+    // The daemon publishes the new value once it is up; poll briefly.
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const h = await invoke("get_headroom");
+      paintHeadroom(h);
+      if (h.active_us === h.saved_us) break;
+    }
+  } catch (e) {
+    el("headroomText").textContent = `Restart failed: ${e}`;
+    el("headroomEff").classList.add("warn");
+  } finally {
+    b.disabled = false;
+  }
+});
+
+refreshHeadroom();
+setInterval(refreshHeadroom, 5000);
