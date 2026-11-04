@@ -138,3 +138,53 @@ Apple-written values to confirm which writes are the live difference.
 3. In the dext, program the 0x5400 block for ethertype 0x88F7 after GRC time
    sync enable, reading each register first and logging every write, then
    check whether RX timestamps latch (the Phase 0 G3 gate).
+
+## Result: the 0x5400 block is behind the RX CPU, not plain MMIO (2026-11-04)
+
+Built AVBBcmDriver 307.22.57 with `programAvbRxRules` (replaying Apple's exact
+0x5400 writes, read-first + logged) behind `AVB_INIT_FLAG_AVB_RX_RULES`, took
+the adapter over (replug), brought the datapath up with the flag, and ran the
+Phase 0 G3 gate (`avb-probe --nic bcm rx-ptp`). Result: **still 0 RX
+timestamps** — `type_flags = 0x0004` on every Pdelay_Req, exactly as Phase 0.
+
+Reading the registers back (`avb-probe --nic bcm snapshot`, live column)
+explains why:
+
+- 0x5000-0x53ff is the **RX CPU** (tg3 `RX_CPU_BASE = 0x5000`). It is running
+  firmware under our driver: `RX_CPU_STATE` (0x5004) and the program counter
+  (0x501c) advance between reads, and 0x5200-0x527c reads back as RISC
+  instructions.
+- Our writes to the 0x5410 / 0x5494 / 0x5498 / 0x5500-0x561c block did NOT
+  stick: every one reads back 0, before and after. 0x5494 taking two different
+  writes (0x88f7ffff then 0x013fffff) confirms it is a write-only indexed port.
+  Only 0x560 (a real MAC register) took its write (0 -> 0xe).
+
+So the 0x5400 classifier is not a bank of plain registers; it is a write-only
+port consumed by the RX CPU firmware. Apple's driver ships that firmware
+(symbols `loadFirmware(FWIMG_INFO*)`, `WaitForFirmwareInit`, `WriteFirmwareSig`,
+`HaltCpu`) and loads it during bring-up; the classifier entries and the RX BD
+timestamp are produced by that firmware. The stock NVRAM firmware the chip
+runs under our driver does not do it.
+
+### Conclusion
+
+Hardware RX timestamps on the BCM57762/57766 require Broadcom RX-CPU firmware
+with AVB/1588 support. This is consistent with Linux tg3 never setting
+PTP_CAPABLE for this ASIC. The clean-room path (public specs + read-only
+register observation) cannot enable it: the mechanism lives in a proprietary
+firmware blob we do not have and should not extract or ship. The register
+offsets and values were learned read-only; replaying them is insufficient
+without the firmware that consumes them.
+
+Phase 0's verdict stands, now with the mechanism understood: the I210 remains
+the timestamping NIC. `programAvbRxRules` and the snapshot tooling are kept
+(behind the opt-in flag, off by default) as the evidence trail; they change no
+default behaviour.
+
+### Options not taken (need a decision)
+
+1. Extract and load Apple's/Broadcom's RX-CPU firmware blob. Out of the
+   project's clean-room rule, and redistribution is almost certainly not
+   permitted. Not pursued without an explicit decision.
+2. Reverse-engineer and write a clean RX-CPU firmware. Very large effort,
+   undocumented RISC target; disproportionate to the gain.
