@@ -188,3 +188,71 @@ default behaviour.
    permitted. Not pursued without an explicit decision.
 2. Reverse-engineer and write a clean RX-CPU firmware. Very large effort,
    undocumented RISC target; disproportionate to the gain.
+
+### Halt / configure / release test (2026-11-04)
+
+To test whether the 0x5400 writes read back 0 only because the RX CPU is
+running, `programAvbRxRules` now mirrors Apple's `HaltCpu` before replaying the
+classifier writes: save RX_CPU MODE/STATE/PC (0x5000/0x5004/0x501c), write
+STATE=0xffffffff and MODE|=0x400 (HALT), poll for the HALT bit, replay the 22
+writes counting how many read back equal to what was written, then release by
+clearing HALT. Commit `12c6e61`.
+
+Hardware result (BCM dext 307.23.22, link up, I210 untouched):
+
+- `rx-ptp --seconds 12`: 64 Pdelay_Req frames, **0 with a timestamp**
+  (`type_flags=0x0004 has_ts=0 hw_ts=0`). No change from the CPU-running replay.
+- Live snapshot: RX_CPU MODE (0x5000) reads `0x00009800` and the program
+  counter (0x501c) advances between reads, so the core is a running RISC
+  processor executing resident firmware (MIPS opcodes are visible in the
+  0x5200-0x527c window: `lui`/`beq`/`j`). The 0x5400-0x561c block prints no
+  lines at all, i.e. it reads back 0 in both the Apple reference capture and
+  live — confirming it is a **write-only indexed port**, not a register bank,
+  so the snapshot cannot show whether a halted write stuck.
+- The only readback of the halted writes is the dext's `os_log` "(stuck)" /
+  "N of 22 writes stuck while halted" line. It could not be captured here
+  (`log show` is blocked in the agent sandbox); pending a Terminal capture.
+
+This does not change the clean-room verdict, but it sharpens the next
+questions, tracked under "Options not taken" below.
+
+### Where the firmware image comes from (loadFirmware disassembly, 2026-11-04)
+
+Decisive for the legal question. `BCM5701Enet::loadFirmware(FWIMG_INFO*, ...)`
+(`0xffffff800272b530`) halts the CPU (`HaltCpu`), then for each segment reads a
+base/length pair from the `FWIMG_INFO` struct and copies the segment word by
+word into the chip:
+
+    mov rax, qword ptr [r14 + 8]     ; FWIMG_INFO.text_data  (HOST pointer)
+    mov edx, dword ptr [rax + rcx]   ; firmware word from host memory
+    call regWrInd                     ; -> chip
+
+The segment data comes from **host-memory pointers inside the struct** (text at
++0x08, data at +0x28, ...), i.e. an image embedded in Apple's kext, not read
+from the chip's NVRAM. This is the proprietary Broadcom RX-CPU firmware. It is
+loaded during `GrcReset`/`setPower` bring-up, then `WriteFirmwareSig` +
+`WaitForFirmwareInit` hand off to it. Our driver never loads firmware, so the
+chip runs whatever the NVRAM left resident, which does not consume the 0x5400
+classifier config — confirmed by the halt test (3/22 writes stuck, RX_PTP_CTL
+stays 0 even after we write 0x0480000f to 0x6c8).
+
+### Verdict and the options that remain
+
+Working BCM57766 RX timestamps REQUIRE loading a Broadcom RX-CPU firmware image
+that implements the AVB classifier + timestamp latch. There is no MMIO-only
+path; both the tg3-documented register and Apple's classifier block are
+firmware-owned.
+
+1. **Personal-use runtime firmware load (only path to working BCM timestamps).**
+   On the owner's own machine, load the firmware image already present on disk
+   (in Apple's kext) through our `FWIMG_INFO`/`loadFirmware` equivalent. Uses a
+   copy already licensed to that machine; redistributes nothing. Risk: macOS
+   SLA / DMCA-1201 are murky, and it is brittle across OS updates. CANNOT be
+   shipped.
+2. **Ship nothing on BCM; keep the I210 as the timestamping NIC.** Status quo,
+   fully working. Broadcom stays a research artifact behind the opt-in flag.
+3. **Clean-room our own RX-CPU firmware.** Legal but disproportionate:
+   undocumented RISC target, large effort, for one adapter.
+
+Shipping a product keeps the I210 (option 2). Option 1 is viable only as a
+personal-machine experiment for this owner.
