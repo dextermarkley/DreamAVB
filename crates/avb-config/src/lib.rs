@@ -419,6 +419,7 @@ impl Config {
     }
 }
 
+pub mod devices;
 pub mod routing;
 
 #[cfg(test)]

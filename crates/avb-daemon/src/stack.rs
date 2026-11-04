@@ -2648,8 +2648,50 @@ fn talker_loop(
     // does — still before any ACMP, which is what a Milan entity requires
     // (review H3).
     let listener_timeout_ns = opts.discover_timeout.saturating_mul(1_000_000_000);
-    let (listener_id, listener_mac) =
+    let (listener_id, listener_mac, seen_devices) =
         discover_listener(opts, log, dext, our_id, our_mac, listener)?;
+    // Report every device on the link, with its name and the streams it can
+    // send, so the app can offer them for mapping. A report, not settings:
+    // writing it changes no routing.
+    {
+        let report: Vec<avb_config::devices::Device> = seen_devices
+            .iter()
+            .map(|&(id, mac, model)| {
+                let p = AecpPeers {
+                    our_mac,
+                    our_id,
+                    target: id,
+                    target_mac: mac,
+                };
+                describe_device(log, dext, p, model, 2_000_000_000)
+            })
+            .collect();
+        match avb_config::devices::save(&report) {
+            Ok(path) => log.log(
+                Level::Info,
+                "routing",
+                &format!(
+                    "device report: {} -> {}",
+                    report
+                        .iter()
+                        .map(|d| format!(
+                            "\"{}\" 0x{:016x} ({} stream(s))",
+                            d.name,
+                            d.entity_id,
+                            d.sources.len()
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    path.display()
+                ),
+            ),
+            Err(e) => log.log(
+                Level::Warn,
+                "routing",
+                &format!("device report not written: {e}"),
+            ),
+        }
+    }
     let peers = AecpPeers {
         our_mac,
         our_id,
@@ -7372,6 +7414,75 @@ fn derive_inbound_source(
 /// Every bound source must share one format, because the ring has a single
 /// geometry across its slots. A source that differs is refused rather than
 /// placed into a slot whose width does not match it.
+/// A report of one device for the companion app's channel-map screen: its
+/// name, model and the audio streams it can send us. Best effort: a device
+/// that does not answer is reported with what ADP told us and no streams.
+fn describe_device(
+    log: &Logger,
+    dext: &mut RealDext,
+    peers: AecpPeers,
+    model_id: u64,
+    timeout_ns: u64,
+) -> avb_config::devices::Device {
+    use avb_avdecc::aem::desc::{decode_entity, decode_stream};
+    use avb_avdecc::constants::desc as aem_desc;
+
+    let entity_id = u64::from_be_bytes(peers.target.0);
+    let mut dev = avb_config::devices::Device {
+        entity_id,
+        model_id,
+        name: String::new(),
+        sources: Vec::new(),
+    };
+    let Ok(base) = read_descriptors(
+        log,
+        dext,
+        peers,
+        &[(aem_desc::ENTITY, 0), (aem_desc::CONFIGURATION, 0)],
+        timeout_ns,
+    ) else {
+        return dev;
+    };
+    if let Some(e) = base
+        .get(&(aem_desc::ENTITY, 0))
+        .and_then(|b| decode_entity(b))
+    {
+        dev.name = e.entity_name;
+        dev.model_id = e.entity_model_id;
+    }
+    let count = base
+        .get(&(aem_desc::CONFIGURATION, 0))
+        .map(|c| config_descriptor_counts(c))
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(dt, _)| *dt == aem_desc::STREAM_OUTPUT)
+        .map_or(0, |(_, n)| n);
+    let want: Vec<(u16, u16)> = (0..count).map(|i| (aem_desc::STREAM_OUTPUT, i)).collect();
+    let Ok(raw) = read_descriptors(log, dext, peers, &want, timeout_ns) else {
+        return dev;
+    };
+    for i in 0..count {
+        let Some(s) = raw
+            .get(&(aem_desc::STREAM_OUTPUT, i))
+            .and_then(|b| decode_stream(b))
+        else {
+            continue;
+        };
+        // Only audio we can depacketize: the same rule the binding uses, so
+        // the app never offers a stream the daemon would refuse.
+        if let Some(a) = s.current_format.aaf() {
+            if !a.ut && s.current_format.decodable() {
+                dev.sources.push(avb_config::devices::Source {
+                    index: i,
+                    channels: a.channels,
+                    name: s.object_name,
+                });
+            }
+        }
+    }
+    dev
+}
+
 fn derive_inbound_sources(
     log: &Logger,
     dext: &mut RealDext,
@@ -7539,7 +7650,7 @@ fn discover_listener(
     our_id: avb_core::Eui64,
     our_mac: avb_core::MacAddr,
     want: Option<u64>,
-) -> Result<(avb_core::Eui64, avb_core::MacAddr), Exit> {
+) -> Result<DiscoveredPeers, Exit> {
     use avb_avdecc::adp::Adpdu;
     use avb_avdecc::constants::subtype;
     use avb_avdecc::EntityTable;
@@ -7706,7 +7817,12 @@ fn discover_listener(
                     mac.octets()
                 ),
             );
-            return Ok((id, mac));
+            // Every talker device seen, for the companion's device report.
+            let seen: Vec<(Eui64, avb_core::MacAddr, u64)> = candidates
+                .iter()
+                .filter_map(|c| table.get(*c).map(|e| (*c, e.mac, e.adp.entity_model_id)))
+                .collect();
+            return Ok((id, mac, seen));
         }
         if ns_since(start) >= deadline_ns {
             log.log(
@@ -7719,6 +7835,14 @@ fn discover_listener(
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
+
+/// The chosen device's id and MAC, plus every talker device seen on the link
+/// as `(id, mac, entity_model_id)`, the chosen one included.
+type DiscoveredPeers = (
+    avb_core::Eui64,
+    avb_core::MacAddr,
+    Vec<(avb_core::Eui64, avb_core::MacAddr, u64)>,
+);
 
 /// How long discovery keeps listening after the first device answers, so a
 /// second device's reply is in before one is chosen. Our ENTITY_DISCOVER is
