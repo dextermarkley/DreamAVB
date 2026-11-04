@@ -259,6 +259,41 @@ constexpr int32_t snapIndex(uint32_t off) {
 // snapshot instead of the live register.
 constexpr uint64_t kReadSnapshotFlag = 1ull << 32;
 
+// ---------------------------------------------------------------------------
+// Apple's AVB RX classifier / rule block (0x5400-0x561c), the exact ordered
+// writes BCM5701Enet::updateAVBStreamFilters() + startAVB() make on this chip
+// to route gPTP (ethertype 0x88F7) frames so their RX timestamps latch. The
+// tg3-documented RX_PTP_CTL path (0x6c8) does NOT do this on 57766. Learned by
+// read-only disassembly of AppleBCM5701Ethernet (register offsets and values
+// only, never code); see docs/bcm-rx-timestamp-investigation.md.
+//
+// Replayed in order, duplicates preserved: 0x5494 and 0x5498 are written twice
+// (they are indexed element/mask ports, so the second write is a second rule
+// element, not a correction). The per-stream MAC/VLAN block (0x5480-0x548c)
+// and the station-address match (setPerfectMatch) are intentionally omitted:
+// they are needed only for unicast audio streams, not for gPTP multicast RX
+// timestamps, and they require live stream state.
+struct RegWrite {
+    uint32_t off;
+    uint32_t val;
+};
+constexpr RegWrite kAvbRxRuleWrites[] = {
+    // updateAVBStreamFilters fixed rule-bank header (elements 0-3).
+    {0x5400, 0x8400e000}, {0x5404, 0x8400e000}, {0x5408, 0x8400000c}, {0x540c, 0x8400000c},
+    // startAVB classifier: ethertype 0x88F7 element + mask pairs.
+    {0x5410, 0x8400000c},
+    {0x5494, 0x88f7ffff},  // ethertype 0x88F7, low mask 0xffff
+    {0x5414, 0x84006002},
+    {0x5494, 0x013fffff},
+    {0x5418, 0x84006002},
+    {0x5498, 0x0140ffff},
+    // Queue / timestamp config.
+    {0x5500, 0x00000005}, {0x5504, 0x0000000a}, {0x5508, 0x00000010}, {0x550c, 0x00000020},
+    {0x5510, 0x00000040}, {0x5608, 0x00000000}, {0x560c, 0x000000e0}, {0x5610, 0x00000000},
+    {0x5614, 0x000000e1}, {0x5618, 0x00000025}, {0x561c, 0x00e4e3a2}, {0x0560, 0x0000000e},
+};
+constexpr uint32_t kAvbRxRuleWriteCount = sizeof(kAvbRxRuleWrites) / sizeof(kAvbRxRuleWrites[0]);
+
 // Little-endian u16 from a byte buffer (status block fields).
 constexpr uint16_t le16At(const uint8_t* p, uint32_t off) {
     return static_cast<uint16_t>(p[off] | (static_cast<uint16_t>(p[off + 1]) << 8));

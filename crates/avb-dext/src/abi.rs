@@ -118,6 +118,9 @@ pub const REG_READ_LIMIT: u32 = 0x20000;
 
 pub const INIT_FLAG_PROMISC: u64 = 1 << 0;
 pub const INIT_FLAG_RX_PTP_V2_L2: u64 = 1 << 1;
+/// BCM only: replay Apple's AVB RX classifier block so gPTP frames latch
+/// RX timestamps (`AVB_INIT_FLAG_AVB_RX_RULES`).
+pub const INIT_FLAG_AVB_RX_RULES: u64 = 1 << 2;
 
 pub const STAGE_NONE: u32 = 0;
 pub const STAGE_TIMESYNC: u32 = 1;

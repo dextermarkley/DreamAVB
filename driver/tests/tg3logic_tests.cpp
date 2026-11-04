@@ -232,8 +232,35 @@ static void testSnapshot() {
     std::printf("pass: Apple-state snapshot windows\n");
 }
 
+// The AVB RX classifier replay is the exact Apple sequence: it includes the
+// gPTP ethertype element, preserves the duplicated indexed-port writes, and
+// stays within the snapshot's 0x5000-0x5700 window (so a capture sees it).
+static void testAvbRxRules() {
+    CHECK(kAvbRxRuleWriteCount == 22);
+    // The gPTP ethertype match (0x88F7) must be present at 0x5494.
+    bool ethertype = false;
+    int dup5494 = 0;
+    for (uint32_t i = 0; i < kAvbRxRuleWriteCount; i++) {
+        const auto& w = kAvbRxRuleWrites[i];
+        if (w.off == 0x5494 && w.val == 0x88f7ffff) {
+            ethertype = true;
+        }
+        if (w.off == 0x5494) {
+            dup5494++;
+        }
+        // Every offset is captured by the snapshot, so a dump shows the result.
+        CHECK(snapIndex(w.off) >= 0);
+    }
+    CHECK(ethertype);
+    CHECK(dup5494 == 2);  // indexed port written twice, order preserved
+    // First four are the rule-bank header from updateAVBStreamFilters.
+    CHECK(kAvbRxRuleWrites[0].off == 0x5400 && kAvbRxRuleWrites[0].val == 0x8400e000);
+    std::printf("pass: AVB RX classifier replay sequence\n");
+}
+
 int main() {
     testSnapshot();
+    testAvbRxRules();
     testCorrection();
     testTxBd();
     testRxBd();

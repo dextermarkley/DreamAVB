@@ -540,7 +540,9 @@ fn cmd_adjfreq(
 
 fn cmd_datapath(dev: &Device, json: Option<&Path>, up: bool) -> Result<()> {
     if up {
-        let stage = dev.init_datapath(abi::INIT_FLAG_PROMISC | abi::INIT_FLAG_RX_PTP_V2_L2)?;
+        let stage = dev.init_datapath(
+            abi::INIT_FLAG_PROMISC | abi::INIT_FLAG_RX_PTP_V2_L2 | abi::INIT_FLAG_AVB_RX_RULES,
+        )?;
         let info = dev.info()?;
         println!(
             "datapath up: stage {} link_up={} 1000FD={}",

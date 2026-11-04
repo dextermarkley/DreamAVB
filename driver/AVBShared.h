@@ -75,6 +75,9 @@ enum AvbMemType : uint64_t {
 // kAvbSelInitDatapath flags.
 #define AVB_INIT_FLAG_PROMISC      (1u << 0)
 #define AVB_INIT_FLAG_RX_PTP_V2_L2 (1u << 1)
+// BCM only: after the datapath is up, replay Apple's AVB RX classifier block
+// (kAvbRxRuleWrites) so gPTP frames latch RX timestamps on the BCM57762.
+#define AVB_INIT_FLAG_AVB_RX_RULES (1u << 2)
 
 // AvbInfo.stage
 enum AvbStage : uint32_t {

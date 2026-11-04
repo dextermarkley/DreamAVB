@@ -589,6 +589,8 @@ static bool stopBlock(IV * v, uint32_t off, uint32_t enableBit)
     return pollUs(v, 100000, 100, [&] { return (rd(v, off) & enableBit) == 0; });
 }
 
+static void programAvbRxRules(IV * v);
+
 // tg3_reset_hw subset (single vector, no TSO frames, no jumbo, no RSS/TSS).
 static bool resetHw(IV * v, uint64_t initFlags)
 {
@@ -765,7 +767,36 @@ static bool resetHw(IV * v, uint64_t initFlags)
             wr(v, bcm::kMacRcvRule4 + i * 8 + 4, 0);
         }
     }
+    // Apple's AVB RX classifier block, so gPTP frames latch RX timestamps
+    // (AVBBcmDriver's reason for existing). Replayed exactly from what
+    // AppleBCM5701Ethernet writes, each register READ before it is written
+    // and the before/after logged, per the register-provenance rule in
+    // AGENTS.md. Gated so a plain datapath bring-up is unchanged.
+    if (ok(v) && (initFlags & AVB_INIT_FLAG_AVB_RX_RULES)) {
+        programAvbRxRules(v);
+    }
+
     return ok(v);
+}
+
+// Replay Apple's AVB RX classifier writes (bcm::kAvbRxRuleWrites). Read-first,
+// log each. These offsets are outside the tg3-documented set; they come from
+// read-only observation of Apple's driver (docs/bcm-rx-timestamp-investigation.md).
+static void programAvbRxRules(IV * v)
+{
+    LOG("AVB RX rules: replaying %u Apple classifier write(s)", bcm::kAvbRxRuleWriteCount);
+    for (uint32_t i = 0; i < bcm::kAvbRxRuleWriteCount && ok(v); i++) {
+        const uint32_t off = bcm::kAvbRxRuleWrites[i].off;
+        const uint32_t val = bcm::kAvbRxRuleWrites[i].val;
+        const uint32_t before = rd(v, off);
+        wr(v, off, val);
+        const uint32_t after = rd(v, off);
+        LOG("AVB RX rule[%u]: 0x%04x 0x%08x -> wrote 0x%08x -> 0x%08x", i, off, before, val, after);
+    }
+    // The EAV clock the timestamps are counted against (read-only), so the log
+    // shows it running.
+    LOG("AVB RX rules done: EAV_REF_CLK 0x%08x, RX_PTP_CTL 0x%08x", rd(v, bcm::kEavRefClkLsb),
+        rd(v, bcm::kRxPtpCtl));
 }
 
 // tg3_abort_hw order for a 5705_PLUS part (RCVLSC/DMAC/MBFREE/BUFMGR/MEMARB
