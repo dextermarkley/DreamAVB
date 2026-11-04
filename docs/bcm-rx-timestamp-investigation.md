@@ -256,3 +256,53 @@ firmware-owned.
 
 Shipping a product keeps the I210 (option 2). Option 1 is viable only as a
 personal-machine experiment for this owner.
+
+### Clean-room firmware prior art (web search, 2026-11-04)
+
+Searched for existing RX-CPU firmware for this silicon, AVB or not. There is
+strong prior art, and it de-risks option 3 considerably.
+
+- **ThunderGate** (https://thundergate.io, https://github.com/sstjohn/thundergate,
+  GPLv3). An open toolkit that builds and flashes **custom firmware for the
+  Tigon3 on-chip core**, and it explicitly covers the **57762 generation — the
+  exact chip in the Apple Thunderbolt adapter** — noting the 57762 has a single
+  core where older parts have two. It ships:
+  - A complete from-source firmware tree for the core: `fw/entry.S`, `fw/init.c`,
+    `fw/main.c`, `fw/rx.c`, `fw/tx.c`, `fw/handlers.c`, a register map
+    (`grc`, `rbdi`/`rbdc` RX-descriptor blocks, `emac`, `cpmu`, ...), and a
+    linker script `fw/image.x` whose segment layout matches the `FWIMG_INFO`
+    struct we decoded from Apple's `loadFirmware`.
+  - A **macOS PCIDriverKit dext** that loads custom firmware into the 57762 on
+    both Intel and Apple Silicon — i.e. our exact platform and driver model.
+  - A MIPS-elf cross-toolchain (GCC 14, `-mtigon`). The core is a standard
+    **MIPS** (confirmed by our own opcode read: `lui`/`beq`/`j`, and by the
+    OpenBSD `ti(4)` note that the Tigon is an R4000). Not an undocumented ISA.
+  - `fw/rx.c` processes a per-frame RX-CPU event (`grc.rxcpu_event.rdiq`): the
+    core sees every received frame and can touch its descriptor — exactly the
+    hook an RX timestamp needs.
+- **Guillaume Delugre**, "Closer to metal: Reverse engineering the Broadcom
+  NetExtreme firmware" (HITB 2011; Hack.lu 2010). Clean-room RE of the
+  NetExtreme firmware plus a from-scratch firmware and instrumentation toolset —
+  the methodology reference.
+- **Linux `tg3`** (GPL, behaviour reference only per AGENTS.md): the firmware
+  header format and RX_CPU/TX_CPU register/load/halt sequence.
+- **Alteon AceNIC / Tigon** (open firmware, late 1990s): the R4000-MIPS
+  lineage these parts descend from.
+
+Revised feasibility of option 3: the toolchain, the firmware load path, the
+macOS-dext integration, the core init and the per-frame RX hook are all already
+demonstrated on this chip by ThunderGate. The genuinely novel work we would own
+is small and well-scoped: in the RX handler, latch the EAV reference clock
+(0x6900) at frame arrival and deliver that value to the host where our dext
+expects it — using hardware blocks we have already mapped read-only
+(EAV clock 0x6900, classifier 0x5400, RX_PTP_CTL 0x6c8).
+
+Open feasibility question to resolve FIRST, before committing: whether the
+57762 MAC hardware-latches an RX arrival timestamp into a register the core can
+read (giving Apple-grade ~tens-of-ns quality), or whether the core only gets a
+software event (software-quality timestamp, likely not good enough for Milan).
+ThunderGate's `fw/rx.c` + the EMAC/timesync register definitions are where to
+settle this. Licensing: ThunderGate is GPLv3 — fine for personal use and as a
+programming-model reference; shipping inside a proprietary product would require
+either a clean-room reimplementation from the hardware facts or shipping our
+NIC firmware as a separate GPLv3 component.
