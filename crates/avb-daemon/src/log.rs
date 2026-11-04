@@ -5,7 +5,10 @@
 //! Nothing is logged on the audio per-packet path.
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Mutex;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Log levels (design §11.1).
@@ -50,13 +53,33 @@ pub const SUBSYSTEMS: &[&str] = &[
 pub struct Logger {
     level: Level,
     last: Mutex<HashMap<String, Instant>>,
+    /// Lines go to a writer thread, not straight to stderr. A stderr write is
+    /// a syscall to the log file, and the talker loop logs from its real-time
+    /// pass: 30-odd lines in one round stalled it ~1 ms, the talker retired
+    /// 8-10 intervals, and every sink on both mixers dropped lock (an audible
+    /// dropout). `None` only once dropped.
+    tx: Option<Sender<String>>,
+    writer: Option<JoinHandle<()>>,
 }
 
 impl Logger {
     pub fn new(level: Level) -> Self {
+        let (tx, rx) = channel::<String>();
+        let writer = std::thread::Builder::new()
+            .name("avb-log".into())
+            .spawn(move || {
+                let stderr = std::io::stderr();
+                for line in rx {
+                    let _ = writeln!(stderr.lock(), "{line}");
+                }
+            })
+            .ok();
         Self {
             level,
             last: Mutex::new(HashMap::new()),
+            // Without a writer thread, fall back to writing inline.
+            tx: writer.as_ref().map(|_| tx),
+            writer,
         }
     }
 
@@ -67,7 +90,15 @@ impl Logger {
     /// Log unconditionally (subject to the level threshold).
     pub fn log(&self, level: Level, subsys: &str, msg: &str) {
         if level <= self.level {
-            eprintln!("avb-daemon[{subsys}]: {}: {msg}", level.tag());
+            let line = format!("avb-daemon[{subsys}]: {}: {msg}", level.tag());
+            match &self.tx {
+                Some(tx) => {
+                    if let Err(e) = tx.send(line) {
+                        eprintln!("{}", e.0);
+                    }
+                }
+                None => eprintln!("{line}"),
+            }
         }
     }
 
@@ -91,6 +122,17 @@ impl Logger {
         drop(last);
         self.log(level, subsys, msg);
         true
+    }
+}
+
+impl Drop for Logger {
+    /// Flush: close the channel and wait for the writer to drain it, so the
+    /// end-of-run summaries are never lost.
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
     }
 }
 

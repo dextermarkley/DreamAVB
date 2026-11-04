@@ -3585,6 +3585,20 @@ fn talker_loop(
     // — a different fault from the dext rate-limiting us, and it must not hide
     // behind the PDU count.
     let mut missed_intervals: u64 = 0;
+    // Control frames sent one per loop pass (see the drain at the loop top).
+    // Last MEDIA_LOCKED/MEDIA_UNLOCKED per (device, descriptor type, index).
+    type CounterKey = (u64, Option<u16>, Option<u16>);
+    let mut last_counter_locks: std::collections::BTreeMap<CounterKey, (u32, u32)> =
+        std::collections::BTreeMap::new();
+    let mut ctl_tx_queue: std::collections::VecDeque<TxFrame> =
+        std::collections::VecDeque::with_capacity(64);
+    // Retire bursts of at least this many intervals are logged (first N).
+    const MISS_BURST_LOG_MIN: u64 = 4;
+    const MISS_BURST_LOG_MAX: u64 = 200;
+    let mut miss_bursts: u64 = 0;
+    // Longest single loop pass since the last PDU send, for the burst log.
+    let mut max_pass_ns: u64 = 0;
+    let mut pass_start_ns: u64 = 0;
     // When the talker armed, so the summary can report rates over the window
     // frames were actually being sent in rather than over the whole run, which
     // includes discovery, the AEM reads and the gPTP lock wait.
@@ -3866,6 +3880,22 @@ fn talker_loop(
     let mut in_decode_fail: u64 = 0;
 
     loop {
+        // One queued control frame per pass. A probe round used to send its
+        // 34 AECP/ACMP frames in one go, ~28 us of SendFrame each: a ~1 ms
+        // stall that made the talker retire 8-11 intervals, and every sink on
+        // both mixers dropped lock once per round (an audible dropout every
+        // 5 s, then every 15 s). Spread out, each pass pays one frame.
+        if let Some(f) = ctl_tx_queue.pop_front() {
+            let _ = dext.send(f.bytes(), false, 0);
+        }
+        // Loop-pass timing for the late-talker log.
+        {
+            let t = ns_since(start);
+            if pass_start_ns != 0 {
+                max_pass_ns = max_pass_ns.max(t.saturating_sub(pass_start_ns));
+            }
+            pass_start_ns = t;
+        }
         if shutdown_requested() {
             break;
         }
@@ -4473,18 +4503,49 @@ fn talker_loop(
                             nz.push(format!("bit{i}={v}"));
                         }
                     }
-                    log.log(
-                        Level::Info,
-                        "aem",
-                        &format!(
-                            "0x{:016x} GET_COUNTERS status={st} type={dty:?} index={didx:?} \
+                    // Logging is synchronous and this is the real-time loop:
+                    // 16 lines per round stalled the talker by ~0.5 ms. Log
+                    // on diagnostic rounds, or when a sink's lock count moved.
+                    let lock_pair = |bit: usize| {
+                        cmd.payload
+                            .get(8 + bit * 4..12 + bit * 4)
+                            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                            .map(u32::from_be_bytes)
+                            .unwrap_or(0)
+                    };
+                    let locks = (lock_pair(0), lock_pair(1));
+                    let ckey = (u64::from_be_bytes(cmd.target_entity_id.0), dty, didx);
+                    let prev_locks = last_counter_locks.insert(ckey, locks);
+                    let moved = prev_locks.is_some_and(|p| p != locks);
+                    if moved {
+                        log.log(
+                            Level::Warn,
+                            "aem",
+                            &format!(
+                                "0x{:016x} {dty:?}/{didx:?} lock changed: MEDIA_LOCKED {} -> {}, \
+                                 MEDIA_UNLOCKED {} -> {}",
+                                ckey.0,
+                                prev_locks.map_or(0, |p| p.0),
+                                locks.0,
+                                prev_locks.map_or(0, |p| p.1),
+                                locks.1
+                            ),
+                        );
+                    }
+                    if sink_watch_verbose {
+                        log.log(
+                            Level::Info,
+                            "aem",
+                            &format!(
+                                "0x{:016x} GET_COUNTERS status={st} type={dty:?} index={didx:?} \
                              counters_valid={} non-zero: [{}] ({} payload B)",
-                            u64::from_be_bytes(cmd.target_entity_id.0),
-                            valid.map_or("?".to_string(), |v| format!("0x{v:08x}")),
-                            nz.join(" "),
-                            cmd.payload.len()
-                        ),
-                    );
+                                u64::from_be_bytes(cmd.target_entity_id.0),
+                                valid.map_or("?".to_string(), |v| format!("0x{v:08x}")),
+                                nz.join(" "),
+                                cmd.payload.len()
+                            ),
+                        );
+                    }
                     continue;
                 }
                 // The 16R's answer to our GET_STREAM_INFO: its OWN view of the
@@ -5544,7 +5605,13 @@ fn talker_loop(
                         Some(avb_avdecc::constants::aem_cmd::GET_STREAM_INFO),
                     ]
                 } else {
-                    [None, Some(avb_avdecc::constants::aem_cmd::GET_STREAM_INFO)]
+                    // Counters every round too: a dropout shows up as a
+                    // MEDIA_LOCKED/UNLOCKED step, and without a reading after
+                    // the first 15 s there is nothing to match it against.
+                    [
+                        Some(avb_avdecc::constants::aem_cmd::GET_COUNTERS),
+                        Some(avb_avdecc::constants::aem_cmd::GET_STREAM_INFO),
+                    ]
                 }
                 .into_iter()
                 .flatten()
@@ -5560,7 +5627,7 @@ fn talker_loop(
                         payload: pl.clone(),
                     };
                     if let Ok(frame) = TxFrame::build(&hdr, &q.encode(), false, 0) {
-                        let _ = dext.send(frame.bytes(), false, 0);
+                        ctl_tx_queue.push_back(frame);
                     }
                 }
             }
@@ -5574,7 +5641,13 @@ fn talker_loop(
             // turns out to be one of OUR streams on a sink we do not use.
             if crf_talker.is_none() {
                 for &(dev, _) in &devs {
-                    send_get_rx_state(dext, our_mac, our_id, dev, CRF_SINK_UID, connect_seq);
+                    ctl_tx_queue.extend(get_rx_state_frame(
+                        our_mac,
+                        our_id,
+                        dev,
+                        CRF_SINK_UID,
+                        connect_seq,
+                    ));
                     connect_seq = connect_seq.wrapping_add(1);
                 }
             }
@@ -5608,7 +5681,7 @@ fn talker_loop(
                         payload: pl,
                     };
                     if let Ok(frame) = TxFrame::build(&hdr, &q.encode(), false, 0) {
-                        let _ = dext.send(frame.bytes(), false, 0);
+                        ctl_tx_queue.push_back(frame);
                     }
                 }
             }
@@ -5714,7 +5787,9 @@ fn talker_loop(
                 &format!(
                     "role={} servo={} gm={} (ours={}) btca(won={} lost={}) mastertx(ann={} sync={} fu={} ts_lost={}) \
                      link(asCapable={} delay_raw={:?} delay_comp={:?} rtt={:?} peer_turnaround={:?} nrr={:?} our_turnaround={:?} max={:?} \
-                     req_rx={} resp_tx={} fu_tx={} resp_ts_fail={} lost={} sync_rx={} ann_rx={} sig_rx={} sig_tx={} multi_resp={} ascap_edges={}){}",
+                     req_rx={} resp_tx={} fu_tx={} resp_ts_fail={} lost={} sync_rx={} ann_rx={} sig_rx={} sig_tx={} multi_resp={} ascap_edges={}) \
+                     talker(pdus={} underruns={} missed={} discarded={} reanchors={} trims={} \
+                     trimmed={} unlocked={} rate_limited={} refused={}){}",
                     st.port_state.name(),
                     st.servo_state.name(),
                     st.gm_identity,
@@ -5744,6 +5819,16 @@ fn talker_loop(
                     c.signaling_tx,
                     c.multiple_responders,
                     c.ascapable_transitions,
+                    tx_pdus,
+                    underruns,
+                    missed_intervals,
+                    skipped_media_frames,
+                    presentation_reanchors,
+                    out_trims,
+                    out_trimmed_frames,
+                    ticks_unlocked,
+                    tx_rate_limited,
+                    tx_rejected,
                     if crf_talker.is_some() {
                         format!(
                             " crf(pdus={crf_pdus} refused={crf_refused} no_anchor={crf_skipped_no_clock} reanchors={crf_reanchors})"
@@ -5885,17 +5970,18 @@ fn talker_loop(
                 lrx.recovered_clock(),
                 recovered_ring.as_ref().and_then(|r| r.ring().read_clock()),
             );
-            // With several devices, Automatic means network time. The
-            // recovered clock comes from whichever device's stream arrived
-            // first, and a device on its own internal clock (the 24R was)
-            // runs at a different rate from the gPTP-paced talker: the output
-            // queue then drifts, gets trimmed, and clicks.
-            let recovered =
-                if devs.len() > 1 && clocksel.selected() == avb_config::ClockSource::Auto {
-                    None
-                } else {
-                    recovered
-                };
+            // In duplex, Automatic means network time: the talker is paced on
+            // gPTP, so any other device rate makes the output queue drift,
+            // get trimmed, and click. The recovered clock is also one
+            // device's estimate, and switching between it and gPTP whenever
+            // its lock flickers changes the device rate mid-stream (seen:
+            // three switches in one run). Mixers following PTP Clock run at
+            // the gPTP rate anyway.
+            let recovered = if duplex && clocksel.selected() == avb_config::ClockSource::Auto {
+                None
+            } else {
+                recovered
+            };
             let decision = clocksel.decide(
                 recovered,
                 st.gptp_ppm_vs_mach,
@@ -6140,6 +6226,26 @@ fn talker_loop(
                     skipped_media_frames = skipped_media_frames.saturating_add(discarded as u64);
                     missed_intervals = missed_intervals.saturating_add(retire);
                     presentation_timeline.skip_intervals(retire);
+                    // A burst of retired intervals is a gap the listeners
+                    // hear. Log when and how long, with the longest loop pass
+                    // since the last send, so a periodic stall can be matched
+                    // to whatever ran then.
+                    if retire >= MISS_BURST_LOG_MIN {
+                        miss_bursts += 1;
+                        if miss_bursts <= MISS_BURST_LOG_MAX {
+                            log.log(
+                                Level::Warn,
+                                "play",
+                                &format!(
+                                    "talker late: retired {retire} interval(s) ({} us) at \
+                                     t={:.3}s; longest loop pass since the last send {} us",
+                                    retire * pdu_interval_ns / 1000,
+                                    ns_since(start) as f64 / 1e9,
+                                    max_pass_ns / 1000,
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -6394,6 +6500,7 @@ fn talker_loop(
         // minimum spacing so a catch-up after a late wake is spread out rather
         // than sent as a burst.
         next_pdu_ns = elapsed.saturating_add(MIN_PDU_SPACING_NS);
+        max_pass_ns = 0;
     }
 
     // Tell the 16R we are going before we stop answering. Without this it
@@ -6795,7 +6902,14 @@ const MAX_CATCHUP_INTERVALS: u64 = avb_audioring::TALKER_PRESENTATION_OFFSET_NS 
 /// (sequence mismatches on sinks 4-8 only, with the dext reporting nothing
 /// refused). 100 us spreads a catch-up out and is still faster than the
 /// 125 us cadence, so a lag drains.
-const MIN_PDU_SPACING_NS: u64 = 100_000;
+///
+/// 50 us, down from 100 us. With 16 outbound and 16 inbound streams a loop
+/// pass takes 70-100 us, so at 100 us spacing a late talker could not gain on
+/// the 125 us grid at all: it drifted 1 ms behind every ~11 ms and retired 8
+/// intervals each time, which the mixers heard as a dropout. At 50 us it
+/// recovers within a few intervals; two PDUs of one stream are never closer
+/// than 50 us, which is still paced, not a burst.
+const MIN_PDU_SPACING_NS: u64 = 50_000;
 
 /// How far the grid may sit ahead of now + offset before it is treated as a
 /// gPTP step backwards rather than "not yet time". 1 ms.
@@ -8378,8 +8492,9 @@ const DISCOVERY_SETTLE_NS: u64 = 1_500_000_000;
 /// How long discovery waits for a device in the channel map that has not
 /// answered yet, before going ahead with the ones that have. ADP adverts come
 /// every few seconds (Milan TMR_ADVERTISE 5 s + up to 4 s delay), and our
-/// ENTITY_DISCOVER is repeated every 2 s.
-const MAPPED_DEVICE_WAIT_NS: u64 = 10_000_000_000;
+/// ENTITY_DISCOVER is repeated every 2 s. 10 s still missed the 16R after a
+/// switch power-cycle, leaving the run streaming to the 24R alone.
+const MAPPED_DEVICE_WAIT_NS: u64 = 20_000_000_000;
 
 /// Which of several AVB devices this run streams with, deterministically.
 ///
@@ -8497,17 +8612,15 @@ fn parse_avb_info(p: &[u8]) -> Option<AvbInfo> {
     })
 }
 
-/// Ask a listener which talker stream its sink `listener_uid` is bound to
-/// (ACMP GET_RX_STATE_COMMAND, 1722.1-2021 §8.2.2.6). Read-only.
-fn send_get_rx_state(
-    dext: &mut RealDext,
+/// The frame asking a listener which talker stream its sink `listener_uid`
+/// is bound to (ACMP GET_RX_STATE_COMMAND, 1722.1-2021 §8.2.2.6). Read-only.
+fn get_rx_state_frame(
     our_mac: avb_core::MacAddr,
     our_id: avb_core::Eui64,
     listener_id: avb_core::Eui64,
     listener_uid: u16,
     sequence_id: u16,
-) {
-    use crate::dextio::DextPort;
+) -> Option<avb_core::TxFrame> {
     let pdu = avb_avdecc::acmp::Acmpdu {
         message_type: avb_avdecc::constants::acmp_msg::GET_RX_STATE_COMMAND,
         status: avb_avdecc::constants::acmp_status::SUCCESS,
@@ -8523,9 +8636,7 @@ fn send_get_rx_state(
         vlan: None,
         ethertype: avb_avtp::common::ETHERTYPE_AVTP,
     };
-    if let Ok(f) = avb_core::TxFrame::build(&hdr, &pdu.encode(), false, 0) {
-        let _ = dext.send(f.bytes(), false, 0);
-    }
+    avb_core::TxFrame::build(&hdr, &pdu.encode(), false, 0).ok()
 }
 
 /// Whether a sink's reported binding is a stale one of OURS that we may
@@ -8760,7 +8871,10 @@ mod talker_tests {
     fn spacing_is_never_a_burst() {
         // Eight 217-byte frames per interval is the most the 16R has been
         // seen to take at once; 16 back to back lost frames on sinks 4-8.
-        const { assert!(MIN_PDU_SPACING_NS >= 100_000) };
+        // Not back to back (the 16R dropped streams at 0 spacing), but well
+        // under the 125 us cadence so a talker with 70-100 us loop passes
+        // still gains on the grid.
+        const { assert!(MIN_PDU_SPACING_NS >= 50_000) };
         const { assert!(MIN_PDU_SPACING_NS < 125_000, "must drain a lag") };
     }
 
