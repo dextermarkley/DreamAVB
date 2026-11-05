@@ -135,6 +135,10 @@ struct AVBBcmDriver_IVars {
     // RX-CPU stamping (AVB_INIT_FLAG_RXCPU_STAMP): attach the firmware's
     // per-frame EAV timestamp to harvested gPTP frames.
     bool rxcpuStamp;
+    // The firmware's DONE signature, once seen (reset on init and on a core
+    // load), and the host mirror of its stamp ring.
+    bool stampDone;
+    RxCpuStampCache stampCache;
 
     // Software RX ring filled by the harvester.
     AvbRxEntry * sw;
@@ -1056,31 +1060,66 @@ static uint32_t readScratch(IV * v, uint32_t virt)
 
 // True once the stamping firmware has run far enough to maintain the ring.
 // Guards against matching uninitialised scratch before the host loads it.
+// The signature is read once; after that this costs nothing.
 static bool rxCpuStampReady(IV * v)
 {
-    return v->rxcpuStamp && readScratch(v, rxcpu::kDoneSig) == rxcpu::kDoneMagic;
+    if (!v->rxcpuStamp) {
+        return false;
+    }
+    if (!v->stampDone) {
+        v->stampDone = readScratch(v, rxcpu::kDoneSig) == rxcpu::kDoneMagic;
+    }
+    return v->stampDone;
 }
 
-// Look up a harvested gPTP frame's EAV timestamp in the stamp ring. On a match
-// within the scan window, set e.hw_ts (reconstructed to 64 bits from the EAV
-// clock) and e.has_ts. `frame`/`len` are the copied frame bytes.
-static void attachRxCpuStamp(IV * v, const uint8_t * frame, uint32_t len, AvbRxEntry & e)
+static void resetStampCache(IV * v)
+{
+    v->stampDone = false;
+    v->stampCache = RxCpuStampCache{};
+}
+
+// Read the ring entries the firmware added since the last refresh: the
+// producer count, then for each new slot its meta word, plus its EAV word only
+// for an event message. Each word is a ~145 us config-window access.
+static void refreshStampCache(IV * v)
+{
+    RxCpuStampCache & c = v->stampCache;
+    const uint32_t prod = readScratch(v, rxcpu::kProd);
+    for (uint32_t i = stampReadStart(c.seen, prod, rxcpu::kScanWindow); i != prod; i++) {
+        const uint32_t base = rxcpu::kRingBase + (i & rxcpu::kRingMask) * 8u;
+        const uint32_t meta = readScratch(v, base + 4u);
+        RxCpuStamp s = decodeRxCpuStamp(0, meta);
+        if (isPtpEventMsg(s.msgType)) {
+            s.eavLo = readScratch(v, base);
+        }
+        stampCachePush(c, s);
+    }
+    c.seen = prod;
+}
+
+// Look up a harvested gPTP event frame's EAV timestamp. The cache is
+// refreshed at most once per drain (`*refreshed`), and only when the frame is
+// not already in it. On a match set e.hw_ts (reconstructed to 64 bits from the
+// EAV clock) and e.has_ts. `frame`/`len` are the copied frame bytes.
+static void attachRxCpuStamp(IV * v, const uint8_t * frame, uint32_t len, AvbRxEntry & e,
+                             bool * refreshed)
 {
     uint8_t msgType = 0;
     uint16_t seq = 0;
-    if (!parseGptpStampKey(frame, len, &msgType, &seq)) {
+    if (!parseGptpStampKey(frame, len, &msgType, &seq) || !isPtpEventMsg(msgType)) {
         return;
     }
-    const uint32_t prod = readScratch(v, rxcpu::kProd);
-    const uint32_t scan = rxcpu::kScanWindow < prod ? rxcpu::kScanWindow : prod;
-    RxCpuStamp recent[rxcpu::kScanWindow];
-    for (uint32_t i = 0; i < scan; i++) {
-        const uint32_t slot = (prod - 1u - i) & rxcpu::kRingMask;
-        const uint32_t base = rxcpu::kRingBase + slot * 8u;
-        recent[i] = decodeRxCpuStamp(readScratch(v, base), readScratch(v, base + 4u));
+    if (!rxCpuStampReady(v)) {
+        return;
     }
     uint32_t eavLo = 0;
-    if (matchRxCpuStamp(recent, scan, msgType, seq, &eavLo)) {
+    bool hit = matchRxCpuStamp(v->stampCache.e, v->stampCache.count, msgType, seq, &eavLo);
+    if (!hit && !*refreshed) {
+        refreshStampCache(v);
+        *refreshed = true;
+        hit = matchRxCpuStamp(v->stampCache.e, v->stampCache.count, msgType, seq, &eavLo);
+    }
+    if (hit) {
         e.hw_ts = reconstructRxTs(v, eavLo);
         e.has_ts = 1;
     }
@@ -1229,7 +1268,10 @@ static bool drainReturnRing(IV * v, RingTick * tick, const volatile RxBd * ret, 
     // even the DONE-signature probe runs); the firmware keeps stamping into the
     // 256-entry ring, so the frame is picked up on a later harvest once the TX
     // timestamp has latched and tsPending clears.
-    const bool stampReady = !v->tsPending && rxCpuStampReady(v);
+    // The DONE probe and ring reads now happen only when a gPTP event frame is
+    // drained (attachRxCpuStamp); they used to run on every 1 ms tick.
+    const bool stampReady = !v->tsPending && v->rxcpuStamp;
+    bool stampRefreshed = false;
     while (cons != hwProd && ok(v)) {
         RxBd bd;
         bd.addrHi = ret[cons].addrHi;
@@ -1271,7 +1313,7 @@ static bool drainReturnRing(IV * v, RingTick * tick, const volatile RxBd * ret, 
                 // stamp for gPTP frames. This overrides the bd.reserved/MAC
                 // latch path (neither works on this 57766-class part).
                 if (stampReady) {
-                    attachRxCpuStamp(v, frame, flen, e);
+                    attachRxCpuStamp(v, frame, flen, e, &stampRefreshed);
                 }
                 if (tick->ringMode) {
                     deliverRing(v, tick, frame, flen, e);
@@ -1439,6 +1481,7 @@ static kern_return_t initDatapath(IV * v, uint64_t initFlags)
     v->tsPending = false;
     v->tsSeq = 0;
     v->rxcpuStamp = (initFlags & AVB_INIT_FLAG_RXCPU_STAMP) != 0;
+    resetStampCache(v);
     v->eavHi = 0;
     v->eavLastLo = 0;
     v->eavSeeded = false;
@@ -2176,6 +2219,8 @@ AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOU
         }
         uint64_t halted = 0;
         uint64_t mode = 0;
+        // A new image restarts the firmware's ring and DONE signature.
+        resetStampCache(v);
         const kern_return_t ret = loadCoreImage(v, static_cast<uint32_t>(a->scalarInput[0]), bytes,
                                                  static_cast<uint32_t>(len), &halted, &mode);
         a->scalarOutput[0] = halted;

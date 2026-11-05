@@ -414,6 +414,45 @@ constexpr uint64_t reconstructEavTs(uint32_t hi, uint32_t curLo, uint32_t frameL
     return (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(frameLsb);
 }
 
+// Only PTP event messages (messageType 0-7: Sync, Delay_Req, Pdelay_Req,
+// Pdelay_Resp) carry a meaningful RX timestamp (IEEE 1588 / 802.1AS); general
+// messages (Follow_Up, Pdelay_Resp_Follow_Up, Announce, ...) need none.
+constexpr bool isPtpEventMsg(uint8_t msgType) { return msgType < 8; }
+
+// Host mirror of the newest stamp-ring entries. Every scratch word costs a
+// config-space window access (~145 us measured on the Thunderbolt adapter),
+// on the same driver queue that serves SendFrames, so the dext reads each
+// ring entry once, when it first appears, instead of re-reading a fixed window
+// for every harvested gPTP frame.
+constexpr uint32_t kRxCpuStampCacheSize = 16;
+struct RxCpuStampCache {
+    RxCpuStamp e[kRxCpuStampCacheSize];  // newest first
+    uint32_t count;                      // valid entries in e
+    uint32_t seen;                       // producer count already read
+};
+
+// First producer index to read when the firmware's count is `prod` and the
+// cache has read up to `seen`: never older than the last `window` entries,
+// and from the start of the window again if the count went backwards (the
+// firmware was reloaded and restarted it).
+constexpr uint32_t stampReadStart(uint32_t seen, uint32_t prod, uint32_t window) {
+    const uint32_t lo = prod > window ? prod - window : 0u;
+    if (prod < seen) {
+        return lo;
+    }
+    return seen > lo ? seen : lo;
+}
+
+// Insert the newest entry at the front, dropping the oldest when full.
+inline void stampCachePush(RxCpuStampCache & c, const RxCpuStamp & s) {
+    const uint32_t keep = c.count < kRxCpuStampCacheSize ? c.count : kRxCpuStampCacheSize - 1u;
+    for (uint32_t i = keep; i > 0; i--) {
+        c.e[i] = c.e[i - 1u];
+    }
+    c.e[0] = s;
+    c.count = keep + 1u;
+}
+
 // Scan a newest-first snapshot of ring entries for the first (msgType, seq)
 // match and return its EAV low word. The dext builds `entries` by reading the
 // slots at producer-1, producer-2, ... so index 0 is the most recent stamp.

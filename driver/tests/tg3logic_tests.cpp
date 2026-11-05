@@ -304,6 +304,35 @@ static void testRxCpuStamp() {
     const RxCpuStamp collide[2] = {{0x111, 0x2, 0x0007}, {0x222, 0x0, 0x0007}};
     CHECK(matchRxCpuStamp(collide, 2, 0x0, 0x0007, &eav) && eav == 0x222);
     std::printf("pass: RX-CPU stamp ring decode / key parse / match\n");
+
+    // Event vs general messages: only 0-7 need an RX timestamp.
+    CHECK(isPtpEventMsg(0x0) && isPtpEventMsg(0x2) && isPtpEventMsg(0x3) && isPtpEventMsg(0x7));
+    CHECK(!isPtpEventMsg(0x8) && !isPtpEventMsg(0xa) && !isPtpEventMsg(0xb) && !isPtpEventMsg(0xf));
+
+    // Incremental read start: only new entries, bounded to the window, and a
+    // restarted (smaller) count re-reads the window.
+    CHECK(stampReadStart(0, 0, 16) == 0);
+    CHECK(stampReadStart(0, 5, 16) == 0);
+    CHECK(stampReadStart(5, 7, 16) == 5);
+    CHECK(stampReadStart(7, 7, 16) == 7);    // nothing new
+    CHECK(stampReadStart(10, 100, 16) == 84); // fell behind: newest 16 only
+    CHECK(stampReadStart(100, 3, 16) == 0);  // firmware reloaded
+    CHECK(stampReadStart(100, 40, 16) == 24);
+
+    // Cache push: newest first, capped at kRxCpuStampCacheSize.
+    RxCpuStampCache c{};
+    for (uint32_t i = 0; i < kRxCpuStampCacheSize + 5; i++) {
+        stampCachePush(c, RxCpuStamp{i, 0x0, static_cast<uint16_t>(i)});
+    }
+    CHECK(c.count == kRxCpuStampCacheSize);
+    CHECK(c.e[0].seq == kRxCpuStampCacheSize + 4);
+    CHECK(c.e[kRxCpuStampCacheSize - 1].seq == 5);
+    CHECK(matchRxCpuStamp(c.e, c.count, 0x0, 10, &eav) && eav == 10);
+    CHECK(!matchRxCpuStamp(c.e, c.count, 0x0, 4, &eav));  // aged out
+    RxCpuStampCache one{};
+    stampCachePush(one, RxCpuStamp{0x77, 0x3, 0x0042});
+    CHECK(one.count == 1 && matchRxCpuStamp(one.e, one.count, 0x3, 0x0042, &eav) && eav == 0x77);
+    std::printf("pass: RX-CPU stamp cache (event filter, incremental read start, push/age-out)\n");
 }
 
 static void testReconstructEavTs() {
