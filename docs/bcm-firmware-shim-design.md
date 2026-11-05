@@ -219,3 +219,27 @@ scratch-window word order needs flipping in `loadCoreImage`; a correct
 signature but a frozen heartbeat means the write landed but the core did not
 resume at the PC (revisit the release/fastboot-PC step). Either outcome is a
 precise, self-diagnosing result, which is the point of M1.
+
+### Toolchain build outcome (2026-11-04) — M0 DONE
+
+The toolchain is built and verified at `.agents/tmp/toolchain/bin`
+(`mips-elf-gcc 16.1.0`, `-mtigon` accepted, emits soft-float MIPS32 with no
+mul/div). Two fixes to ThunderGate's `misc/build-toolchain.sh` were needed on
+this machine; the scratch clone is ephemeral, so they are recorded here:
+
+1. **`--without-zstd` on both binutils and GCC configure.** binutils 2.46 links
+   `libzstd` for compressed debug sections; macOS's linker default-searches
+   `/usr/local/lib`, where a stale **x86_64** Homebrew `libzstd` lives, so
+   linking `as-new` failed with an arch mismatch. A cross-assembler needs no
+   zstd.
+2. **Build the toolchain as x86_64** (`--build/--host=x86_64-apple-darwin`,
+   `CC="clang -arch x86_64"`, `CXX="clang++ -arch x86_64"`). This machine's only
+   Homebrew is the **Intel** one at `/usr/local` (`brew --prefix` → `/usr/local`;
+   there is no `/opt/homebrew`), so gmp/mpfr/mpc/isl are x86_64 and cannot link
+   into a native arm64 GCC. A cross-compiler's host arch is irrelevant to the
+   MIPS code it emits; `mips-elf-gcc` simply runs under Rosetta.
+
+If an arm64 Homebrew is ever installed (`/opt/homebrew` with the five deps), the
+x86_64 override can be dropped for a native build. The two fixes are applied in
+the scratch clone's script; fold them upstream-style into any committed copy of
+the build recipe.
