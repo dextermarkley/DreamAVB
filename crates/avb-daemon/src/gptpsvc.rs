@@ -84,6 +84,19 @@ pub struct GptpService {
     /// cleared by a clock step — an anchor taken before a step is wrong by the
     /// step, and a wrong presentation timestamp is worse than none.
     anchor: Option<ClockAnchor>,
+    /// Software GM clock for NICs whose hardware clock cannot be stepped (the
+    /// BCM57762: its EAV counter free-runs, SetClock is ineffective, and the
+    /// MSB register reads 0). We present every HW timestamp as a virtual GM
+    /// time = unwrapped-64-bit-HW + `gm_offset_ns`, so the servo disciplines
+    /// `gm_offset_ns` in software exactly as it would step the I210's clock.
+    /// Zero and unused on the I210 (which steps its hardware clock directly).
+    sw_clock: bool,
+    gm_offset_ns: i128,
+    /// Software high word to unwrap the 32-bit `ReadClock` LSB (the BCM MSB
+    /// register reads 0), re-synced from each 64-bit RX/TX timestamp's epoch.
+    hw_hi: u32,
+    hw_last_lo: u32,
+    hw_seeded: bool,
 }
 
 impl GptpService {
@@ -107,7 +120,8 @@ impl GptpService {
         let clock_gen = dext.clock_gen();
         // Per-NIC timestamp-point latency profile (BCM uses the RX-CPU stamp
         // path, whose RX latency differs from the I210's MAC capture).
-        let cfg = if info.nic_kind == avb_dext::abi::NIC_BCM57762 {
+        let is_bcm = info.nic_kind == avb_dext::abi::NIC_BCM57762;
+        let cfg = if is_bcm {
             PortConfig::bcm57762(mac, tb)
         } else {
             PortConfig::i210(mac, tb)
@@ -127,7 +141,43 @@ impl GptpService {
             last_clock_read: now,
             clock_read_ticks: tb.ns_to_ticks(clock_read_ns),
             anchor: None,
+            sw_clock: is_bcm,
+            gm_offset_ns: 0,
+            hw_hi: 0,
+            hw_last_lo: 0,
+            hw_seeded: false,
         })
+    }
+
+    /// Virtualise a 64-bit HW timestamp into GM time and re-sync the software
+    /// high word to this stamp's epoch. On the I210 (`!sw_clock`) it is the
+    /// identity. The BCM's RX/TX timestamps are already 64-bit (eavHi); adding
+    /// `gm_offset_ns` puts them in the same GM frame as `now_ns` and the clock
+    /// reads the servo sees.
+    fn virt_ts(&mut self, hw_ts: u64) -> u64 {
+        if !self.sw_clock {
+            return hw_ts;
+        }
+        self.hw_hi = (hw_ts >> 32) as u32;
+        self.hw_last_lo = hw_ts as u32;
+        self.hw_seeded = true;
+        (hw_ts as i128 + self.gm_offset_ns) as u64
+    }
+
+    /// Virtualise a `ReadClock` sample. The BCM returns a 32-bit LSB (MSB reads
+    /// 0); unwrap it with the software high word (re-synced from RX/TX stamps),
+    /// then shift into GM time. Identity on the I210.
+    fn virt_read(&mut self, nic_ns: u64) -> u64 {
+        if !self.sw_clock {
+            return nic_ns;
+        }
+        let lo = nic_ns as u32;
+        if self.hw_seeded && lo < self.hw_last_lo {
+            self.hw_hi = self.hw_hi.wrapping_add(1);
+        }
+        self.hw_last_lo = lo;
+        let hw64 = (u64::from(self.hw_hi) << 32) | u64::from(lo);
+        (hw64 as i128 + self.gm_offset_ns) as u64
     }
 
     pub fn port(&self) -> &Port {
@@ -179,9 +229,10 @@ impl GptpService {
 
         // 1) Drain RX control frames into the port.
         for slot in dext.rx_ctl() {
+            let hw_ts = slot.hw_ts_ns.map(|t| self.virt_ts(t));
             let meta = RxMeta {
                 harvest: now_t,
-                hw_ts: slot.hw_ts_ns,
+                hw_ts,
                 clock_gen: slot.clock_gen,
                 step_ambig: slot.step_ambig,
                 desc_vlan_tci: slot.desc_vlan_tci,
@@ -209,7 +260,8 @@ impl GptpService {
         // 2) Harvest a pending TX timestamp and route it to its exchange.
         match dext.poll_tx_ts() {
             TxTsResult::Ready { tag, systim_ns } => {
-                self.port.on_tx_timestamp(tag, GTxTs::Ok(systim_ns), now_t);
+                let ts = self.virt_ts(systim_ns);
+                self.port.on_tx_timestamp(tag, GTxTs::Ok(ts), now_t);
             }
             TxTsResult::Timeout => { /* exchange abandoned; port times it out */ }
             TxTsResult::Pending | TxTsResult::Idle => {}
@@ -269,6 +321,17 @@ impl GptpService {
         while let Some(action) = self.port.take_action() {
             match action {
                 Action::AdjFreq { ppb } => dext.adj_freq(ppb),
+                // Software-clock NICs (BCM): the hardware clock cannot be
+                // stepped (free-running EAV counter, SetClock ineffective), so
+                // apply the servo's step to the software GM offset instead. The
+                // virtualised clock reads then reflect the jump and the servo
+                // converges exactly as a hardware step would. Rate is still
+                // disciplined in hardware via AdjFreq above.
+                Action::StepClock { delta_ns } | Action::SetClock { delta_ns } if self.sw_clock => {
+                    self.gm_offset_ns += i128::from(delta_ns);
+                    self.anchor = None;
+                    self.port.on_clock_stepped(now_t, 0);
+                }
                 Action::StepClock { delta_ns } => {
                     dext.step(delta_ns);
                     // The anchor predates the step, so it is now wrong by
@@ -300,17 +363,18 @@ impl GptpService {
         {
             let (mach, nic_ns) = dext.read_clock();
             if mach.0 != 0 {
+                let gm_ns = self.virt_read(nic_ns);
                 // DextPort collapses the read to a midpoint; use it for both
                 // brackets (read jitter is already averaged out).
                 let reads = [avb_gptp::ClockRead {
                     mach_before: mach.0,
-                    systim_ns: nic_ns,
+                    systim_ns: gm_ns,
                     mach_after: mach.0,
                 }];
                 let _ = self.port.on_clock_read(now_t, &reads);
                 self.anchor = Some(ClockAnchor {
                     mach,
-                    systim_ns: nic_ns,
+                    systim_ns: gm_ns,
                 });
             }
             self.last_clock_read = now_t;
@@ -326,9 +390,10 @@ impl GptpService {
     /// Feed one already-drained control frame to the port. Used by a loop that
     /// owns the control-ring drain itself (see [`GptpService::service_no_rx`]).
     pub fn handle_rx(&mut self, now_t: MachTicks, slot: &crate::dextio::RxSlot) {
+        let hw_ts = slot.hw_ts_ns.map(|t| self.virt_ts(t));
         let meta = RxMeta {
             harvest: now_t,
-            hw_ts: slot.hw_ts_ns,
+            hw_ts,
             clock_gen: slot.clock_gen,
             step_ambig: slot.step_ambig,
             desc_vlan_tci: slot.desc_vlan_tci,
@@ -348,7 +413,8 @@ impl GptpService {
             match dext.poll_tx_ts() {
                 TxTsResult::Ready { tag, systim_ns } => {
                     let now = MachTicks(unsafe { mach2::mach_time::mach_absolute_time() });
-                    self.port.on_tx_timestamp(tag, GTxTs::Ok(systim_ns), now);
+                    let ts = self.virt_ts(systim_ns);
+                    self.port.on_tx_timestamp(tag, GTxTs::Ok(ts), now);
                     return;
                 }
                 TxTsResult::Timeout | TxTsResult::Idle => return,
