@@ -590,8 +590,9 @@ fn cmd_datapath(dev: &Device, json: Option<&Path>, up: bool) -> Result<()> {
         // Load the stamping firmware so the dext's harvest can read the ring
         // and attach each gPTP frame's EAV timestamp (RX_TSTAMP / BD.reserved
         // never latch on this part). The firmware installs its own gPTP rule,
-        // stamps, and passes frames on to the host ring.
-        if bcm {
+        // stamps, and passes frames on to the host ring. AVB_SKIP_STAMPER
+        // leaves the stock RX-CPU in place (to isolate TX-timestamp effects).
+        if bcm && std::env::var_os("AVB_SKIP_STAMPER").is_none() {
             let mut image = BCMFW_IMAGE.to_vec();
             while !image.len().is_multiple_of(4) {
                 image.push(0);
