@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Shared RX frame classification and shared-ring index helpers, used by both
+// Shared RX frame classification, shared-ring index helpers and the
+// kAvbSelSendFrames batch parser, used by both
 // the I210 and the BCM57762 dexts so the DP-4 classifier and the ABI v3 ring
 // rules have one implementation. Pure constexpr; host-tested through
 // i210logic_tests (moved verbatim from I210Logic.hpp).
@@ -186,6 +187,83 @@ constexpr RingSpace ringFree(uint64_t head, uint64_t tail, uint32_t slots) {
 // live header producer_running rule (§3.4)
 constexpr bool producerRunning(bool attached, uint32_t stage, uint32_t fault) {
     return attached && stage == kAvbStageDatapath && fault == kAvbFaultNone;
+}
+
+// ---------------------------------------------------------------------------
+// kAvbSelSendFrames batch parsing (ABI v4). Pure and host-tested: this walks
+// client-supplied bytes, so every bound is checked here BEFORE the driver
+// touches the TX ring, and the whole batch is refused rather than partly
+// queued. Layout is documented on AvbTxBatchHeader in AVBShared.h.
+
+// Little-endian u32 at byte `off` (the batch layout is host byte order).
+constexpr uint32_t batchLe32(const uint8_t* p, uint32_t off) {
+    return static_cast<uint32_t>(p[off]) | (static_cast<uint32_t>(p[off + 1]) << 8) |
+           (static_cast<uint32_t>(p[off + 2]) << 16) | (static_cast<uint32_t>(p[off + 3]) << 24);
+}
+
+struct TxBatchFrame {
+    uint32_t offset;  // into the structure input
+    uint32_t len;
+};
+
+struct TxBatchPlan {
+    bool valid;
+    uint32_t count;
+    TxBatchFrame f[AVB_TX_BATCH_MAX];
+};
+
+constexpr uint32_t roundUp4(uint32_t n) { return (n + 3u) & ~3u; }
+
+// Parses and validates a whole batch. `valid` is false for any malformed
+// input: short buffer, bad count, a declared total that disagrees with the
+// real length, a frame length outside 14..AVB_FRAME_MAX_LEN, a non-zero
+// reserved field, an entry running past the end, or trailing bytes after the
+// last frame. Nothing is trusted from the header except after checking.
+constexpr TxBatchPlan parseTxBatch(const uint8_t* in, uint32_t inLen) {
+    TxBatchPlan p{};
+    if (in == nullptr || inLen < 8u || inLen > AVB_TX_BATCH_BYTES_MAX) {
+        return p;
+    }
+    const uint32_t count = batchLe32(in, 0);
+    const uint32_t total = batchLe32(in, 4);
+    if (count == 0u || count > AVB_TX_BATCH_MAX || total != inLen) {
+        return p;
+    }
+    uint32_t at = 8u;
+    for (uint32_t i = 0; i < count; i++) {
+        if (at + 4u > inLen) {
+            return p;
+        }
+        const uint32_t hdr = batchLe32(in, at);
+        const uint32_t len = hdr & 0xFFFFu;
+        const uint32_t reserved = hdr >> 16;
+        if (reserved != 0u || len < 14u || len > AVB_FRAME_MAX_LEN) {
+            return p;
+        }
+        at += 4u;
+        if (len > inLen - at) {  // no overflow: at <= inLen here
+            return p;
+        }
+        p.f[i].offset = at;
+        p.f[i].len = len;
+        const uint32_t padded = roundUp4(len);
+        if (padded > inLen - at) {
+            return p;
+        }
+        at += padded;
+    }
+    if (at != inLen) {  // trailing slop: the client and we disagree on layout
+        return p;
+    }
+    p.valid = true;
+    p.count = count;
+    return p;
+}
+
+// Bytes a batch of `count` frames of `len` each occupies. Client-side helper,
+// kept here so both sides size the buffer from one expression.
+constexpr uint32_t txBatchBytes(uint32_t count, uint32_t len) {
+    return 8u + count * (4u + roundUp4(len));
 }
 
 }  // namespace avbrx

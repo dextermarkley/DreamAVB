@@ -122,6 +122,8 @@ const IOUserClientMethodDispatch kDispatchRingAttach =
     /* 13 RingAttach      */ {dispatchToDriver, 0, 1, 0, 3, 0};
 const IOUserClientMethodDispatch kDispatchRingDetach =
     /* 14 RingDetach      */ {dispatchToDriver, 0, 0, 0, 0, 0};
+const IOUserClientMethodDispatch kDispatchSendFrames =
+    /* 15 SendFrames      */ {dispatchToDriver, 0, 0, kVar, 2, 0};
 const IOUserClientMethodDispatch kDispatchReadSram =
     /* 18 ReadSram: scalarIn nic_sram_addr, scalarOut word */
     {dispatchToDriver, 0, 1, 0, 1, 0};
@@ -242,9 +244,12 @@ AVBBcmUserClient::ExternalMethod(uint64_t selector,
     if (selector == kAvbSelRingDetach) {
         return super::ExternalMethod(selector, arguments, &kDispatchRingDetach, this, nullptr);
     }
+    if (selector == kAvbSelSendFrames) {
+        return super::ExternalMethod(selector, arguments, &kDispatchSendFrames, this, nullptr);
+    }
     if (selector >= kAvbSelBaseCount) {
-        // 10 StepClock and 15 SendFrames are I210-only (the BCM clock is
-        // disciplined in software; frames go out one SendFrame at a time).
+        // 10 StepClock is I210-only: the BCM clock cannot be stepped, so the
+        // daemon disciplines its offset in software.
         return kIOReturnUnsupported;
     }
     return super::ExternalMethod(selector, arguments, &kDispatch[selector], this, nullptr);

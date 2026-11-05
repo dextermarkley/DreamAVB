@@ -54,7 +54,9 @@ namespace {
 // the return ring 1024, so both still exceed what is posted.
 constexpr uint32_t kRxPosted      = 256;    // std RX buffers posted
 constexpr uint32_t kRxBufSize     = 2048;   // per RX buffer (DMA size 1536)
-constexpr uint32_t kTxSlots       = 16;     // TX bounce buffers / max in flight
+// 64 in flight holds four full 16-frame batches while the status-block TX
+// consumer catches up; the 512-entry TX ring is a multiple of it.
+constexpr uint32_t kTxSlots       = 64;     // TX bounce buffers / max in flight
 constexpr uint32_t kTxBufSize     = 2048;
 constexpr uint32_t kSwRingSize    = 256;    // software RX ring (power of two)
 constexpr uint64_t kTimerPeriodNs = 1000000;      // 1 ms
@@ -1500,7 +1502,9 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
     wrFlush(v, bcm::kMboxTxHostProd0, v->txProd);
 
     const uint64_t seq = ++v->txSeq;
+    v->ctr.c[kAvbCtrTxFrames]++;
     if (wantTs) {
+        v->ctr.c[kAvbCtrTxTsRequested]++;
         v->tsPending = true;
         v->tsSeq = seq;
         v->tsPre = pre;
@@ -1510,6 +1514,69 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
         v->tsMach = 0;
     }
     *seqOut = seq;
+    *machOut = mach;
+    return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
+}
+
+// kAvbSelSendFrames (ABI v4): queue up to AVB_TX_BATCH_MAX untimestamped frames
+// with ONE doorbell and one user-client round trip. The talker sends one frame
+// per stream every 125 us; per-frame SendFrame calls (~20 000/s) kept the
+// driver queue busy enough to miss most observation intervals and to delay the
+// 1 ms RX harvest. Frames are queued in order until the in-flight window is
+// full; `acceptedOut` says how many went in, so the client re-paces the rest.
+// The batch layout is validated by the shared parseTxBatch before any frame is
+// touched (malformed -> the whole call is refused).
+static kern_return_t sendFrames(IV * v, const uint8_t * in, uint32_t inLen, uint64_t * acceptedOut,
+                                uint64_t * machOut)
+{
+    *acceptedOut = 0;
+    *machOut = 0;
+    if (!ok(v) || v->stage != kAvbStageDatapath) {
+        return kIOReturnNotReady;
+    }
+    const TxBatchPlan plan = parseTxBatch(in, inLen);
+    if (!plan.valid) {
+        v->ctr.c[kAvbCtrTxBatchRejected]++;
+        return kIOReturnBadArgument;
+    }
+    checkTx(v);
+    auto * ring = reinterpret_cast<TxBd *>(v->txRing.va);
+    uint32_t accepted = 0;
+    bool refused = false;
+    for (uint32_t i = 0; i < plan.count; i++) {
+        if (ringDistance(v->txCons, v->txProd, bcm::kTxRingSize) >= kTxSlots) {
+            refused = true;
+            break;
+        }
+        const uint32_t len = plan.f[i].len;
+        const uint32_t slot = v->txProd % kTxSlots;
+        uint8_t * buf = v->txBufs.va + uint64_t(slot) * kTxBufSize;
+        memcpy(buf, in + plan.f[i].offset, len);
+        uint32_t padded = len;
+        if (padded < AVB_FRAME_MIN_LEN) {
+            memset(buf + len, 0, AVB_FRAME_MIN_LEN - len);
+            padded = AVB_FRAME_MIN_LEN;
+        }
+        ring[v->txProd] = makeTxBd(v->txBufs.iova + uint64_t(slot) * kTxBufSize, padded, false);
+        v->txProd = ringNext(v->txProd, bcm::kTxRingSize);
+        accepted++;
+    }
+    if (accepted == 0) {
+        // Nothing queued: no doorbell, not an error -- the client backs off.
+        return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    OSSynchronizeIO();
+    const uint64_t mach = mach_absolute_time();
+    wrFlush(v, bcm::kMboxTxHostProd0, v->txProd);
+
+    v->txSeq += accepted;
+    v->ctr.c[kAvbCtrTxFrames] += accepted;
+    v->ctr.c[kAvbCtrTxBatches]++;
+    if (refused) {
+        v->ctr.c[kAvbCtrTxBatchPartial]++;
+    }
+    *acceptedOut = accepted;
     *machOut = mach;
     return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
 }
@@ -2019,6 +2086,24 @@ AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOU
         const kern_return_t ret =
             sendFrame(v, bytes, static_cast<uint32_t>(len), a->scalarInput[0] != 0, &seq, &mach);
         a->scalarOutput[0] = seq;
+        a->scalarOutput[1] = mach;
+        return ret;
+    }
+
+    case kAvbSelSendFrames: {
+        if (a->structureInput == nullptr) {
+            return kIOReturnBadArgument;
+        }
+        const auto * bytes = static_cast<const uint8_t *>(a->structureInput->getBytesNoCopy());
+        const size_t len = a->structureInput->getLength();
+        if (bytes == nullptr || len > AVB_TX_BATCH_BYTES_MAX) {
+            v->ctr.c[kAvbCtrTxBatchRejected]++;
+            return kIOReturnBadArgument;
+        }
+        uint64_t accepted = 0;
+        uint64_t mach = 0;
+        const kern_return_t ret = sendFrames(v, bytes, static_cast<uint32_t>(len), &accepted, &mach);
+        a->scalarOutput[0] = accepted;
         a->scalarOutput[1] = mach;
         return ret;
     }
