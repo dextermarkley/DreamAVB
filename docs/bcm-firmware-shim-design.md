@@ -175,3 +175,47 @@ No change to ring management, classifier offsets, or the gPTP consumer.
 - Core-side register access assumptions (the `0x30000` window, fastboot PC) are
   cross-checked against two independent sources (ThunderGate and Apple's
   `loadFirmware`) but still need the M1 hardware confirmation.
+
+## 11. Execution status (2026-11-04)
+
+**M0 toolchain — blocked on a manual step.** Homebrew refuses to run inside the
+build sandbox (`sandbox-exec: sandbox_apply: Operation not permitted`), so the
+five missing deps (`mpfr libmpc isl texinfo gnu-sed`; `gmp` is already present)
+cannot be installed from here, and GCC's configure needs them. ThunderGate is
+cloned at `.agents/tmp/thundergate`. To build the toolchain, run once in a real
+Terminal:
+
+    brew install mpfr libmpc isl texinfo gnu-sed
+    TG_TOOLCHAIN_PREFIX=/Users/dexter/AVB-Audio/.agents/tmp/toolchain \
+    TG_TOOLCHAIN_BUILD=/Users/dexter/AVB-Audio/.agents/tmp/.toolchain-build \
+    bash /Users/dexter/AVB-Audio/.agents/tmp/thundergate/misc/build-toolchain.sh
+
+The toolchain is only needed for the C-based real shim (M2). It is NOT needed
+for M1.
+
+**M0 NVRAM backup — deferred, and lower-risk than first stated.** The whole
+approach loads into the RX-CPU scratch pad (volatile RAM), never NVRAM, so a
+power cycle fully restores the factory state; an NVRAM backup is insurance, not
+a prerequisite. A read-only NVRAM dump command (dext + probe) is a small
+follow-up to add before M2 if wanted.
+
+**M1 hello-core — implemented, gate-green, ready for a hardware run.** Rather
+than wait on the toolchain, the hello-core is hand-assembled (10 big-endian
+MIPS words, no mul/div/unaligned) and carried by `avb-probe core-selftest`. The
+dext gained two BCM-only selectors (`LoadCoreImage` 16, `ReadCoreMem` 17,
+outside the shared `kAvbSelCount` space so the I210 is untouched):
+`loadCoreImage` halts the RX CPU, writes the image to the scratch pad through
+the memory window (virt `0x08000000` -> window `0x30000`), sets the PC, and
+releases; `readCoreMem` reads scratch back by virtual address. Commit `2fdad8c`.
+
+Hardware run (after activating the rebuilt dext and replugging):
+
+    avb-probe --nic bcm core-selftest
+
+Expected on success: `signature 0x7a6b4331 MATCH` and a `heartbeat` that
+advances between the two samples (`core RUNNING`) — which proves
+halt/load/set-PC/release end to end. A byte-swapped signature means the
+scratch-window word order needs flipping in `loadCoreImage`; a correct
+signature but a frozen heartbeat means the write landed but the core did not
+resume at the PC (revisit the release/fastboot-PC step). Either outcome is a
+precise, self-diagnosing result, which is the point of M1.
