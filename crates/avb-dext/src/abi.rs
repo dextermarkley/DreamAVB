@@ -102,6 +102,12 @@ pub mod sel {
     /// in: packed `TxBatch` (see `super::tx_batch`); out: accepted, mach.
     pub const SEND_FRAMES: u32 = 15;
     pub const COUNT: u32 = 16;
+    /// BCM only (RX-CPU bring-up, M1+), outside the shared COUNT space: in
+    /// load_addr + struct image bytes; out halted, post-release mode. Loads a
+    /// clean-room image into the RX-CPU scratch pad and starts it.
+    pub const LOAD_CORE_IMAGE: u32 = 16;
+    /// BCM only: in virtual scratch address (0x0800xxxx); out one word.
+    pub const READ_CORE_MEM: u32 = 17;
     /// Selectors every NIC dext implements (the BCM dext: only these).
     /// 32..47 are reserved for the talker path.
     pub const BASE_COUNT: u32 = 10;
@@ -121,6 +127,11 @@ pub const INIT_FLAG_RX_PTP_V2_L2: u64 = 1 << 1;
 /// BCM only: replay Apple's AVB RX classifier block so gPTP frames latch
 /// RX timestamps (`AVB_INIT_FLAG_AVB_RX_RULES`).
 pub const INIT_FLAG_AVB_RX_RULES: u64 = 1 << 2;
+
+/// BCM RX-CPU scratch pad (M1 core bring-up): the core's virtual base address
+/// and its size. Images load here and the PC is set to a address within it.
+pub const RX_CPU_SCRATCH_BASE: u32 = 0x0800_0000;
+pub const RX_CPU_SCRATCH_SIZE: u32 = 0x0001_0000;
 
 pub const STAGE_NONE: u32 = 0;
 pub const STAGE_TIMESYNC: u32 = 1;

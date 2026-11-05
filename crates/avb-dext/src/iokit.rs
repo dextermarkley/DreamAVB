@@ -384,6 +384,36 @@ impl Device {
         Ok(())
     }
 
+    /// BCM M1: load a clean-room image into the RX-CPU scratch pad at
+    /// `load_addr` (a `0x0800xxxx` virtual address) and start the core.
+    /// Returns `(halted, post_release_mode)`.
+    pub fn load_core_image(&self, load_addr: u32, image: &[u8]) -> Result<(bool, u32)> {
+        let mut out = [0u64; 2];
+        self.call(
+            sel::LOAD_CORE_IMAGE,
+            &[u64::from(load_addr)],
+            image,
+            &mut out,
+            None,
+            "LoadCoreImage",
+        )?;
+        Ok((out[0] != 0, out[1] as u32))
+    }
+
+    /// BCM M1: read one word of RX-CPU scratch by virtual address.
+    pub fn read_core_mem(&self, virt_addr: u32) -> Result<u32> {
+        let mut out = [0u64; 1];
+        self.call(
+            sel::READ_CORE_MEM,
+            &[u64::from(virt_addr)],
+            &[],
+            &mut out,
+            None,
+            "ReadCoreMem",
+        )?;
+        Ok(out[0] as u32)
+    }
+
     /// Drain up to `max` frames whose ethertype matches (0 = all).
     pub fn poll_rx(&self, ethertype: u16, max: usize) -> Result<Box<RxBatch>> {
         let mut batch = Box::<RxBatch>::default();

@@ -90,6 +90,10 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         count: u32,
     },
+    /// M1 (BCM): load a hand-assembled hello-core image into the RX-CPU scratch
+    /// pad, start it, and read back the signature + heartbeat to prove the
+    /// halt / load / set-PC / release path works on real hardware.
+    CoreSelftest,
     /// info, clock 10 s, adjfreq +-100000 ppb, datapath up, rx-ptp 10 s, pdelay 30, datapath down.
     All,
 }
@@ -563,6 +567,91 @@ fn cmd_datapath(dev: &Device, json: Option<&Path>, up: bool) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// M1: RX-CPU load-path self-test (BCM)
+
+/// Hand-assembled big-endian MIPS32 hello-core for the Tigon3 RX CPU, loaded at
+/// 0x08000000. It writes a signature to scratch 0x0800FF00, then spins
+/// incrementing a heartbeat at 0x0800FF04 so the host can see the core actually
+/// executing (not merely that memory was written). It uses no multiply, divide
+/// or unaligned access, so it is valid without the -mtigon toolchain.
+///
+///   lui   t0, 0x0800        ; t0 = 0x08000000
+///   ori   t0, t0, 0xFF00    ; t0 = 0x0800FF00   (scratch I/O base)
+///   lui   t1, 0x7A6B
+///   ori   t1, t1, 0x4331    ; t1 = 0x7A6B4331   (signature)
+///   sw    t1, 0(t0)         ; [0x0800FF00] = signature
+///   ori   t2, zero, 0       ; t2 = 0
+/// loop (0x08000018):
+///   addiu t2, t2, 1         ; heartbeat++
+///   sw    t2, 4(t0)         ; [0x0800FF04] = heartbeat
+///   j     loop              ; -> 0x08000018
+///   nop                     ; branch delay slot
+const HELLO_CORE: [u32; 10] = [
+    0x3C08_0800,
+    0x3508_FF00,
+    0x3C09_7A6B,
+    0x3529_4331,
+    0xAD09_0000,
+    0x340A_0000,
+    0x254A_0001,
+    0xAD0A_0004,
+    0x0A00_0006,
+    0x0000_0000,
+];
+const HELLO_SIG: u32 = 0x7A6B_4331;
+const HELLO_SIG_ADDR: u32 = 0x0800_FF00;
+const HELLO_HB_ADDR: u32 = 0x0800_FF04;
+
+fn cmd_core_selftest(dev: &Device, json: Option<&Path>) -> Result<()> {
+    let mut image = Vec::with_capacity(HELLO_CORE.len() * 4);
+    for w in HELLO_CORE {
+        image.extend_from_slice(&w.to_be_bytes());
+    }
+    let (halted, mode) = dev.load_core_image(abi::RX_CPU_SCRATCH_BASE, &image)?;
+    println!(
+        "core load: halted={halted} post-release mode=0x{mode:08x} ({} bytes at 0x{:08x})",
+        image.len(),
+        abi::RX_CPU_SCRATCH_BASE
+    );
+
+    let sig = dev.read_core_mem(HELLO_SIG_ADDR)?;
+    let hb1 = dev.read_core_mem(HELLO_HB_ADDR)?;
+    sleep(Duration::from_millis(50));
+    let hb2 = dev.read_core_mem(HELLO_HB_ADDR)?;
+
+    let sig_ok = sig == HELLO_SIG;
+    let running = hb2 != hb1;
+    println!(
+        "signature 0x{sig:08x} (expected 0x{HELLO_SIG:08x}): {}",
+        if sig_ok { "MATCH" } else { "MISMATCH" }
+    );
+    println!(
+        "heartbeat {hb1} -> {hb2}: core {}",
+        if running { "RUNNING" } else { "NOT advancing" }
+    );
+    emit(
+        json,
+        "core_selftest",
+        &serde_json::json!({
+            "halted": halted,
+            "mode": mode,
+            "signature": sig,
+            "signature_ok": sig_ok,
+            "heartbeat": [hb1, hb2],
+            "running": running,
+        }),
+    )?;
+    if !sig_ok || !running {
+        bail!(
+            "core self-test failed (signature_ok={sig_ok}, running={running}); \
+             a byte-swapped signature means the scratch-window endianness needs flipping"
+        );
+    }
+    println!("core self-test PASSED: halt / load / set-PC / release works on hardware");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // G3
 
 #[derive(Serialize)]
@@ -972,6 +1061,7 @@ fn main() -> Result<()> {
         Cmd::Datapath { state } => cmd_datapath(&dev, json, state == "up"),
         Cmd::RxPtp { seconds } => cmd_rx_ptp(&dev, json, seconds),
         Cmd::Pdelay { count } => cmd_pdelay(&dev, json, count),
+        Cmd::CoreSelftest => cmd_core_selftest(&dev, json),
         Cmd::All => cmd_all(&dev, json),
     }
 }

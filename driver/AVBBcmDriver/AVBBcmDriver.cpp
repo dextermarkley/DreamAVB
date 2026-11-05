@@ -823,6 +823,86 @@ static void programAvbRxRules(IV * v)
         rd(v, bcm::kRxCpuMode), rd(v, bcm::kEavRefClkLsb), rd(v, bcm::kRxPtpCtl));
 }
 
+// Map an RX-CPU virtual scratch address (0x0800xxxx) to its memory-window
+// address (0x0003xxxx), bounds-checked to the 64 KB pad.
+static bool scratchWinAddr(uint32_t virtAddr, uint32_t len, uint32_t * winOut)
+{
+    if (virtAddr < bcm::kRxCpuScratchVirtBase) {
+        return false;
+    }
+    const uint32_t off = virtAddr - bcm::kRxCpuScratchVirtBase;
+    if (off >= bcm::kRxCpuScratchSize || len > bcm::kRxCpuScratchSize - off) {
+        return false;
+    }
+    *winOut = bcm::kRxCpuScratchWinBase + off;
+    return true;
+}
+
+// M1: load a clean-room RX-CPU image into the scratch pad and start it.
+// Mirrors ThunderGate image_load / Apple loadFirmware: halt the core, write the
+// flat image word by word through the memory window, point the PC at the image
+// base, release. The host reads back a signature/heartbeat with readCoreMem to
+// prove the core executed. Image words are assembled big-endian (the core is a
+// big-endian MIPS); the readback is self-consistent through the same window.
+static kern_return_t loadCoreImage(IV * v, uint32_t loadAddr, const uint8_t * img, uint32_t len,
+                                   uint64_t * haltedOut, uint64_t * modeOut)
+{
+    if (!ok(v)) {
+        return kIOReturnNotReady;
+    }
+    uint32_t winBase = 0;
+    if (img == nullptr || len == 0 || (len & 3u) != 0 || !scratchWinAddr(loadAddr, len, &winBase)) {
+        return kIOReturnBadArgument;
+    }
+
+    const uint32_t savedMode = rd(v, bcm::kRxCpuMode);
+    wr(v, bcm::kRxCpuState, 0xffffffff);
+    wr(v, bcm::kRxCpuMode, savedMode | bcm::kRxCpuModeHalt);
+    const bool halted =
+        pollUs(v, 5000, 50, [&] { return (rd(v, bcm::kRxCpuMode) & bcm::kRxCpuModeHalt) != 0; });
+    LOG("core load: halt requested, halted=%d mode 0x%08x, writing %u bytes at 0x%08x (win 0x%05x)",
+        halted, rd(v, bcm::kRxCpuMode), len, loadAddr, winBase);
+
+    for (uint32_t i = 0; i < len && ok(v); i += 4) {
+        const uint32_t word = (static_cast<uint32_t>(img[i]) << 24) |
+                              (static_cast<uint32_t>(img[i + 1]) << 16) |
+                              (static_cast<uint32_t>(img[i + 2]) << 8) |
+                              static_cast<uint32_t>(img[i + 3]);
+        sramWrite(v, winBase + i, word);
+    }
+
+    // Point the core at the image base and release it. Setting the PC register
+    // then clearing HALT resumes execution there (tg3_load_firmware_cpu order).
+    wr(v, bcm::kRxCpuPc, loadAddr);
+    wr(v, bcm::kRxCpuMode, savedMode & ~bcm::kRxCpuModeHalt);
+    const uint32_t finalMode = rd(v, bcm::kRxCpuMode);
+    LOG("core load: released, mode 0x%08x pc 0x%08x", finalMode, rd(v, bcm::kRxCpuPc));
+
+    if (haltedOut != nullptr) {
+        *haltedOut = halted ? 1 : 0;
+    }
+    if (modeOut != nullptr) {
+        *modeOut = finalMode;
+    }
+    return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
+}
+
+// M1 readback: one word of RX-CPU scratch, by virtual address.
+static kern_return_t readCoreMem(IV * v, uint32_t virtAddr, uint64_t * wordOut)
+{
+    if (!ok(v)) {
+        return kIOReturnNotReady;
+    }
+    uint32_t winAddr = 0;
+    if (!scratchWinAddr(virtAddr, 4, &winAddr)) {
+        return kIOReturnBadArgument;
+    }
+    if (wordOut != nullptr) {
+        *wordOut = sramRead(v, winAddr);
+    }
+    return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
+}
+
 // tg3_abort_hw order for a 5705_PLUS part (RCVLSC/DMAC/MBFREE/BUFMGR/MEMARB
 // cannot be stopped on this class and are skipped, as tg3 does).
 static void abortHw(IV * v)
@@ -1453,6 +1533,31 @@ AVBBcmDriver::HandleUserMethod(uint64_t selector, IOUserClientMethodArguments * 
     case kAvbSelShutdownDatapath:
         shutdownDatapath(v);
         return kIOReturnSuccess;
+
+    case kAvbSelLoadCoreImage: {
+        if (a->structureInput == nullptr) {
+            return kIOReturnBadArgument;
+        }
+        const auto * bytes = static_cast<const uint8_t *>(a->structureInput->getBytesNoCopy());
+        const size_t len = a->structureInput->getLength();
+        if (bytes == nullptr || len == 0 || len > bcm::kRxCpuScratchSize) {
+            return kIOReturnBadArgument;
+        }
+        uint64_t halted = 0;
+        uint64_t mode = 0;
+        const kern_return_t ret = loadCoreImage(v, static_cast<uint32_t>(a->scalarInput[0]), bytes,
+                                                 static_cast<uint32_t>(len), &halted, &mode);
+        a->scalarOutput[0] = halted;
+        a->scalarOutput[1] = mode;
+        return ret;
+    }
+
+    case kAvbSelReadCoreMem: {
+        uint64_t word = 0;
+        const kern_return_t ret = readCoreMem(v, static_cast<uint32_t>(a->scalarInput[0]), &word);
+        a->scalarOutput[0] = word;
+        return ret;
+    }
 
     default:
         return kIOReturnUnsupported;

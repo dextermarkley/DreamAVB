@@ -50,8 +50,13 @@ enum AvbSelector : uint32_t {
     kAvbSelRingAttach       = 13, // in: flags (must be 0)     out: generation, rx_mem_size, consumer_mem_size
     kAvbSelRingDetach       = 14, // in: -                     out: -
     kAvbSelSendFrames       = 15, // in: struct AvbTxBatch     out: accepted, mach_at_doorbell
-    kAvbSelCount            = 16,
+    kAvbSelCount            = 16, // size of the shared selector space (I210 implements 0..15)
     kAvbSelBaseCount        = 10, // implemented by every NIC dext (BCM: only these)
+    // BCM-only (RX-CPU firmware bring-up, M1+), outside the shared space so the
+    // I210 dispatch table (sized kAvbSelCount) and its bounds check are
+    // untouched. The BCM userclient routes these two explicitly.
+    kAvbSelLoadCoreImage    = 16, // BCM: in: load_addr + struct image bytes  out: halted, mode
+    kAvbSelReadCoreMem      = 17, // BCM: in: scratch addr (0x0800xxxx)        out: word
     // 32..47 reserved: talker TX ring / Qav (not built in Phase 1a)
 };
 

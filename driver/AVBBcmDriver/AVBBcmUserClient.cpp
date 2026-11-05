@@ -67,6 +67,14 @@ const IOUserClientMethodDispatch kDispatch[kAvbSelBaseCount] = {
 };
 static_assert(sizeof(kDispatch) / sizeof(kDispatch[0]) == kAvbSelBaseCount, "BCM dispatch covers the base selectors");
 
+// BCM-only RX-CPU bring-up selectors (16/17), outside the shared base range.
+const IOUserClientMethodDispatch kDispatchLoadCoreImage =
+    /* 16 LoadCoreImage: scalarIn load_addr, structIn image, scalarOut halted+mode */
+    {dispatchToDriver, 0, 1, kVar, 2, 0};
+const IOUserClientMethodDispatch kDispatchReadCoreMem =
+    /* 17 ReadCoreMem: scalarIn virt_addr, scalarOut word */
+    {dispatchToDriver, 0, 1, 0, 1, 0};
+
 }  // namespace
 
 bool
@@ -130,8 +138,14 @@ AVBBcmUserClient::ExternalMethod(uint64_t selector,
     (void)dispatch;
     (void)target;
     (void)reference;
+    if (selector == kAvbSelLoadCoreImage) {
+        return super::ExternalMethod(selector, arguments, &kDispatchLoadCoreImage, this, nullptr);
+    }
+    if (selector == kAvbSelReadCoreMem) {
+        return super::ExternalMethod(selector, arguments, &kDispatchReadCoreMem, this, nullptr);
+    }
     if (selector >= kAvbSelBaseCount) {
-        // 10..14 (shared rings, StepClock, counters) are I210-only.
+        // 10..15 (shared rings, StepClock, counters) are I210-only.
         return kIOReturnUnsupported;
     }
     return super::ExternalMethod(selector, arguments, &kDispatch[selector], this, nullptr);

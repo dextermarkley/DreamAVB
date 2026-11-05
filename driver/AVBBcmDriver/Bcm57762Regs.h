@@ -262,6 +262,13 @@ constexpr uint32_t kFtqReset            = 0x5c00;
 constexpr uint32_t kRxCpuMode           = 0x5000;
 constexpr uint32_t  kRxCpuModeHalt      = 0x00000400;
 constexpr uint32_t kRxCpuState          = 0x5004;
+constexpr uint32_t kRxCpuPc             = 0x501c;      // program counter; set to image base before release
+// RX-CPU scratch pad. The core's virtual base 0x08000000 maps to NIC memory
+// window address 0x30000 (ThunderGate _tr_addr; matches Apple memWrInd). The
+// 64 KB pad is addressed through the memory window (kMemWinBase/kMemWinData).
+constexpr uint32_t kRxCpuScratchVirtBase = 0x08000000;
+constexpr uint32_t kRxCpuScratchWinBase  = 0x00030000;
+constexpr uint32_t kRxCpuScratchSize     = 0x00010000; // 64 KB
 
 constexpr uint32_t kGrcMode             = 0x6800;
 constexpr uint32_t  kGrcWswapNonFrm     = 0x00000004;
