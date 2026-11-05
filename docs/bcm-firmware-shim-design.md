@@ -491,3 +491,36 @@ at `[rax+0x1c8]` of `[this+0x398]` to find the register writes that install the
 realtime-queue ingress filter (what actually routes 0x88F7 to the queue and
 arms per-frame BD.reserved stamping), then replicate them from the shim/dext.
 This is a deeper RE layer (framework, not the BCM driver) with real uncertainty.
+
+### Apple-state capture attempt (2026-11-05): nothing armed to capture
+
+Set up Apple's AVB via Audio MIDI Setup: all 8 MacBook Pro Audio Input Streams
+showed "Connected" against the 16R Send banks (screenshot), but "not acquired",
+and Apple's stack threw an error (the broken macOS AVB we are replacing). Took
+over with our dext and snapshotted before any reset:
+
+- Realtime-queue registers all ZERO: ring base 0xd20, size 0x5c8, HOSTCC AVB
+  tuning 0x3c08/0x3c10/0x3c20. Classifier block (0x5400-0x561c) also zero.
+- Only unrelated registers retained values (0x3c44=0xb00 status-block coalescing,
+  0x3cd4=0x0f, 0x5c0=0x408404a0).
+
+Conclusion: Apple arms the realtime RX queue only when a stream is ACQUIRED and
+media flows, not merely "connected". macOS AVB errored before acquisition, so
+the receive path was never armed -- there was no live config to capture. The
+capture-and-replay strategy therefore depends on Apple's AVB working well enough
+to acquire a stream, which on this machine it does not. (A Thunderbolt replug
+also risks power-cycling the adapter, a second obstacle to the snapshot path.)
+
+So both non-framework paths to the realtime queue are now blocked:
+- Capture-and-replay: needs Apple to acquire a stream; its AVB cannot.
+- Pure register replay (classifier + ring 1): proven insufficient -- the
+  routing/arming lives in IONetworkingFamily's realtime-queue logic, active only
+  during acquisition.
+
+What remains is to derive and program the realtime RX queue entirely ourselves
+(allocate the ring, work out 0xd20/0x5c8/0x3c00 and the classifier->ring routing
+by experiment, drive it from our own gPTP/stream), i.e. reimplement the receive
+queue from first principles rather than copy Apple. That is a large, open-ended
+effort. Everything up to it is built and proven: feasibility, toolchain, the
+RX-CPU load path (M1), the BD.reserved timestamp read, return ring 1, and the
+full classifier replay.
