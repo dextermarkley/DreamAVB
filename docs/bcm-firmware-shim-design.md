@@ -314,3 +314,40 @@ Next, trace the `startAVB` / `updateAVBStreamFilters` register-write helper
 enable, per-rule enable bits, and EAV/0x6900 setup -- then make the shim replay
 that exact sequence instead of just the 0x5400-0x561c window and the bogus
 0x6c8 write. Drop the 0x6c8 write.
+
+### Apple's full classifier sequence traced; shim write list rebuilt (2026-11-05)
+
+Traced `startAVB` (0xffffff800272c11a), `updateAVBStreamFilters` (0x...be58)
+and `setPerfectMatch` from the boot KC. Apple's writes are direct MMIO
+(`mov dword ptr [regbase + 0xNNNN], imm`); the `call 0xaa0a30` before each is a
+posted-write flush, not the write. Complete ordered sequence:
+
+updateAVBStreamFilters (runs first):
+  0x5400=0x8400e000  0x5480=<stationMAC>
+  0x5404=0x8400e000  0x5484=<stationMAC>
+  0x5408=0x8400000c  0x5488=<stationMAC>
+  0x540c=0x8400000c  0x548c=<stationMAC>
+then setPerfectMatch x5 (station MAC match; slots 1-4 zeroed, slot 5 a const),
+then startAVB:
+  0xd20=<r14 & 0xffff8000>   0x5c8=<(r15-r14) & 0xf8000>   (realtime-queue derived)
+  0x5410=0x8400000c  0x5494=0x88f7ffff  0x5414=0x84006002  0x5494=0x013fffff
+  0x5418=0x84006002  0x5498=0x0140ffff
+  0x5500=5 0x5504=0xa 0x5508=0x10 0x550c=0x20 0x5510=0x40
+  0x5608=0 0x560c=0xe0 0x5610=0 0x5614=0xe1 0x5618=0x25 0x561c=0xe4e3a2 0x560=0xe
+
+Findings:
+- **Apple never writes RX_PTP_CTL (0x6c8).** Our Phase-0 guess was wrong;
+  dropped from the shim. Arming is the classifier itself.
+- We had been **missing the 0x5480-0x548c per-stream match block** (written by
+  updateAVBStreamFilters) and had the first-bank order slightly off. The shim
+  now replays the exact sequence, with 0x5480-0x548c = 0 (multicast gPTP needs
+  no unicast station match; matches Apple's zeroed slots).
+- Two writes remain unreplayed: **0xd20 and 0x5c8**, computed from the
+  realtime-AVB receive-queue buffers that `setupAVB` allocates via
+  IOEthernetController (`setNumberOfRealtimeReceiveQueues` /
+  `createRealtimeAVBPacketPool`, latencies 125 us / 250 us). Our dext uses its
+  own standard RX ring, not that realtime queue, so these are deferred. If the
+  rebuilt classifier still does not arm the capture, the realtime-queue path
+  (and 0xd20/0x5c8) is the next and most likely hypothesis.
+
+Shim rebuilt to 388 bytes; rodata table verified against the trace.
