@@ -84,6 +84,11 @@ enum AvbMemType : uint64_t {
 // BCM only: after the datapath is up, replay Apple's AVB RX classifier block
 // (kAvbRxRuleWrites) so gPTP frames latch RX timestamps on the BCM57762.
 #define AVB_INIT_FLAG_AVB_RX_RULES (1u << 2)
+// BCM only: load the clean-room RX-CPU stamping firmware (driver/bcm-fw) and
+// attach its per-frame EAV timestamp to harvested gPTP frames (matched by PTP
+// messageType + sequenceId). This is our own RX-timestamp path, independent of
+// the (non-functional on this part) MAC RX_TSTAMP latch.
+#define AVB_INIT_FLAG_RXCPU_STAMP  (1u << 3)
 
 // AvbInfo.stage
 enum AvbStage : uint32_t {

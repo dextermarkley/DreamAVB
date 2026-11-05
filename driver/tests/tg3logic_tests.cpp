@@ -260,9 +260,56 @@ static void testAvbRxRules() {
     std::printf("pass: AVB RX classifier replay sequence\n");
 }
 
+static void testRxCpuStamp() {
+    // Slot decode: word1 = (messageType << 16) | sequenceId.
+    const RxCpuStamp d = decodeRxCpuStamp(0x12345678u, (0x2u << 16) | 0xabcdu);
+    CHECK(d.eavLo == 0x12345678u && d.msgType == 0x2 && d.seq == 0xabcd);
+    // Only the low nibble of word1's high half is the messageType.
+    CHECK(decodeRxCpuStamp(0, 0x00ff0001u).msgType == 0x0f);
+
+    // gPTP key parse: a Pdelay_Req (messageType 2) with sequenceId 0x1234.
+    uint8_t frame[64] = {0};
+    frame[12] = 0x88;
+    frame[13] = 0xf7;        // ethertype 0x88F7
+    frame[14] = 0x12;        // transportSpecific=1, messageType=2
+    frame[44] = 0x12;        // sequenceId high
+    frame[45] = 0x34;        // sequenceId low
+    uint8_t mt = 0xff;
+    uint16_t seq = 0;
+    CHECK(parseGptpStampKey(frame, sizeof(frame), &mt, &seq));
+    CHECK(mt == 0x2 && seq == 0x1234);
+    // Rejects: wrong ethertype, and too-short frames.
+    frame[13] = 0x00;
+    CHECK(!parseGptpStampKey(frame, sizeof(frame), &mt, &seq));
+    frame[13] = 0xf7;
+    CHECK(!parseGptpStampKey(frame, 45, &mt, &seq));
+    CHECK(!parseGptpStampKey(nullptr, 64, &mt, &seq));
+
+    // Match newest-first: entries[0] is the most recent stamp. Pick the first
+    // (msgType, seq) match and return its EAV low word.
+    const RxCpuStamp ring[4] = {
+        {0x0000000a, 0x0, 0x0005},  // Sync, newest
+        {0x0000000b, 0x2, 0x0004},  // Pdelay_Req
+        {0x0000000c, 0x2, 0x0003},
+        {0x0000000d, 0x0, 0x0002},
+    };
+    uint32_t eav = 0;
+    CHECK(matchRxCpuStamp(ring, 4, 0x2, 0x0004, &eav) && eav == 0x0000000b);
+    CHECK(matchRxCpuStamp(ring, 4, 0x0, 0x0002, &eav) && eav == 0x0000000d);
+    // No match in the window, empty ring, and null are all false.
+    CHECK(!matchRxCpuStamp(ring, 4, 0x2, 0x0099, &eav));
+    CHECK(!matchRxCpuStamp(ring, 0, 0x0, 0x0005, &eav));
+    CHECK(!matchRxCpuStamp(nullptr, 4, 0x0, 0x0005, &eav));
+    // On a sequenceId collision across messageTypes, messageType disambiguates.
+    const RxCpuStamp collide[2] = {{0x111, 0x2, 0x0007}, {0x222, 0x0, 0x0007}};
+    CHECK(matchRxCpuStamp(collide, 2, 0x0, 0x0007, &eav) && eav == 0x222);
+    std::printf("pass: RX-CPU stamp ring decode / key parse / match\n");
+}
+
 int main() {
     testSnapshot();
     testAvbRxRules();
+    testRxCpuStamp();
     testCorrection();
     testTxBd();
     testRxBd();

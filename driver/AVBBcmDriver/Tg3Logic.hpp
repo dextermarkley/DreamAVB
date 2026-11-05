@@ -362,6 +362,64 @@ constexpr uint32_t stdReplenishThreshold(uint32_t posted) {
     return nic < host ? nic : host;
 }
 
+// --- RX-CPU stamp ring (driver/bcm-fw) -------------------------------------
+//
+// The stamping firmware records one entry per gPTP frame it services: the EAV
+// reference-clock low 32 bits at service time, plus the frame's PTP
+// messageType and sequenceId so the host can match a harvested frame to its
+// timestamp. Ring layout (scratch 0x0800C000): slot = { word0 = eavLo,
+// word1 = (messageType << 16) | sequenceId }, 256 slots, producer count at
+// 0x0800BFF0. These helpers are pure (host-tested); the window I/O is in the
+// dext.
+
+struct RxCpuStamp {
+    uint32_t eavLo;
+    uint8_t  msgType;
+    uint16_t seq;
+};
+
+// Decode one ring slot's two words.
+constexpr RxCpuStamp decodeRxCpuStamp(uint32_t word0, uint32_t word1) {
+    return RxCpuStamp{word0, static_cast<uint8_t>((word1 >> 16) & 0x0fu),
+                      static_cast<uint16_t>(word1 & 0xffffu)};
+}
+
+// Parse the gPTP match key from a raw Ethernet frame: dst(6) src(6)
+// ethertype(2), then the PTP common header. messageType is the low nibble of
+// PTP byte 0 (frame[14]); sequenceId is the big-endian u16 at PTP offset 30
+// (frame[44..46]). Returns false unless it is an 0x88F7 frame long enough.
+inline bool parseGptpStampKey(const uint8_t * frame, uint32_t len, uint8_t * msgTypeOut,
+                              uint16_t * seqOut) {
+    if (frame == nullptr || len < 46) {
+        return false;
+    }
+    if (frame[12] != 0x88 || frame[13] != 0xf7) {
+        return false;
+    }
+    *msgTypeOut = static_cast<uint8_t>(frame[14] & 0x0fu);
+    *seqOut = static_cast<uint16_t>((static_cast<uint16_t>(frame[44]) << 8) | frame[45]);
+    return true;
+}
+
+// Scan a newest-first snapshot of ring entries for the first (msgType, seq)
+// match and return its EAV low word. The dext builds `entries` by reading the
+// slots at producer-1, producer-2, ... so index 0 is the most recent stamp.
+inline bool matchRxCpuStamp(const RxCpuStamp * entries, uint32_t n, uint8_t msgType,
+                            uint16_t seq, uint32_t * eavLoOut) {
+    if (entries == nullptr) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (entries[i].msgType == msgType && entries[i].seq == seq) {
+            if (eavLoOut != nullptr) {
+                *eavLoOut = entries[i].eavLo;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace tg3logic
 
 #endif  // TG3_LOGIC_HPP

@@ -705,3 +705,38 @@ any pending interlock, then uses the free-running EAV clock as the stamp
 source. This prevents recurrence, but does not un-wedge an already-frozen
 block — that still needs a replug. The earlier working stamp results
 (1 s deltas, forwarding) stand; they were taken before this experiment.
+
+### 2026-11-05 — Stamp ring wired into the gPTP RX-timestamp path (dext-side)
+
+The daemon's gPTP consumes `RxSlot.hw_ts_ns`, which the dext fills in
+`harvestRx`. Rather than make the daemon NIC-aware, the stamp ring is wired in
+at the dext so the existing, NIC-agnostic `hw_ts` plumbing carries it.
+
+- New init flag `AVB_INIT_FLAG_RXCPU_STAMP` (1<<3). When set, the dext records
+  it (`v->rxcpuStamp`) but loads nothing itself — the host loads the firmware
+  via the existing `LoadCoreImage` selector after `datapath up`.
+- `harvestRx` → `drainReturnRing`: for each harvested frame, once the firmware
+  signature is present (`rxCpuStampReady`: scratch 0x0800F004 == 'DONE', which
+  guards against matching uninitialised scratch), it parses the gPTP key
+  (messageType + sequenceId) and scans the newest 16 ring entries for a match;
+  on a hit it sets `e.hw_ts = reconstructRxTs(eavLo)` (64-bit, borrow-corrected
+  against the EAV clock) and `e.has_ts = 1`. This overrides the dead
+  bd.reserved / MAC-latch path for gPTP.
+- Pure helpers in `Tg3Logic.hpp` (`decodeRxCpuStamp`, `parseGptpStampKey`,
+  `matchRxCpuStamp`) with host unit tests in `tg3logic_tests.cpp`.
+- `avb-probe datapath up` now, for BCM, uses `RXCPU_STAMP` (its own receive
+  rule + ring 0) instead of the superseded `AVB_RX_RULES` classifier replay,
+  and loads the firmware. So after the datapath is up, `rx-ptp` shows `has_ts`
+  per gPTP frame and `pdelay` gets its t4 → a hardware link delay — the Phase 0
+  G3 blocker, via our own firmware.
+
+Validation is pending the Thunderbolt replug (the EAV clock is wedged from the
+earlier experiment; `reconstructRxTs` needs it live). After the replug:
+`avb-probe --nic bcm datapath up` then `avb-probe --nic bcm pdelay --count 5`
+should yield complete exchanges with a real link delay.
+
+Remaining for a full daemon-on-BCM gPTP run: the daemon's `bring_up` opens the
+I210 only and uses `PortConfig::i210`. A BCM run needs NIC selection plus a
+calibrated BCM `LatencyProfile` — and the RX stamp is taken at RDIQ service
+time (not MAC ingress), so its rx-latency constant must be measured on hardware
+once the clock is back. Left as a follow-up rather than shipped untuned.

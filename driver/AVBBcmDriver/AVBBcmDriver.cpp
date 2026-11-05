@@ -114,6 +114,10 @@ struct AVBBcmDriver_IVars {
     uint64_t tsValue;
     uint64_t tsMach;
 
+    // RX-CPU stamping (AVB_INIT_FLAG_RXCPU_STAMP): attach the firmware's
+    // per-frame EAV timestamp to harvested gPTP frames.
+    bool rxcpuStamp;
+
     // Software RX ring filled by the harvester.
     AvbRxEntry * sw;
     uint32_t swHead;             // next write
@@ -977,6 +981,60 @@ static kern_return_t readCoreMem(IV * v, uint32_t virtAddr, uint64_t * wordOut)
     return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
 }
 
+// RX-CPU stamp ring (driver/bcm-fw, AVB_INIT_FLAG_RXCPU_STAMP). The firmware
+// records one {eavLo, msgType|seq} entry per gPTP frame in RX-CPU scratch; we
+// read them back through the memory window and match a harvested frame to its
+// EAV timestamp. These scratch virtual addresses mirror driver/bcm-fw/regs.h.
+namespace rxcpu {
+constexpr uint32_t kDoneSig    = 0x0800F004u;  // == 'DONE' once the firmware configured
+constexpr uint32_t kDoneMagic  = 0x444F4E45u;
+constexpr uint32_t kProd       = 0x0800BFF0u;  // ring producer count
+constexpr uint32_t kRingBase   = 0x0800C000u;  // 256 x {eavLo, meta} 8-byte slots
+constexpr uint32_t kRingMask   = 0xffu;        // 256 entries (power of two)
+constexpr uint32_t kScanWindow = 16u;          // newest N slots to search
+}  // namespace rxcpu
+
+static uint32_t readScratch(IV * v, uint32_t virt)
+{
+    uint32_t win = 0;
+    if (!scratchWinAddr(virt, 4, &win)) {
+        return 0;
+    }
+    return regWinRead(v, win);
+}
+
+// True once the stamping firmware has run far enough to maintain the ring.
+// Guards against matching uninitialised scratch before the host loads it.
+static bool rxCpuStampReady(IV * v)
+{
+    return v->rxcpuStamp && readScratch(v, rxcpu::kDoneSig) == rxcpu::kDoneMagic;
+}
+
+// Look up a harvested gPTP frame's EAV timestamp in the stamp ring. On a match
+// within the scan window, set e.hw_ts (reconstructed to 64 bits from the EAV
+// clock) and e.has_ts. `frame`/`len` are the copied frame bytes.
+static void attachRxCpuStamp(IV * v, const uint8_t * frame, uint32_t len, AvbRxEntry & e)
+{
+    uint8_t msgType = 0;
+    uint16_t seq = 0;
+    if (!parseGptpStampKey(frame, len, &msgType, &seq)) {
+        return;
+    }
+    const uint32_t prod = readScratch(v, rxcpu::kProd);
+    const uint32_t scan = rxcpu::kScanWindow < prod ? rxcpu::kScanWindow : prod;
+    RxCpuStamp recent[rxcpu::kScanWindow];
+    for (uint32_t i = 0; i < scan; i++) {
+        const uint32_t slot = (prod - 1u - i) & rxcpu::kRingMask;
+        const uint32_t base = rxcpu::kRingBase + slot * 8u;
+        recent[i] = decodeRxCpuStamp(readScratch(v, base), readScratch(v, base + 4u));
+    }
+    uint32_t eavLo = 0;
+    if (matchRxCpuStamp(recent, scan, msgType, seq, &eavLo)) {
+        e.hw_ts = reconstructRxTs(v, eavLo);
+        e.has_ts = 1;
+    }
+}
+
 // tg3_abort_hw order for a 5705_PLUS part (RCVLSC/DMAC/MBFREE/BUFMGR/MEMARB
 // cannot be stopped on this class and are skipped, as tg3 does).
 static void abortHw(IV * v)
@@ -1039,6 +1097,7 @@ static bool drainReturnRing(IV * v, const volatile RxBd * ret, uint32_t * consp,
 {
     bool reposted = false;
     uint32_t cons = *consp;
+    const bool stampReady = rxCpuStampReady(v);
     while (cons != hwProd && ok(v)) {
         RxBd bd;
         bd.addrHi = ret[cons].addrHi;
@@ -1073,6 +1132,12 @@ static bool drainReturnRing(IV * v, const volatile RxBd * ret, uint32_t * consp,
                 e.len = r.len;
                 const uint32_t n = r.len < AVB_RX_COPY_BYTES ? r.len : AVB_RX_COPY_BYTES;
                 memcpy(e.data, v->rxBufs.va + uint64_t(r.stdIndex) * kRxBufSize, n);
+                // Our own RX-timestamp path: attach the RX-CPU firmware's EAV
+                // stamp for gPTP frames. This overrides the bd.reserved/MAC
+                // latch path (neither works on this 57766-class part).
+                if (stampReady) {
+                    attachRxCpuStamp(v, e.data, n, e);
+                }
                 swPush(v, e);
             }
             postStdBuffer(v, r.stdIndex);
@@ -1213,6 +1278,7 @@ static kern_return_t initDatapath(IV * v, uint64_t initFlags)
     v->txSeq = 0;
     v->tsPending = false;
     v->tsSeq = 0;
+    v->rxcpuStamp = (initFlags & AVB_INIT_FLAG_RXCPU_STAMP) != 0;
 
     LOG("datapath: core reset + init (flags 0x%llx)", initFlags);
     if (!resetHw(v, initFlags)) {

@@ -131,6 +131,9 @@ pub const INIT_FLAG_RX_PTP_V2_L2: u64 = 1 << 1;
 /// BCM only: replay Apple's AVB RX classifier block so gPTP frames latch
 /// RX timestamps (`AVB_INIT_FLAG_AVB_RX_RULES`).
 pub const INIT_FLAG_AVB_RX_RULES: u64 = 1 << 2;
+/// BCM only: load the RX-CPU stamping firmware and attach its per-frame EAV
+/// timestamp to harvested gPTP frames (`AVB_INIT_FLAG_RXCPU_STAMP`).
+pub const INIT_FLAG_RXCPU_STAMP: u64 = 1 << 3;
 
 /// BCM RX-CPU scratch pad (M1 core bring-up): the core's virtual base address
 /// and its size. Images load here and the PC is set to a address within it.

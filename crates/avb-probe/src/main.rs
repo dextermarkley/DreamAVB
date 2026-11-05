@@ -578,9 +578,30 @@ fn cmd_adjfreq(
 
 fn cmd_datapath(dev: &Device, json: Option<&Path>, up: bool) -> Result<()> {
     if up {
-        let stage = dev.init_datapath(
-            abi::INIT_FLAG_PROMISC | abi::INIT_FLAG_RX_PTP_V2_L2 | abi::INIT_FLAG_AVB_RX_RULES,
-        )?;
+        let bcm = dev.info()?.nic_kind == abi::NIC_BCM57762;
+        // BCM: use our RX-CPU stamping path (its own receive rule + ring 0),
+        // not the superseded Apple-classifier replay (AVB_RX_RULES).
+        let flags = if bcm {
+            abi::INIT_FLAG_PROMISC | abi::INIT_FLAG_RX_PTP_V2_L2 | abi::INIT_FLAG_RXCPU_STAMP
+        } else {
+            abi::INIT_FLAG_PROMISC | abi::INIT_FLAG_RX_PTP_V2_L2 | abi::INIT_FLAG_AVB_RX_RULES
+        };
+        let stage = dev.init_datapath(flags)?;
+        // Load the stamping firmware so the dext's harvest can read the ring
+        // and attach each gPTP frame's EAV timestamp (RX_TSTAMP / BD.reserved
+        // never latch on this part). The firmware installs its own gPTP rule,
+        // stamps, and passes frames on to the host ring.
+        if bcm {
+            let mut image = BCMFW_IMAGE.to_vec();
+            while !image.len().is_multiple_of(4) {
+                image.push(0);
+            }
+            let (halted, mode) = dev.load_core_image(abi::RX_CPU_SCRATCH_BASE, &image)?;
+            println!(
+                "  rx-cpu stamper loaded: halted={halted} mode=0x{mode:08x} ({} bytes)",
+                image.len()
+            );
+        }
         let info = dev.info()?;
         println!(
             "datapath up: stage {} link_up={} 1000FD={}",
