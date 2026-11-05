@@ -127,13 +127,41 @@ fn bring_up(opts: &GlobalOpts, log: &Logger) -> Result<RealDext, Exit> {
     if is_bcm {
         init_flags |= avb_dext::abi::INIT_FLAG_RXCPU_STAMP;
     }
-    if dev.init_datapath(init_flags).is_err() {
+    datapath_up(&dev, opts, log, init_flags, is_bcm)?;
+    if is_bcm {
+        bcm_ensure_tx(&dev, opts, log, init_flags, info.mac)?;
+    }
+    let (numer, denom) = (info.tb_numer, info.tb_denom);
+    let mut dext = RealDext::new(dev, numer, denom);
+    // Steps 4–6: map the RX + consumer memory and validate the header against
+    // the attach generation. This is what makes `rx_ctl` able to drain the
+    // control ring; gPTP RX arrives there after RingAttach. Without rings (an
+    // older BCM dext) `rx_ctl` falls back to PollRx and we skip the mapping.
+    if rings {
+        if let Err(what) = dext.attach_rings(generation) {
+            log.log(Level::Error, "dext", &format!("map rings: {what}"));
+            return Err(Exit::AbiMismatch);
+        }
+    }
+    Ok(dext)
+}
+
+/// InitDatapath, then (BCM, when `stamper`) load the RX-CPU stamping
+/// firmware, then step 7: wait ≤ link_timeout for LINK_UP.
+fn datapath_up(
+    dev: &Device,
+    opts: &GlobalOpts,
+    log: &Logger,
+    flags: u64,
+    stamper: bool,
+) -> Result<(), Exit> {
+    if dev.init_datapath(flags).is_err() {
         return Err(Exit::DextFault);
     }
     // BCM: load the stamping firmware now that the datapath is up, so the
     // dext's harvest attaches each gPTP frame's EAV timestamp (without it,
     // `hw_ts` is never set and the port never completes a Pdelay exchange).
-    if is_bcm {
+    if stamper {
         match dev.load_stamp_firmware() {
             Ok((halted, mode)) => log.log(
                 Level::Info,
@@ -150,11 +178,10 @@ fn bring_up(opts: &GlobalOpts, log: &Logger) -> Result<RealDext, Exit> {
             }
         }
     }
-    // Step 7: wait ≤ link_timeout for LINK_UP.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(opts.link_timeout);
     loop {
         match dev.info() {
-            Ok(i) if i.flags & FLAG_LINK_UP != 0 => break,
+            Ok(i) if i.flags & FLAG_LINK_UP != 0 => return Ok(()),
             Ok(_) => {}
             Err(_) => return Err(Exit::DextFault),
         }
@@ -162,25 +189,94 @@ fn bring_up(opts: &GlobalOpts, log: &Logger) -> Result<RealDext, Exit> {
             log.log(
                 Level::Error,
                 "dext",
-                "no link on the I210 (cable to the 16R?)",
+                "no link on the NIC (cable to the 16R?)",
             );
             return Err(Exit::Link);
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let (numer, denom) = (info.tb_numer, info.tb_denom);
-    let mut dext = RealDext::new(dev, numer, denom);
-    // Steps 4–6: map the RX + consumer memory and validate the header against
-    // the attach generation. This is what makes `rx_ctl` able to drain the
-    // control ring; gPTP RX arrives there after RingAttach. Without rings (an
-    // older BCM dext) `rx_ctl` falls back to PollRx and we skip the mapping.
-    if rings {
-        if let Err(what) = dext.attach_rings(generation) {
-            log.log(Level::Error, "dext", &format!("map rings: {what}"));
-            return Err(Exit::AbiMismatch);
+}
+
+/// BCM57762 MAC TX octet counter (tg3 MAC_TX_STATS_OCTETS). On hardware it
+/// reads back to 0 after each read and counts 64 per minimum-size frame.
+const BCM_MAC_TX_OCTETS: u32 = 0x0800;
+
+/// A minimum-size frame addressed to our own MAC, ethertype 0x88B5 (IEEE 802
+/// local experimental). It egresses like any frame, and no other station
+/// acts on it.
+fn tx_probe_frame(mac: [u8; 6]) -> [u8; 60] {
+    let mut f = [0u8; 60];
+    f[0..6].copy_from_slice(&mac);
+    f[6..12].copy_from_slice(&mac);
+    f[12] = 0x88;
+    f[13] = 0xb5;
+    f[14..22].copy_from_slice(b"AVBTXCHK");
+    f
+}
+
+/// Send one probe frame and report whether the MAC counted it as sent.
+fn bcm_tx_egresses(dev: &Device, mac: [u8; 6]) -> bool {
+    // Clear the counter (read-to-clear), then send and poll up to ~50 ms.
+    if dev.read_reg32(BCM_MAC_TX_OCTETS).is_err() {
+        return false;
+    }
+    if dev.send_frame(&tx_probe_frame(mac), false).is_err() {
+        return false;
+    }
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        match dev.read_reg32(BCM_MAC_TX_OCTETS) {
+            Ok(n) if n > 0 => return true,
+            Ok(_) => {}
+            Err(_) => return false,
         }
     }
-    Ok(dext)
+    false
+}
+
+/// After a BCM power-on, the first bring-up with the stamper loaded has been
+/// seen to leave TX dead: send BDs are consumed but MAC TX octets stay 0, so
+/// nothing reaches the 16R. One bring-up with the stock RX-CPU cleared it on
+/// hardware, after which stamper bring-ups transmit normally. Check egress,
+/// and if dead, do that recovery once.
+fn bcm_ensure_tx(
+    dev: &Device,
+    opts: &GlobalOpts,
+    log: &Logger,
+    flags: u64,
+    mac: [u8; 6],
+) -> Result<(), Exit> {
+    if bcm_tx_egresses(dev, mac) {
+        log.log(Level::Info, "dext", "bcm tx check: frames reach the wire");
+        return Ok(());
+    }
+    log.log(
+        Level::Warn,
+        "dext",
+        "bcm tx check: no frame left the MAC (TX octets 0); re-initialising once without the stamper, then with it",
+    );
+    datapath_up(dev, opts, log, flags, false)?;
+    let plain = bcm_tx_egresses(dev, mac);
+    log.log(
+        Level::Info,
+        "dext",
+        &format!("bcm tx check without the stamper: egress={plain}"),
+    );
+    datapath_up(dev, opts, log, flags, true)?;
+    if bcm_tx_egresses(dev, mac) {
+        log.log(
+            Level::Info,
+            "dext",
+            "bcm tx check: recovered, frames reach the wire",
+        );
+        return Ok(());
+    }
+    log.log(
+        Level::Error,
+        "dext",
+        "bcm tx check: still no egress after recovery; replug the Thunderbolt adapter",
+    );
+    Err(Exit::DextFault)
 }
 
 // --- Subcommand runners ---
@@ -9264,5 +9360,22 @@ mod talker_tests {
             let sid = StreamId::from_parts(mac, uid);
             assert_eq!(talker_tspec(sid, 234).dest_mac, stream_dest_mac(sid));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tx_probe_frame;
+
+    #[test]
+    fn tx_probe_frame_is_self_addressed_min_size() {
+        let mac = [0x38, 0xc9, 0x86, 0x46, 0x7e, 0x8b];
+        let f = tx_probe_frame(mac);
+        assert_eq!(f.len(), 60);
+        assert_eq!(&f[0..6], &mac, "destination is our own MAC");
+        assert_eq!(&f[6..12], &mac, "source is our own MAC");
+        assert_eq!(f[0] & 1, 0, "unicast, so no station but us accepts it");
+        assert_eq!(&f[12..14], &[0x88, 0xb5]);
+        assert!(f[22..].iter().all(|&b| b == 0));
     }
 }
