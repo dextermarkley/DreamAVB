@@ -122,6 +122,17 @@ enum Cmd {
         #[arg(long, default_value_t = 0x300)]
         end: u32,
     },
+    /// Send an AEM READ_DESCRIPTOR(ENTITY 0) to the 16R, once unicast to its
+    /// MAC and once to the AVDECC multicast, then list every AVTP control
+    /// frame that comes back. Separates "our unicast TX does not arrive" from
+    /// "its unicast reply is not received". Datapath must be up, no daemon.
+    AecpPing {
+        /// The 16R's MAC (from its ADP entity_id 000a92fffe033ba9).
+        #[arg(long, default_value = "00:0a:92:03:3b:a9")]
+        target: String,
+        #[arg(long, default_value_t = 3.0)]
+        seconds: f64,
+    },
     /// Load the NIC clock through the dext's SetClock sequence (stop, write,
     /// resume), then sample it twice to confirm it advances.
     SetClock {
@@ -984,6 +995,96 @@ fn cmd_stamp_watch(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()
     )
 }
 
+fn parse_mac(s: &str) -> Result<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        bail!("bad MAC '{s}'");
+    }
+    let mut m = [0u8; 6];
+    for (o, p) in m.iter_mut().zip(parts) {
+        *o = u8::from_str_radix(p, 16).map_err(|_| anyhow::anyhow!("bad MAC '{s}'"))?;
+    }
+    Ok(m)
+}
+
+/// EUI-64 from a MAC the 1722.1 way: mac[0..3] FF FE mac[3..6].
+fn eui64(m: [u8; 6]) -> [u8; 8] {
+    [m[0], m[1], m[2], 0xff, 0xfe, m[3], m[4], m[5]]
+}
+
+fn cmd_aecp_ping(dev: &Device, target: &str, seconds: f64) -> Result<()> {
+    let info = dev.info()?;
+    if info.stage != abi::STAGE_DATAPATH {
+        bail!("datapath is not up; run `avb-probe datapath up` first");
+    }
+    let tmac = parse_mac(target)?;
+    let ours = info.mac;
+    let build = |dst: [u8; 6], seq: u16| {
+        let mut f = Vec::with_capacity(64);
+        f.extend_from_slice(&dst);
+        f.extend_from_slice(&ours);
+        f.extend_from_slice(&[0x22, 0xf0]);
+        // AECP AEM_COMMAND, control_data_length = 12 fixed + 8 payload.
+        f.extend_from_slice(&[0xfb, 0x00, 0x00, 20]);
+        f.extend_from_slice(&eui64(tmac));
+        f.extend_from_slice(&eui64(ours));
+        f.extend_from_slice(&seq.to_be_bytes());
+        f.extend_from_slice(&[0x00, 0x04]); // READ_DESCRIPTOR
+        f.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // config 0, ENTITY 0
+        while f.len() < 60 {
+            f.push(0);
+        }
+        f
+    };
+    let _ = dev.poll_rx(0x22f0, abi::RX_BATCH_MAX)?;
+    let uni = dev.send_frame(&build(tmac, 0x7001), false);
+    let multi = dev.send_frame(&build([0x91, 0xe0, 0xf0, 0x01, 0x00, 0x00], 0x7002), false);
+    println!(
+        "sent seq 0x7001 unicast to {target}: {:?}; seq 0x7002 to 91:e0:f0:01:00:00: {:?}",
+        uni.map(|_| "ok"),
+        multi.map(|_| "ok")
+    );
+    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    let mut n = 0;
+    while Instant::now() < end && !interrupted() {
+        let b = dev.poll_rx(0x22f0, abi::RX_BATCH_MAX)?;
+        for e in b.entries() {
+            let d = e.bytes();
+            if d.len() < 18 {
+                continue;
+            }
+            let (st, mt) = (d[14], d[15] & 0x0f);
+            let seq = if d.len() >= 34 {
+                u16::from_be_bytes([d[32], d[33]])
+            } else {
+                0
+            };
+            let kind = match (st, mt) {
+                (0xfa, _) => "ADP",
+                (0xfb, 0) => "AECP AEM_COMMAND",
+                (0xfb, 1) => "AECP AEM_RESPONSE",
+                (0xfb, _) => "AECP other",
+                (0xfc, _) => "ACMP",
+                _ => "other",
+            };
+            if st == 0xfa {
+                continue;
+            }
+            n += 1;
+            println!(
+                "  rx {kind}: dst={:02x?} src={:02x?} len={} seq=0x{seq:04x} status={}",
+                &d[0..6],
+                &d[6..12],
+                e.len,
+                d[16] >> 3
+            );
+        }
+        nap(Duration::from_millis(5));
+    }
+    println!("=> {n} non-ADP AVDECC frames received in {seconds} s");
+    Ok(())
+}
+
 fn cmd_rx_tstamp_poll(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()> {
     let info = dev.info()?;
     if info.stage != abi::STAGE_DATAPATH {
@@ -1475,6 +1576,7 @@ fn main() -> Result<()> {
         Cmd::StampWatch { seconds } => cmd_stamp_watch(&dev, json, seconds),
         Cmd::RxTstampPoll { seconds } => cmd_rx_tstamp_poll(&dev, json, seconds),
         Cmd::SramDump { start, end } => cmd_sram_dump(&dev, json, start, end),
+        Cmd::AecpPing { target, seconds } => cmd_aecp_ping(&dev, &target, seconds),
         Cmd::SetClock { ns } => {
             let back = dev.set_clock(ns)?;
             let a = dev.read_clock(1)?[0];
