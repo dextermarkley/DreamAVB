@@ -81,6 +81,17 @@ for proj in AVBI210Driver AVBBcmDriver; do
         SYMROOT="$BUILD/driver" OBJROOT="$BUILD/driver/obj" CODE_SIGNING_ALLOWED=NO build
 done
 
+# Optional: rebuild the BCM57762 RX-CPU enable shim (driver/bcm-fw) when the
+# mips-elf -mtigon cross toolchain is present. The built image bcmfw.img is
+# committed, so a build without the toolchain just uses the checked-in copy.
+BCMFW_TOOLCHAIN="${BCMFW_TOOLCHAIN:-$ROOT/.agents/tmp/toolchain}"
+if [ -x "$BCMFW_TOOLCHAIN/bin/mips-elf-gcc" ]; then
+    echo "== build bcm-fw shim (mips-elf -mtigon)"
+    make -C "$ROOT/driver/bcm-fw" TOOLCHAIN="$BCMFW_TOOLCHAIN" clean all
+else
+    echo "== skip bcm-fw shim rebuild (no mips-elf toolchain); using committed bcmfw.img"
+fi
+
 echo "== build Rust (release)"
 # Resolve the pinned toolchain explicitly instead of trusting the ambient PATH.
 # rust-toolchain.toml pins a plain version (it must: a host-qualified channel is

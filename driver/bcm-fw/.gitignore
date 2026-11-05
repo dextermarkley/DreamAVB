@@ -1,0 +1,3 @@
+# Build intermediates (the flat image bcmfw.img IS committed on purpose).
+*.o
+*.elf
