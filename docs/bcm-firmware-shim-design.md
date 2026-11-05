@@ -588,3 +588,40 @@ path (and forwards frames to the host itself via WDMA + return rings). The
 
 The stamper firmware (`driver/bcm-fw/shim.c`) is kept as the correct stamping
 logic, with a header note marking it blocked pending option 1's routing work.
+
+### 2026-11-05 — Feasibility probe: the RX-CPU is fully out of the receive path
+
+A final firmware probe (v8) polled the receive datapath from the core for 6 s
+while gPTP + audio traffic flowed (host `rx-ptp` confirms frames arriving). It
+tracked the MAX depth of all four receive FTQs and counted EMAC receive events:
+
+| signal | register | result over 4.34M polls |
+|---|---|---|
+| rdiq depth | 0x5CF4 | **0** (never non-empty) |
+| rcv_list_plmt depth | 0x5CE4 | **0** |
+| rcv_bd_comp depth | 0x5CD4 | **0** |
+| rcv_data_comp depth | 0x5D04 | **0** |
+| rdiq peek word | 0x5CFC | **0** |
+| EMAC rxcpu-event | grc 0x6810 b6 | **0 assertions** (enable set) |
+| loop iterations | — | 4,340,549 (core alive) |
+| EAV clock | 0x6900 | live (0x15ee1560) |
+
+So from the core's view the entire receive FTQ pipeline is permanently empty and
+the EMAC never raises a receive event — the hardware-DMA receive path does not
+involve the RX CPU at all. This is independent of the receive rule and of the
+offset-field limitation; the frames are simply never presented to the core.
+
+**Consequence for "option 1".** Putting the RX CPU into the receive path is not
+a bolt-on. It requires reconfiguring the EMAC to raise rxcpu receive events and
+feed the core's FTQs, then having the core own the *entire* receive engine —
+mbuf cluster management, frame gather, WDMA back to host memory, and receive
+return-BD ring maintenance — because enabling core receive would displace the
+hardware-DMA host delivery that currently works. That is a ground-up
+reimplementation of the Tigon3 receive processor (ThunderGate's full init.c +
+rx.c + net stack), with a high risk of destabilising the NIC for macOS, to
+obtain a capability the I210 already provides cleanly.
+
+**Recommendation:** stop pursuing BCM RX timestamps. gPTP + AVB streaming to the
+16R already work fully on the Intel I210. Keep the Broadcom adapter for
+non-timestamped use; leave this firmware and its probes in the tree as the
+documented record of why the on-core interception path is closed on this chip.

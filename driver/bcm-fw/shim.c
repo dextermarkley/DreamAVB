@@ -16,10 +16,12 @@
  * hardware-DMA datapath. Proven on hardware (see docs/bcm-firmware-shim-design.md):
  *   - The RX CPU runs our code and reads the EAV clock live (0x6900 advances).
  *   - Our scratch-ring delivery round-trips perfectly (sentinel test passed).
- *   - BUT setting activate_rxcpu on a receive rule does NOT divert frames to
- *     the RX CPU's RDIQ: the RDIQ count/peek (0x5cf4/0x5cfc) stay 0 and gPTP
- *     keeps reaching the host ring. The RX CPU is not in the RX datapath, so
- *     the per-frame RDIQ wake below never fires.
+ *   - BUT the RX CPU is fully out of the receive path. A 6 s / 4.34M-poll probe
+ *     (v8) found ALL four receive FTQs (rdiq 0x5cf4, rcv_list_plmt 0x5ce4,
+ *     rcv_bd_comp 0x5cd4, rcv_data_comp 0x5d04) permanently at depth 0 and the
+ *     EMAC rxcpu-event (grc 0x6810 b6) never asserting, while gPTP kept reaching
+ *     the host ring. activate_rxcpu is inert; the per-frame RDIQ wake below
+ *     never fires. See docs/bcm-firmware-shim-design.md (2026-11-05).
  * Making this work needs a ThunderGate-style full receive-processor bring-up
  * (the core owns RX and forwards frames to the host via WDMA/return rings),
  * which is a much larger firmware than this stamper. Left here as the correct
