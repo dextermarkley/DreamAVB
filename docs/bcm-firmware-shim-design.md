@@ -384,3 +384,42 @@ gPTP traffic. If it advances, the capture hardware IS latching and only the
 delivery/flagging differs (recoverable); if it stays put, the capture never
 arms without the realtime queue. That one read decides whether to go deeper or
 stop with the I210 as the shipping timestamping NIC.
+
+### Direct 0x6b0 poll + realtime-queue dig (2026-11-05): the real mechanism
+
+`rx-tstamp-poll` after loading the rebuilt shim: RX_TSTAMP 0x6b0/0x6b4 stayed
+`0` across 1481 samples over 10 s of live gPTP traffic, while EAV_REF_CLK
+0x6900 advanced the whole time. So the register-pair capture is simply not
+engaged on the 57766 -- not a delivery/flagging bug, the latch never fires.
+
+Disassembling setupAVB's helpers (0x26e5b12 / 0x26e5ae4 / 0x26e5c8a) shows they
+are not register programming: they are accessors on an AVB queue-management
+object at `[this+0x110]` -- array lookups (`[obj+0x20][i]`, `[obj+0x18][i]`) and
+a setter that stores the 125 us / 250 us latencies into one of those arrays.
+The pointers they return, masked (`& 0xffff8000` = 32 KB-aligned base,
+`(r15-r14) & 0xf8000` = size), are what startAVB writes to the MAC at `0xd20`
+and `0x5c8`.
+
+Conclusion: on the 57766 the RX timestamp is delivered through a **realtime-AVB
+receive DMA ring** whose buffer base/size are programmed into 0xd20/0x5c8 from
+buffers the realtime-queue object allocates. The timestamp sits in that ring's
+descriptors -- not the tg3 RX_TSTAMP register pair, and not the standard RX ring
+we harvest. The classifier routes matched frames into that ring; without the
+ring, nothing latches. That is why an exact classifier replay changes nothing.
+
+### Where this leaves the Broadcom effort
+
+Everything upstream is proven and working: feasibility (the hardware latch
+exists), the full clean-room toolchain, the M1 load/run path, and a shim that
+configures the chip from the core. The remaining gap is a bounded but real
+sub-project: reverse-engineer the realtime-AVB RX ring's complete register set
+(beyond 0xd20/0x5c8 -- producer/consumer mailboxes, enable, descriptor-ring
+control) and its descriptor format, allocate an equivalent ring from our dext
+(we already have DMA-ring infrastructure), point the MAC at it, and harvest the
+timestamp from its descriptors. Multiple dext iterations and hardware runs, with
+real uncertainty in the undocumented descriptor layout.
+
+Decision point: pursue the realtime-ring reimplementation, or stop here with the
+I210 as the shipping timestamping NIC and this document as the complete record.
+The I210 path is fully working today; the Broadcom adapter would be a
+personal-machine capability at best (RAM-only shim, no shipping).
