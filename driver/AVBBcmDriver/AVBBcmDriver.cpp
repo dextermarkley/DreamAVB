@@ -290,6 +290,21 @@ static bool readTs(IV * v, uint32_t lsbOff, uint32_t msbOff, uint64_t * out)
     return ok(v);
 }
 
+// Reconstruct a full 64-bit RX timestamp from the per-frame low-32 value the
+// hardware writes into the RX return BD's reserved field (offset 0x18) and the
+// free-running EAV reference clock, exactly as Apple's receivePackets does:
+// read the EAV clock, and if its low word has already wrapped past the frame's
+// latched low word, borrow one from the high word.
+static uint64_t reconstructRxTs(IV * v, uint32_t frameLsb)
+{
+    const uint32_t eavLsb = rdRaw(v, bcm::kEavRefClkLsb);
+    uint32_t eavMsb = rdRaw(v, bcm::kEavRefClkMsb);
+    if (eavLsb <= frameLsb) {
+        eavMsb--;
+    }
+    return (static_cast<uint64_t>(eavMsb) << 32) | frameLsb;
+}
+
 // ---------------------------------------------------------------------------
 // DMA buffers
 
@@ -1021,9 +1036,16 @@ static void harvestRx(IV * v)
         AvbRxEntry e{};
         e.harvest_mach = now;
         e.type_flags = r.flags;
-        if (r.hasTimestamp) {
-            // Read LSB then MSB for every PTP-flagged frame, even an errored
-            // one, so the one-deep RX latch is released for the next event.
+        // Apple's actual RX-timestamp path: the hardware writes the per-frame
+        // low-32 timestamp into the RX BD reserved field (offset 0x18), and the
+        // full time is reconstructed against the EAV clock. The tg3 register
+        // pair (0x6b0/0x6b4) is not wired on the 57766, so prefer the BD field.
+        if (bd.reserved != 0) {
+            e.hw_ts = reconstructRxTs(v, bd.reserved);
+            e.has_ts = 1;
+        } else if (r.hasTimestamp) {
+            // Fallback to the tg3 register pair if a PTPSTAT-flagged frame ever
+            // appears; reading LSB then MSB releases the one-deep latch.
             uint64_t ts = 0;
             if (readTs(v, bcm::kRxTstampLsb, bcm::kRxTstampMsb, &ts)) {
                 e.hw_ts = ts & bcm::kTstampMask;
