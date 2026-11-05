@@ -614,6 +614,32 @@ fn cmd_core_selftest(dev: &Device, json: Option<&Path>) -> Result<()> {
         abi::RX_CPU_SCRATCH_BASE
     );
 
+    // Diagnostic: read the image straight back through the same window. If these
+    // match HELLO_CORE, the write/read path and its endianness are consistent
+    // and address the scratch the core actually fetches from (the core ran).
+    // If they do not, the scratch-window mapping or endianness is wrong and the
+    // signature/heartbeat results below are meaningless.
+    let mut image_ok = true;
+    println!("image readback @0x{:08x}:", abi::RX_CPU_SCRATCH_BASE);
+    for (i, &expect) in HELLO_CORE.iter().enumerate() {
+        let addr = abi::RX_CPU_SCRATCH_BASE + (i as u32) * 4;
+        let got = dev.read_core_mem(addr)?;
+        let ok = got == expect;
+        image_ok &= ok;
+        println!(
+            "  0x{addr:08x}: 0x{got:08x} (expect 0x{expect:08x}) {}",
+            if ok { "ok" } else { "DIFF" }
+        );
+    }
+    println!(
+        "image readback: {}",
+        if image_ok {
+            "MATCH (load path + endianness correct)"
+        } else {
+            "MISMATCH (scratch-window mapping/endianness wrong -- see DIFF rows)"
+        }
+    );
+
     let sig = dev.read_core_mem(HELLO_SIG_ADDR)?;
     let hb1 = dev.read_core_mem(HELLO_HB_ADDR)?;
     sleep(Duration::from_millis(50));
