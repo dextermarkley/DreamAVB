@@ -1116,8 +1116,14 @@ static void abortHw(IV * v)
     wr(v, bcm::kFtqReset, 0xffffffff);
     wr(v, bcm::kFtqReset, 0x00000000);
 
+    // Do NOT latch a hard fault here. With the RX-CPU stamper firmware holding
+    // the RX path, a block enable bit routinely refuses to clear on shutdown
+    // ("block stop timeout"). The next InitDatapath performs a full chipReset,
+    // so this is benign; latching kAvbFaultStopBlock only wedged the device
+    // (all MMIO refused) until a physical replug. Log and move on.
     if (!allStopped) {
-        setFault(v, kAvbFaultStopBlock, "a block enable bit did not clear during shutdown");
+        LOG("abortHw: a block enable bit did not clear during shutdown "
+            "(expected with stamper loaded; chipReset on next InitDatapath clears it)");
     }
 }
 
