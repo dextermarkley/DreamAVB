@@ -128,6 +128,12 @@ enum Cmd {
         #[arg(required = true)]
         offsets: Vec<String>,
     },
+    /// BCM: time BAR register reads against RX-CPU scratch reads (the
+    /// config-space register window the stamp lookup uses). Read-only.
+    WinTiming {
+        #[arg(long, default_value_t = 500)]
+        n: u32,
+    },
     /// Send an AEM READ_DESCRIPTOR(ENTITY 0) to the 16R, once unicast to its
     /// MAC and once to the AVDECC multicast, then list every AVTP control
     /// frame that comes back. Separates "our unicast TX does not arrive" from
@@ -870,6 +876,29 @@ fn cmd_sram_dump(dev: &Device, json: Option<&Path>, start: u32, end: u32) -> Res
     )
 }
 
+/// Mean user-client round trip of a BAR register read vs an RX-CPU scratch
+/// read (which goes through the config-space register window).
+fn cmd_win_timing(dev: &Device, json: Option<&Path>, n: u32) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    for _ in 0..n {
+        dev.read_reg32(0x6900)?;
+    }
+    let bar = t0.elapsed().as_nanos() as f64 / f64::from(n) / 1000.0;
+    let t1 = std::time::Instant::now();
+    for _ in 0..n {
+        dev.read_core_mem(abi::RX_CPU_SCRATCH_BASE)?;
+    }
+    let win = t1.elapsed().as_nanos() as f64 / f64::from(n) / 1000.0;
+    println!("BAR read (EAV LSB)         {bar:8.1} us per call");
+    println!("scratch read (config win)  {win:8.1} us per call");
+    println!("config-window cost         {:8.1} us per word", win - bar);
+    emit(
+        json,
+        "win_timing",
+        &serde_json::json!({ "n": n, "bar_us": bar, "win_us": win }),
+    )
+}
+
 fn cmd_peek(dev: &Device, json: Option<&Path>, offsets: &[String]) -> Result<()> {
     let mut rec = serde_json::Map::new();
     for s in offsets {
@@ -1596,6 +1625,7 @@ fn main() -> Result<()> {
         Cmd::RxTstampPoll { seconds } => cmd_rx_tstamp_poll(&dev, json, seconds),
         Cmd::SramDump { start, end } => cmd_sram_dump(&dev, json, start, end),
         Cmd::Peek { ref offsets } => cmd_peek(&dev, json, offsets),
+        Cmd::WinTiming { n } => cmd_win_timing(&dev, json, n),
         Cmd::AecpPing { target, seconds } => cmd_aecp_ping(&dev, &target, seconds),
         Cmd::SetClock { ns } => {
             let back = dev.set_clock(ns)?;
