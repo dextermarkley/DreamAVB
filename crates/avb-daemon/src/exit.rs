@@ -33,7 +33,7 @@ impl Exit {
             Exit::Success => "success",
             Exit::Internal => "internal error",
             Exit::Usage => "usage",
-            Exit::ServiceNotFound => "dext service AVBI210Driver not found",
+            Exit::ServiceNotFound => "dext service not found (AVBI210Driver or AVBBcmDriver)",
             Exit::AbiMismatch => "ABI or shared-memory layout mismatch",
             Exit::Link => "no link at start, or link lost",
             Exit::TalkerNotFound => {
