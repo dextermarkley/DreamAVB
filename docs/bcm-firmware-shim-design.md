@@ -276,3 +276,41 @@ tree), build it with the `.agents/tmp/toolchain` mips-elf `-mtigon` compiler to
 a flat image, and have `loadCoreImage` carry that image instead of the 10-word
 test program. The shim's job (from §2): housekeeping subset + replay the
 classifier/`0x6c8` config from the core, then park.
+
+### M3 first hardware run (2026-11-05)
+
+`datapath up` -> `core-load-shim` -> `rx-ptp`. The shim infrastructure works;
+the timestamp capture did not arm.
+
+What worked (a real milestone):
+- The shim executed: `SHM1` and `DONE` signatures both present, heartbeat
+  climbing (`21232 -> 345763`), so the core applied its whole write list and
+  parked without faulting.
+- **Core-side register writes land and are host-visible.** The live snapshot
+  shows `0x0560 = 0x0000000e` (Apple's capture had 0) — exactly the shim's final
+  classifier write. Our clean-room firmware genuinely configures the chip from
+  the RX CPU.
+
+What did not:
+- `RX_PTP_CTL` (0x6c8) reads back `0` from the host after the shim wrote
+  `0x0480000f`.
+- `rx-ptp` still shows `type_flags=0x0004 has_ts=0` on every Pdelay_Req — no
+  PTPSTAT bit, no latched timestamp.
+
+Key finding from re-reading Apple's `startAVB` disassembly: Apple issues its
+0x5400-block writes through one register-write helper (~18 calls), then
+`setPerfectMatch` x5 (unicast MAC match -- intentionally skipped for multicast
+gPTP), then `updateAVBStreamFilters` (which reads the EAV clock at 0x6900).
+**Apple never writes 0x6c8.** Our `RX_PTP_CTL = 0x0480000f` is a tg3-derived
+Phase-0 guess, not Apple's actual mechanism, which is why it reads back 0 and
+changes nothing: the arming on this chip is the classifier block itself, not
+`RX_PTP_CTL`.
+
+So the gap is no longer feasibility or the load path -- both are proven. It is
+that our replayed classifier is incomplete or missing an activation step.
+Next, trace the `startAVB` / `updateAVBStreamFilters` register-write helper
+(`0xffffff8000aa0a30`) argument by argument to recover the COMPLETE ordered
+(offset, value) sequence -- including any receive-list-processor (RLP, 0x2000)
+enable, per-rule enable bits, and EAV/0x6900 setup -- then make the shim replay
+that exact sequence instead of just the 0x5400-0x561c window and the bogus
+0x6c8 write. Drop the 0x6c8 write.
