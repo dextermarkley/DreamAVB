@@ -227,8 +227,9 @@ struct SnapWindow {
 // the tg3 path never touches and that is how Apple routes gPTP frames for RX
 // timestamping. The earlier windows missed it.
 constexpr SnapWindow kSnapWindows[] = {
-    {0x0400u, 0x0700u}, {0x2000u, 0x2100u}, {0x2400u, 0x2500u}, {0x3600u, 0x3700u},
-    {0x4800u, 0x4900u}, {0x4c00u, 0x4d00u}, {0x5000u, 0x5700u}, {0x6800u, 0x6a00u},
+    {0x0400u, 0x0700u}, {0x0c00u, 0x0e00u}, {0x2000u, 0x2100u}, {0x2400u, 0x2500u},
+    {0x3600u, 0x3700u}, {0x3c00u, 0x3d00u}, {0x4800u, 0x4900u}, {0x4c00u, 0x4d00u},
+    {0x5000u, 0x5700u}, {0x6800u, 0x6a00u},
 };
 constexpr uint32_t snapWindowWords(const SnapWindow& w) { return (w.end - w.start) / 4u; }
 constexpr uint32_t kSnapWords = [] {

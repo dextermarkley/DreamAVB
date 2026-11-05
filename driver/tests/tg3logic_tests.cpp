@@ -202,10 +202,12 @@ static void testFrameAndComposites() {
 // indexed, and nothing in the MAC statistics block (0x800+) that may clear
 // on read.
 static void testSnapshot() {
-    CHECK(kSnapWords == (0x300u + 0x100u * 5u + 0x700u + 0x200u) / 4u);
+    CHECK(kSnapWords == (0x300u + 0x200u + 0x100u * 6u + 0x700u + 0x200u) / 4u);
     CHECK(snapIndex(0x0400) == 0);
     CHECK(snapIndex(0x06fc) == 0x300 / 4 - 1);
-    CHECK(snapIndex(0x2000) == 0x300 / 4);
+    CHECK(snapIndex(0x2000) == (0x300u + 0x200u) / 4u);  // 0x0c00-0x0e00 now precedes
+    CHECK(snapIndex(0x0d20) >= 0);  // realtime-queue ring base
+    CHECK(snapIndex(0x3c08) >= 0);  // HOSTCC RX coalescing (AVB tuning)
     CHECK(snapIndex(0x06c8) >= 0);  // RX_PTP_CTL
     CHECK(snapIndex(0x06b0) >= 0);  // RX timestamp LSB
     CHECK(snapIndex(0x05c0) >= 0);  // TX timestamp LSB

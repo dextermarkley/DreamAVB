@@ -27,9 +27,11 @@ pub const BCM_SNAPSHOT_MISC_HOST_CTRL: u32 = 0xffff_ffff;
 /// `end` exclusive. Mirrors `kSnapWindows` in `Tg3Logic.hpp`.
 pub const BCM_SNAPSHOT_WINDOWS: &[(u32, u32)] = &[
     (0x0400, 0x0700),
+    (0x0c00, 0x0e00),
     (0x2000, 0x2100),
     (0x2400, 0x2500),
     (0x3600, 0x3700),
+    (0x3c00, 0x3d00),
     (0x4800, 0x4900),
     (0x4c00, 0x4d00),
     (0x5000, 0x5700),
@@ -814,11 +816,12 @@ impl StreamFilter {
 
 #[cfg(test)]
 mod tests {
-    /// Pinned to `kSnapWindows` / `kSnapWords` in Tg3Logic.hpp (1088 words).
+    /// Pinned to `kSnapWindows` / `kSnapWords` in Tg3Logic.hpp (1280 words:
+    /// added 0x0c00-0x0e00 and 0x3c00-0x3d00 for the realtime-queue registers).
     #[test]
     fn bcm_snapshot_windows_match_the_dext() {
         let words: u32 = BCM_SNAPSHOT_WINDOWS.iter().map(|(a, b)| (b - a) / 4).sum();
-        assert_eq!(words, 1088);
+        assert_eq!(words, 1280);
         assert_eq!(READ_SNAPSHOT_FLAG & 0xffff_ffff, 0);
         // Never the MAC statistics block (counters may clear on read).
         assert!(BCM_SNAPSHOT_WINDOWS
