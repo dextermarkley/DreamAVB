@@ -243,3 +243,36 @@ If an arm64 Homebrew is ever installed (`/opt/homebrew` with the five deps), the
 x86_64 override can be dropped for a native build. The two fixes are applied in
 the scratch clone's script; fold them upstream-style into any committed copy of
 the build recipe.
+
+### M1 PASSED on hardware (2026-11-04)
+
+`avb-probe --nic bcm core-selftest` on the live adapter:
+
+    image readback @0x08000000:  all 10 words ok
+    signature 0x7a6b4331 (expected 0x7a6b4331): MATCH
+    heartbeat 26321 -> 717043: core RUNNING
+    core self-test PASSED: halt / load / set-PC / release works on hardware
+
+So the RX-CPU bring-up path is proven end to end: halt the core, write a
+clean-room image into the scratch pad, set the PC, release, and the core
+fetches and executes it (it computed the signature and incremented a counter
+from ~0). Two findings fixed along the way, both now locked in:
+
+1. **CPU scratch is reached through the register-indirect window** (config
+   `0x78` base / `0x80` data via `ConfigurationRead32`/`Write32`), NOT the
+   packet-SRAM memory window (`0x7c`/`0x84`). The memory window read pure noise.
+2. **No byte swap on the register-window data port.** A big-endian-assembled
+   word written there reads back identical and the core fetches it correctly;
+   ThunderGate's `htonl` was compensating for its own Python layer, not the
+   hardware.
+
+RX-CPU control (MODE `0x5000` / STATE `0x5004` / PC `0x501c`) stays on BAR0
+MMIO, which already worked. The load primitive (`loadCoreImage` selector 16 +
+`readCoreMem` 17) is the foundation M2 builds on: replace the hand-assembled
+hello-core with the C enable shim, keep the same load path.
+
+**M2 is unblocked.** Next: scaffold `driver/bcm-fw/` (our own clean-room source
+tree), build it with the `.agents/tmp/toolchain` mips-elf `-mtigon` compiler to
+a flat image, and have `loadCoreImage` carry that image instead of the 10-word
+test program. The shim's job (from §2): housekeeping subset + replay the
+classifier/`0x6c8` config from the core, then park.
