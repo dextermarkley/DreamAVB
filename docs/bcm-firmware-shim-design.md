@@ -423,3 +423,46 @@ Decision point: pursue the realtime-ring reimplementation, or stop here with the
 I210 as the shipping timestamping NIC and this document as the complete record.
 The I210 path is fully working today; the Broadcom adapter would be a
 personal-machine capability at best (RAM-only shim, no shipping).
+
+### Realtime-AVB RX ring: register set reverse-engineered (2026-11-05)
+
+Confirmed first: with the classifier loaded, `bd.reserved` (BD offset 0x18) is
+still 0 on the standard ring, so the hardware only stamps frames routed into the
+realtime queue. The timestamp READ is now correct in harvestRx (BD.reserved +
+EAV clock, Apple's algorithm); the missing half is the queue itself.
+
+Complete register map recovered from startAVB / DoAVBGated / receivePackets:
+
+- **Ring base**  `0xd20` = `ring_buffer_phys & 0xffff8000` (32 KB-aligned base).
+- **Ring size**  `0x5c8` = `(end_phys - base_phys) & 0xf8000` (size field).
+  Both derived from DMA buffers the realtime-queue object allocates
+  (superclass accessors at [this+0x110]); we must allocate our own and encode
+  them the same way.
+- **Enable/control**  `0x3c08` = ivar[0x6bc], `0x3c10` = ivar[0x6c4],
+  `0x3c20` = ivar[0x6d4] (saved register values written by DoAVBGated on
+  enable; the disable path writes 1). The 0x3c00 block is the realtime-queue
+  control; exact values must be read from our own chip at init.
+- **Classifier routing**  the 0x5608-0x561c block (queue selectors 0xe0/0xe1 at
+  0x560c/0x5614, counts 0x25 at 0x5618, 0xe4e3a2 at 0x561c) routes matched
+  0x88F7 frames into the realtime queue. Already replayed by the shim.
+- **Per-frame timestamp**  low-32 in each realtime-ring BD's reserved field
+  (0x18); full = (EAV_msb borrow-corrected << 32) | reserved.
+
+Still unknown (needed before an implementation can work):
+1. The realtime ring's RCB (receive control block) / descriptor layout and how
+   RX buffers are posted to it (our standard ring uses sramSetRcb + postStdBuffer;
+   the realtime ring's control block location is not yet found).
+2. The producer/consumer mailbox the MAC advances for this ring (how harvest
+   knows where new entries are).
+3. Whether the 0xd20/0x5c8/0x3c00 writes stick from the host or must come from
+   the core (shim), as the classifier did.
+
+### Honest status at this point
+
+Mechanism fully understood; timestamp-read path implemented and in the shipped
+dext. Remaining work is a real DMA-subsystem build: allocate a realtime RX ring,
+find+program its RCB, program 0xd20/0x5c8 and the 0x3c00 control, wire a harvest
+off its mailbox, and confirm each write sticks (host vs core). That is several
+more build+replug hardware cycles with genuine uncertainty in the undocumented
+RCB/mailbox layout, for a personal-machine-only payoff (the I210 remains the
+shipping timestamping NIC). This is the decision point on whether to invest it.
