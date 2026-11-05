@@ -98,6 +98,14 @@ enum Cmd {
     /// the RX CPU after `datapath up`, confirm it ran, and report whether
     /// RX_PTP_CTL now holds the enable. Follow with `rx-ptp`.
     CoreLoadShim,
+    /// M3 (BCM): poll RX_TSTAMP (0x6b0/0x6b4) directly during gPTP traffic to
+    /// tell whether the hardware capture latches at all, independent of the RX
+    /// descriptor flag path. Reports the EAV clock (0x6900) as a liveness
+    /// baseline. Datapath must be up (load the shim first).
+    RxTstampPoll {
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f64,
+    },
     /// info, clock 10 s, adjfreq +-100000 ppb, datapath up, rx-ptp 10 s, pdelay 30, datapath down.
     All,
 }
@@ -776,6 +784,82 @@ fn cmd_core_load_shim(dev: &Device, json: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+fn cmd_rx_tstamp_poll(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()> {
+    let info = dev.info()?;
+    if info.stage != abi::STAGE_DATAPATH {
+        bail!(
+            "datapath is not up (stage {}); run `avb-probe datapath up` (and core-load-shim) first",
+            abi::stage_name(info.stage)
+        );
+    }
+    const RX_TS_LSB: u32 = 0x06b0;
+    const RX_TS_MSB: u32 = 0x06b4;
+    const EAV_LSB: u32 = 0x6900;
+    const EAV_MSB: u32 = 0x6904;
+    let read64 = |lo: u32, hi: u32| -> Result<u64> {
+        // LSB first, then MSB: matches the dext's readTs order so the one-deep
+        // RX latch interlock is released for the next event.
+        let l = dev.read_reg32(lo)?;
+        let h = dev.read_reg32(hi)?;
+        Ok((u64::from(h) << 32) | u64::from(l))
+    };
+
+    let first_ts = read64(RX_TS_LSB, RX_TS_MSB)?;
+    let first_eav = read64(EAV_LSB, EAV_MSB)?;
+    let mut last_ts = first_ts;
+    let mut last_eav = first_eav;
+    let mut changes = 0u64;
+    let mut samples = 0u64;
+    let mut eav_advanced = false;
+    let mut distinct: Vec<u64> = vec![first_ts];
+
+    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    while Instant::now() < end && !interrupted() {
+        let ts = read64(RX_TS_LSB, RX_TS_MSB)?;
+        let eav = read64(EAV_LSB, EAV_MSB)?;
+        samples += 1;
+        if ts != last_ts {
+            changes += 1;
+            if distinct.len() < 8 {
+                distinct.push(ts);
+            }
+            last_ts = ts;
+        }
+        if eav != last_eav {
+            eav_advanced = true;
+            last_eav = eav;
+        }
+        nap(Duration::from_millis(5));
+    }
+
+    println!(
+        "RX_TSTAMP 0x6b0/0x6b4: first=0x{first_ts:016x} changed {changes}x over {samples} samples"
+    );
+    println!(
+        "EAV_REF_CLK 0x6900/0x6904: {} (first=0x{first_eav:016x} last=0x{last_eav:016x})",
+        if eav_advanced { "advancing" } else { "FROZEN" }
+    );
+    if changes > 0 {
+        println!("=> RX_TSTAMP IS latching: the capture works; only descriptor delivery/flagging is the gap (recoverable). Distinct values:");
+        for (i, d) in distinct.iter().enumerate() {
+            println!("     [{i}] 0x{d:016x}");
+        }
+    } else {
+        println!("=> RX_TSTAMP never changed: the capture does not arm from the classifier alone; Apple's realtime-AVB-queue path is required.");
+    }
+    emit(
+        json,
+        "rx_tstamp_poll",
+        &serde_json::json!({
+            "changes": changes,
+            "samples": samples,
+            "first_ts": first_ts,
+            "eav_advancing": eav_advanced,
+            "distinct": distinct,
+        }),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // G3
 
@@ -1188,6 +1272,7 @@ fn main() -> Result<()> {
         Cmd::Pdelay { count } => cmd_pdelay(&dev, json, count),
         Cmd::CoreSelftest => cmd_core_selftest(&dev, json),
         Cmd::CoreLoadShim => cmd_core_load_shim(&dev, json),
+        Cmd::RxTstampPoll { seconds } => cmd_rx_tstamp_poll(&dev, json, seconds),
         Cmd::All => cmd_all(&dev, json),
     }
 }
