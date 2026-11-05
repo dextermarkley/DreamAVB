@@ -94,6 +94,10 @@ enum Cmd {
     /// pad, start it, and read back the signature + heartbeat to prove the
     /// halt / load / set-PC / release path works on real hardware.
     CoreSelftest,
+    /// M3 (BCM): load the clean-room enable shim (driver/bcm-fw/bcmfw.img) into
+    /// the RX CPU after `datapath up`, confirm it ran, and report whether
+    /// RX_PTP_CTL now holds the enable. Follow with `rx-ptp`.
+    CoreLoadShim,
     /// info, clock 10 s, adjfreq +-100000 ppb, datapath up, rx-ptp 10 s, pdelay 30, datapath down.
     All,
 }
@@ -678,6 +682,101 @@ fn cmd_core_selftest(dev: &Device, json: Option<&Path>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// M3: load the RX-CPU enable shim (BCM)
+
+/// The clean-room shim built by driver/bcm-fw (committed, so no toolchain is
+/// needed here). Big-endian MIPS, loaded at RX_CPU_SCRATCH_BASE.
+const BCMFW_IMAGE: &[u8] = include_bytes!("../../../driver/bcm-fw/bcmfw.img");
+/// Handshake words the shim writes (driver/bcm-fw/regs.h).
+const SHIM_RUN_ADDR: u32 = 0x0800_F000;
+const SHIM_DONE_ADDR: u32 = 0x0800_F004;
+const SHIM_HB_ADDR: u32 = 0x0800_F008;
+const SHIM_SIG_RUN: u32 = 0x5348_4D31; // "SHM1"
+const SHIM_SIG_DONE: u32 = 0x444F_4E45; // "DONE"
+/// RX_PTP_CTL and the value the shim writes (driver/bcm-fw/regs.h).
+const RX_PTP_CTL: u32 = 0x06c8;
+const RX_PTP_ENABLE: u32 = 0x0480_000f;
+
+fn cmd_core_load_shim(dev: &Device, json: Option<&Path>) -> Result<()> {
+    // The datapath bring-up resets the chip, which also resets the RX CPU, so
+    // the shim must go in after it, never before.
+    let info = dev.info()?;
+    if info.stage != abi::STAGE_DATAPATH {
+        bail!(
+            "datapath is not up (stage {}); run `avb-probe datapath up` first",
+            abi::stage_name(info.stage)
+        );
+    }
+    let mut image = BCMFW_IMAGE.to_vec();
+    while !image.len().is_multiple_of(4) {
+        image.push(0);
+    }
+    let ptp_before = dev.read_reg32(RX_PTP_CTL)?;
+    let (halted, mode) = dev.load_core_image(abi::RX_CPU_SCRATCH_BASE, &image)?;
+    println!(
+        "shim load: halted={halted} post-release mode=0x{mode:08x} ({} bytes)",
+        image.len()
+    );
+
+    // Give the core a moment to run the classifier writes.
+    sleep(Duration::from_millis(20));
+    let run = dev.read_core_mem(SHIM_RUN_ADDR)?;
+    let done = dev.read_core_mem(SHIM_DONE_ADDR)?;
+    let hb1 = dev.read_core_mem(SHIM_HB_ADDR)?;
+    sleep(Duration::from_millis(50));
+    let hb2 = dev.read_core_mem(SHIM_HB_ADDR)?;
+    let ptp_after = dev.read_reg32(RX_PTP_CTL)?;
+
+    let ran = run == SHIM_SIG_RUN;
+    let applied = done == SHIM_SIG_DONE;
+    let parked = hb2 != hb1;
+    let ptp_stuck = ptp_after == RX_PTP_ENABLE;
+    println!(
+        "shim started: 0x{run:08x} {}",
+        if ran { "SHM1 ok" } else { "MISSING" }
+    );
+    println!(
+        "config applied: 0x{done:08x} {}",
+        if applied { "DONE ok" } else { "MISSING" }
+    );
+    println!(
+        "heartbeat {hb1} -> {hb2}: core {}",
+        if parked {
+            "alive (parked)"
+        } else {
+            "NOT advancing"
+        }
+    );
+    println!(
+        "RX_PTP_CTL host view: 0x{ptp_before:08x} -> 0x{ptp_after:08x} (enable 0x{RX_PTP_ENABLE:08x}) {}",
+        if ptp_stuck { "STUCK" } else { "not the enable value" }
+    );
+    emit(
+        json,
+        "core_load_shim",
+        &serde_json::json!({
+            "halted": halted,
+            "mode": mode,
+            "image_bytes": image.len(),
+            "run": run,
+            "done": done,
+            "heartbeat": [hb1, hb2],
+            "rx_ptp_ctl_before": ptp_before,
+            "rx_ptp_ctl_after": ptp_after,
+            "ran": ran,
+            "applied": applied,
+            "parked": parked,
+            "rx_ptp_ctl_stuck": ptp_stuck,
+        }),
+    )?;
+    if !ran || !applied {
+        bail!("shim did not complete (ran={ran}, applied={applied})");
+    }
+    println!("shim loaded; now run `avb-probe --nic bcm rx-ptp --seconds 12`");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // G3
 
 #[derive(Serialize)]
@@ -1088,6 +1187,7 @@ fn main() -> Result<()> {
         Cmd::RxPtp { seconds } => cmd_rx_ptp(&dev, json, seconds),
         Cmd::Pdelay { count } => cmd_pdelay(&dev, json, count),
         Cmd::CoreSelftest => cmd_core_selftest(&dev, json),
+        Cmd::CoreLoadShim => cmd_core_load_shim(&dev, json),
         Cmd::All => cmd_all(&dev, json),
     }
 }
