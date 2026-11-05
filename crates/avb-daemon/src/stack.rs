@@ -3955,6 +3955,10 @@ fn talker_loop(
     let mut last_in_connect = MachTicks(0);
     let mut in_slots: u64 = 0;
     let mut in_decode_fail: u64 = 0;
+    // Inbound peak |sample| per (stream_id, channel), sampled every 8th PDU,
+    // so the run summary can say which 16R channels actually carried signal.
+    let mut in_peak: std::collections::BTreeMap<(u64, u16), i64> = Default::default();
+    let mut in_peak_tick: u64 = 0;
 
     loop {
         // One queued control frame per pass. A probe round used to send its
@@ -5624,6 +5628,10 @@ fn talker_loop(
                                 &dump_aaf_pdu("RX 16R's", p.payload, gptp.now_ns(now_mach())),
                             );
                         }
+                        in_peak_tick = in_peak_tick.wrapping_add(1);
+                        if in_peak_tick.is_multiple_of(8) && pdu.hdr.bit_depth == 32 {
+                            note_channel_peaks(&mut in_peak, &pdu);
+                        }
                         lrx.on_pdu(log, &pdu, elapsed);
                     }
                     Err(_) => in_decode_fail += 1,
@@ -6724,6 +6732,7 @@ fn talker_loop(
             ),
         );
         report_discarded_streams(log, "duplex", &lrx);
+        report_inbound_signal(log, &in_peak);
         // Per-slot frames and alignment health. A slot that bound and
         // delivered nothing is 8 silent channels in the middle of the device,
         // which the total frames_placed hides completely.
@@ -7982,6 +7991,59 @@ fn uid_label(uid: Option<u16>) -> String {
     match uid {
         Some(u) => format!("{u} (explicit)"),
         None => "auto from the 16R's AEM".to_string(),
+    }
+}
+
+/// Fold one AAF PDU's samples into the per-(stream_id, channel) peak map.
+/// 32-bit big-endian interleaved, `channels_per_frame` channels per sample
+/// frame.
+fn note_channel_peaks(
+    peaks: &mut std::collections::BTreeMap<(u64, u16), i64>,
+    pdu: &avb_avtp::aaf::AafPdu<'_>,
+) {
+    let sid = pdu.hdr.stream.stream_id.0;
+    let ch = usize::from(pdu.hdr.channels_per_frame.max(1));
+    let (samples, _) = pdu.data.as_chunks::<4>();
+    for (i, b) in samples.iter().enumerate() {
+        let v = i64::from(i32::from_be_bytes(*b)).abs();
+        let e = peaks.entry((sid, (i % ch) as u16)).or_insert(0);
+        if v > *e {
+            *e = v;
+        }
+    }
+}
+
+/// Log every inbound channel above -60 dBFS, naming the device channel it is
+/// (talker_unique_id = low 16 bits of the stream_id; a 16R AAF source `u`
+/// carries device channels 8*(u-1)+1 .. 8*u).
+fn report_inbound_signal(log: &Logger, peaks: &std::collections::BTreeMap<(u64, u16), i64>) {
+    let floor = i64::from(i32::MAX) / 1000; // -60 dBFS
+    let mut any = false;
+    for (&(sid, c), &p) in peaks {
+        if p <= floor {
+            continue;
+        }
+        any = true;
+        let uid = (sid & 0xffff) as u16;
+        let dev_ch = (u32::from(uid).saturating_sub(1)) * 8 + u32::from(c) + 1;
+        log.log(
+            Level::Info,
+            "duplex",
+            &format!(
+                "IN SIGNAL stream 0x{sid:016x} (source {uid}) channel {c} = device channel {dev_ch}: {}",
+                peak_label(p)
+            ),
+        );
+    }
+    if !any {
+        log.log(
+            Level::Info,
+            "duplex",
+            &format!(
+                "IN: no channel above -60 dBFS across {} sampled (stream, channel) pairs",
+                peaks.len()
+            ),
+        );
     }
 }
 

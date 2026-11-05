@@ -1709,11 +1709,15 @@ AVBBcmDriver::ClientGone(AVBBcmUserClient * client)
     if (client == nullptr || client != v->owner) {
         return;
     }
+    // Release the rings but leave the datapath up. Its RX/TX DMA targets the
+    // driver's own buffers, never the shared mapping, so a running datapath
+    // with no owner is safe (it falls back to the PollRx software ring). An
+    // abortHw here latched "block stop timeout" on hardware with the RX-CPU
+    // stamper loaded, and a latched fault needs a replug to clear.
     v->producerRunning = false;
-    shutdownDatapath(v);
     v->tsPending = false;
     detachRings(v);
-    LOG("uc: closed (owner): datapath down, rings of generation %u released", v->generation);
+    LOG("uc: closed (owner): rings of generation %u released, datapath left up", v->generation);
 }
 
 bool
