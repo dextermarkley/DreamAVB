@@ -845,3 +845,41 @@ Two limits block full absolute-time use on BCM, both rooted in the hardware:
 So on BCM today: gPTP timing foundation (asCapable + rate lock) is solid; the
 two items above are the remaining work to stream audio with GM-accurate media
 timing. The I210 remains the fully-working path for production audio.
+
+### 2026-11-05 — BCM gPTP FULLY synchronized (software GM clock); audio-path map
+
+Reframed "blockers" as unbuilt work and built the first one.
+
+**gPTP on BCM is now complete (commit f8c006f).** The EAV clock free-runs and
+cannot be stepped, which is the normal free-running-PHC situation. Added a
+software GM clock in gptpsvc: every HW timestamp (RX, TX, ReadClock) is
+presented as virtual GM = unwrapped-64-bit-HW + gm_offset_ns, and the servo's
+step is applied to gm_offset instead of the hardware; rate stays disciplined in
+hardware via AdjFreq. Validated vs the 16R: **servo=LOCKED, asCapable=true,
+offset_ns=-86 (from -42670 s), path_delay +/-tens of ns**. `now_ns` is now
+GM-accurate on BCM, so media timestamps can be produced/consumed correctly.
+
+**No hardware blocker remains for audio.** The remaining work is the AAF
+datapath, all daemon-side (the dext already DMAs frames to the host and sends
+them; gPTP RX proves the path). AAF RX needs no hardware RX timestamp (the
+presentation time is in the AVTP header, compared to our GM `now`).
+
+Concrete sub-tasks found:
+1. **PollRx is destructive** (drains the whole sw ring, drops non-matching
+   ethertypes), so two filtered pollers (gPTP + audio) can't coexist. A BCM
+   listener must `poll_rx(0)` once per loop and demux in the daemon.
+2. **Demux needs AVTP subtype**, not just ethertype: AVDECC control (ADP/AECP/
+   ACMP/MAAP) and AAF/CRF streams all use ethertype 0x22F0. Split by the AVTP
+   subtype byte (stream subtypes -> audio, control subtypes -> ctl; 0x88F7 ->
+   gPTP; 0x22EA -> MSRP; 0x88F5 -> MVRP).
+3. Then the ACMP/SRP connection + CoreAudio pipeline runs over SendFrame +
+   the demuxed PollRx.
+
+Unknowns to MEASURE (not assume): PollRx throughput at a stream's packet rate
+(~8000 pkt/s/stream; sw-ring depth + 2 ms harvest timer set the ceiling), and
+media-clock jitter from the RDIQ-service RX stamp. If PollRx can't sustain the
+rate, grow the BCM dext's mapped stream ring.
+
+External dependency for VALIDATION: the 16R must actually stream to us (an ACMP
+connection / mixer routing) before the audio RX path can be exercised end to
+end. The gPTP foundation needs no such setup and is done.
