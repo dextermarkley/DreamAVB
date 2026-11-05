@@ -122,6 +122,12 @@ enum Cmd {
         #[arg(long, default_value_t = 0x300)]
         end: u32,
     },
+    /// Read-only: read BAR0 registers by offset (hex, e.g. 1400 0x1800).
+    /// For checking send-engine state without a dext rebuild.
+    Peek {
+        #[arg(required = true)]
+        offsets: Vec<String>,
+    },
     /// Send an AEM READ_DESCRIPTOR(ENTITY 0) to the 16R, once unicast to its
     /// MAC and once to the AVDECC multicast, then list every AVTP control
     /// frame that comes back. Separates "our unicast TX does not arrive" from
@@ -864,6 +870,19 @@ fn cmd_sram_dump(dev: &Device, json: Option<&Path>, start: u32, end: u32) -> Res
     )
 }
 
+fn cmd_peek(dev: &Device, json: Option<&Path>, offsets: &[String]) -> Result<()> {
+    let mut rec = serde_json::Map::new();
+    for s in offsets {
+        let t = s.trim_start_matches("0x").trim_start_matches("0X");
+        let off =
+            u32::from_str_radix(t, 16).map_err(|e| anyhow::anyhow!("bad hex offset {s}: {e}"))?;
+        let v = dev.read_reg32(off)?;
+        println!("  0x{off:05x} = 0x{v:08x}");
+        rec.insert(format!("0x{off:05x}"), format!("0x{v:08x}").into());
+    }
+    emit(json, "peek", &rec)
+}
+
 fn cmd_stamp_watch(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()> {
     let info = dev.info()?;
     if info.stage != abi::STAGE_DATAPATH {
@@ -1576,6 +1595,7 @@ fn main() -> Result<()> {
         Cmd::StampWatch { seconds } => cmd_stamp_watch(&dev, json, seconds),
         Cmd::RxTstampPoll { seconds } => cmd_rx_tstamp_poll(&dev, json, seconds),
         Cmd::SramDump { start, end } => cmd_sram_dump(&dev, json, start, end),
+        Cmd::Peek { ref offsets } => cmd_peek(&dev, json, offsets),
         Cmd::AecpPing { target, seconds } => cmd_aecp_ping(&dev, &target, seconds),
         Cmd::SetClock { ns } => {
             let back = dev.set_clock(ns)?;
