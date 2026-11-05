@@ -228,6 +228,44 @@ static void sramWrite(IV * v, uint32_t addr, uint32_t val)
     wrFlush(v, bcm::kMemWinBase, 0);
 }
 
+static void cfgWr32(IV * v, uint32_t off, uint32_t val)
+{
+    if (!ok(v)) {
+        return;
+    }
+    v->pci->ConfigurationWrite32(off, val);
+}
+
+// Raw config read (no all-ones fault check: the register-window data port can
+// legitimately return 0xFFFFFFFF as scratch content).
+static uint32_t cfgRd32Raw(IV * v, uint32_t off)
+{
+    uint32_t x = 0xffffffff;
+    if (!ok(v)) {
+        return x;
+    }
+    v->pci->ConfigurationRead32(off, &x);
+    return x;
+}
+
+// Internal memory (RX/TX-CPU scratch at 0x30000/0x34000) through the register
+// indirect window. Matches ThunderGate: write the big-endian-assembled word
+// as-is, byte-swap on read (their htonl), restore the base to 0 after.
+static void regWinWrite(IV * v, uint32_t winAddr, uint32_t word)
+{
+    cfgWr32(v, bcm::kRegWinBase, winAddr);
+    cfgWr32(v, bcm::kRegWinData, word);
+    cfgWr32(v, bcm::kRegWinBase, 0);
+}
+
+static uint32_t regWinRead(IV * v, uint32_t winAddr)
+{
+    cfgWr32(v, bcm::kRegWinBase, winAddr);
+    const uint32_t raw = cfgRd32Raw(v, bcm::kRegWinData);
+    cfgWr32(v, bcm::kRegWinBase, 0);
+    return __builtin_bswap32(raw);
+}
+
 static uint64_t nsToMach(IV * v, uint64_t ns)
 {
     return v->tb.numer == 0 ? ns : ns * v->tb.denom / v->tb.numer;
@@ -868,7 +906,7 @@ static kern_return_t loadCoreImage(IV * v, uint32_t loadAddr, const uint8_t * im
                               (static_cast<uint32_t>(img[i + 1]) << 16) |
                               (static_cast<uint32_t>(img[i + 2]) << 8) |
                               static_cast<uint32_t>(img[i + 3]);
-        sramWrite(v, winBase + i, word);
+        regWinWrite(v, winBase + i, word);
     }
 
     // Point the core at the image base and release it. Setting the PC register
@@ -898,7 +936,7 @@ static kern_return_t readCoreMem(IV * v, uint32_t virtAddr, uint64_t * wordOut)
         return kIOReturnBadArgument;
     }
     if (wordOut != nullptr) {
-        *wordOut = sramRead(v, winAddr);
+        *wordOut = regWinRead(v, winAddr);
     }
     return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
 }

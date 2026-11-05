@@ -55,8 +55,14 @@ constexpr uint32_t  kPciStateRomEnable  = 0x00000020;
 constexpr uint32_t  kPciStateRomRetry   = 0x00000040;
 
 constexpr uint32_t kClockCtrl           = 0x74;
-constexpr uint32_t kMemWinBase          = 0x7c;
-constexpr uint32_t kMemWinData          = 0x84;
+constexpr uint32_t kMemWinBase          = 0x7c;        // packet-SRAM memory window (base)
+constexpr uint32_t kMemWinData          = 0x84;        // packet-SRAM memory window (data)
+// Register indirect window (config space): reaches the full internal address
+// map including the RX/TX-CPU scratch pads (0x30000/0x34000). The memory window
+// above does NOT map the CPU scratch. Data is byte-swapped on read (ThunderGate
+// htonl; py/blocks/cpu.py + macos/TGDext use ConfigurationRead32/Write32 here).
+constexpr uint32_t kRegWinBase          = 0x78;
+constexpr uint32_t kRegWinData          = 0x80;
 constexpr uint32_t kGen15ProdIdAsicRev  = 0xfc;
 constexpr uint32_t  kAsicRev57766       = 0x57766;     // (asic_rev >> 12)
 constexpr uint32_t  kChipRev57765Ax     = 0x577650;    // (asic_rev >> 8)
