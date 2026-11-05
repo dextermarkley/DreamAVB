@@ -114,6 +114,15 @@ struct AVBBcmDriver_IVars {
     uint64_t tsValue;
     uint64_t tsMach;
 
+    // Software-tracked EAV high word. EAV_REF_CLCK_MSB reads 0 on this
+    // 57766-class part, so a 64-bit RX timestamp cannot be built from it. We
+    // advance eavHi on each EAV_LSB wrap and re-align it to the TX_TSTAMP latch
+    // epoch (the only register that exposes the true high 32 bits) whenever a
+    // TX timestamp latches, so RX (t4) and TX (t1) share one 64-bit epoch.
+    uint32_t eavHi;
+    uint32_t eavLastLo;
+    bool eavSeeded;
+
     // RX-CPU stamping (AVB_INIT_FLAG_RXCPU_STAMP): attach the firmware's
     // per-frame EAV timestamp to harvested gPTP frames.
     bool rxcpuStamp;
@@ -301,14 +310,30 @@ static bool readTs(IV * v, uint32_t lsbOff, uint32_t msbOff, uint64_t * out)
 // free-running EAV reference clock, exactly as Apple's receivePackets does:
 // read the EAV clock, and if its low word has already wrapped past the frame's
 // latched low word, borrow one from the high word.
+// Sample the free-running EAV LSB (a BAR read, safe during a TX latch) and
+// advance the software high word on wrap. Returns the sampled low word. The
+// absolute high word is kept correct by the TX-epoch re-align in checkTx; this
+// only tracks wraps between those re-aligns.
+static uint32_t eavSample(IV * v)
+{
+    const uint32_t lo = rdRaw(v, bcm::kEavRefClkLsb);
+    if (v->eavSeeded && lo < v->eavLastLo) {
+        v->eavHi++;
+    }
+    v->eavLastLo = lo;
+    return lo;
+}
+
+// Reconstruct a full 64-bit RX timestamp from the per-frame low-32 value (from
+// the RX-CPU stamp ring, or the RX BD reserved field) and the software EAV high
+// word. EAV_REF_CLCK_MSB reads 0 on this part, so we cannot read the high word
+// directly (as Apple's receivePackets does on parts where it works); instead we
+// use eavHi, re-aligned to the TX latch epoch. If the current low word is at or
+// behind the frame's, the frame predates the latest wrap -> borrow one.
 static uint64_t reconstructRxTs(IV * v, uint32_t frameLsb)
 {
-    const uint32_t eavLsb = rdRaw(v, bcm::kEavRefClkLsb);
-    uint32_t eavMsb = rdRaw(v, bcm::kEavRefClkMsb);
-    if (eavLsb <= frameLsb) {
-        eavMsb--;
-    }
-    return (static_cast<uint64_t>(eavMsb) << 32) | frameLsb;
+    const uint32_t eavLsb = eavSample(v);
+    return reconstructEavTs(v->eavHi, eavLsb, frameLsb);
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,6 +1189,13 @@ static void harvestRx(IV * v)
     readStatusBlock(v, sb);
     bool reposted = false;
 
+    // Keep the software EAV high word tracking wraps even when no gPTP frame is
+    // stamped this cycle (a BAR read, safe alongside TX). Skip while a TX
+    // timestamp is pending so nothing competes with the latch window.
+    if (!v->tsPending) {
+        (void)eavSample(v);
+    }
+
     const uint32_t prod0 = le16At(sb, bcm::kSbRxProducer0) & (bcm::kRxRetRingSize - 1);
     if (prod0 != v->retCons) {
         reposted |= drainReturnRing(v, reinterpret_cast<const volatile RxBd *>(v->retRing.va),
@@ -1205,6 +1237,12 @@ static void checkTx(IV * v)
     uint64_t ts = 0;
     if (readTs(v, bcm::kTxTstampLsb, bcm::kTxTstampMsb, &ts) && ts != v->tsPre) {
         v->tsValue = ts & bcm::kTstampMask;
+        // Re-align the software EAV high word to this TX latch, the only source
+        // of the true high 32 bits on this part, so RX reconstruction shares
+        // the TX epoch.
+        v->eavHi = static_cast<uint32_t>((ts & bcm::kTstampMask) >> 32);
+        v->eavLastLo = static_cast<uint32_t>(ts);
+        v->eavSeeded = true;
         v->tsMach = mach_absolute_time();
         v->tsStatus = kAvbTxTsOk;
         v->tsPending = false;
@@ -1286,6 +1324,9 @@ static kern_return_t initDatapath(IV * v, uint64_t initFlags)
     v->tsPending = false;
     v->tsSeq = 0;
     v->rxcpuStamp = (initFlags & AVB_INIT_FLAG_RXCPU_STAMP) != 0;
+    v->eavHi = 0;
+    v->eavLastLo = 0;
+    v->eavSeeded = false;
 
     LOG("datapath: core reset + init (flags 0x%llx)", initFlags);
     if (!resetHw(v, initFlags)) {

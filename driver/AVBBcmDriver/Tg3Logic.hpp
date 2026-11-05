@@ -401,6 +401,19 @@ inline bool parseGptpStampKey(const uint8_t * frame, uint32_t len, uint8_t * msg
     return true;
 }
 
+// Combine a 32-bit EAV frame timestamp with the current software high word and
+// a fresh low-word sample into a 64-bit value. EAV_REF_CLCK_MSB reads 0 on the
+// 57766-class part, so the high word is tracked in software (advanced on wrap,
+// re-aligned to the TX latch epoch). When the frame's low word is at or after
+// the current low word, the frame was captured before the most recent wrap, so
+// borrow one from the high word.
+constexpr uint64_t reconstructEavTs(uint32_t hi, uint32_t curLo, uint32_t frameLsb) {
+    if (curLo <= frameLsb) {
+        hi--;
+    }
+    return (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(frameLsb);
+}
+
 // Scan a newest-first snapshot of ring entries for the first (msgType, seq)
 // match and return its EAV low word. The dext builds `entries` by reading the
 // slots at producer-1, producer-2, ... so index 0 is the most recent stamp.

@@ -769,3 +769,24 @@ only briefly.
 Pending validation of the fix: dext 308.17.16 activated; needs the device to
 re-enumerate (replug) to bind, then `pdelay` should show BOTH t1 (TX) and t4
 (RX) → a complete exchange with a hardware link delay.
+
+### 2026-11-05 — EAV high-word reconstruction (fixes the absolute link delay)
+
+The validated run showed correct nrr (-1.13 ppm) but an absolute link delay of
+~-51 s: `reconstructRxTs` built t4's high 32 bits from `EAV_REF_CLCK_MSB`, which
+reads 0 on this part, while t1 (TX) carries the real high word (~25) from the
+TX_TSTAMP latch. t4 was effectively 32-bit, t1 64-bit, so (t4 - t1) was garbage.
+
+Fix (dext 308.18.29): track the EAV high word in software (`v->eavHi`). It is
+advanced on each EAV_LSB wrap (`eavSample`, a BAR read sampled every harvest and
+on each RX stamp) and RE-ALIGNED to the TX latch epoch in `checkTx` whenever a
+TX timestamp latches — the TX_TSTAMP register is the only source of the true
+high 32 bits here. `reconstructRxTs` then combines `eavHi` with a fresh low
+sample via the pure, unit-tested `reconstructEavTs(hi, curLo, frameLsb)` (borrow
+when the frame low is at/after the current low). Since gPTP sends a TX-stamped
+frame at least every second and the LSB wraps every ~4.29 s, eavHi stays aligned
+with the TX epoch, so t4 and t1 share one 64-bit epoch and the link delay reads
+its true ~1.4 us.
+
+Needs the device to re-enumerate (replug) to bind 308.18.29, then `pdelay`
+should report a small positive link delay.

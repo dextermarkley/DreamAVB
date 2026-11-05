@@ -306,10 +306,27 @@ static void testRxCpuStamp() {
     std::printf("pass: RX-CPU stamp ring decode / key parse / match\n");
 }
 
+static void testReconstructEavTs() {
+    // No wrap: frame low behind the current low -> same high word.
+    CHECK(reconstructEavTs(25, 0x0000f000, 0x0000e000) == (25ull << 32 | 0x0000e000));
+    // Frame low AT the current low counts as "before the latest wrap" (borrow),
+    // matching the <= boundary the hardware path used.
+    CHECK(reconstructEavTs(25, 0x0000e000, 0x0000e000) == (24ull << 32 | 0x0000e000));
+    // Wrap: current low has wrapped past the frame low -> borrow one.
+    CHECK(reconstructEavTs(26, 0x00001000, 0xfffff000) == (25ull << 32 | 0xfffff000));
+    // t1/t4 alignment: a TX latch at hi=25 and an RX frame ~27 us later (no
+    // wrap) land in the same epoch, so (t4 - t1) is a small positive delta.
+    const uint64_t t1 = 25ull << 32 | 0x5f5e1000;             // TX low
+    const uint64_t t4 = reconstructEavTs(25, 0x5f5e8000, 0x5f5e6cf0);  // RX, ~23 us later
+    CHECK(t4 > t1 && (t4 - t1) < 100000);  // sub-100 us round-trip-ish
+    std::printf("pass: EAV 64-bit timestamp reconstruction\n");
+}
+
 int main() {
     testSnapshot();
     testAvbRxRules();
     testRxCpuStamp();
+    testReconstructEavTs();
     testCorrection();
     testTxBd();
     testRxBd();
