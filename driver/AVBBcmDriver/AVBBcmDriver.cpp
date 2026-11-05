@@ -94,11 +94,13 @@ struct AVBBcmDriver_IVars {
     DmaBuf status;
     DmaBuf stdRing;
     DmaBuf retRing;
+    DmaBuf retRing1;             // AVB realtime return ring (classifier routes gPTP here)
     DmaBuf txRing;
     DmaBuf rxBufs;
     DmaBuf txBufs;
     uint32_t stdProd;            // std ring producer (ring index)
-    uint32_t retCons;            // RX return ring consumer
+    uint32_t retCons;            // RX return ring 0 consumer
+    uint32_t retCons1;           // RX return ring 1 (AVB) consumer
     uint32_t txProd;             // TX producer
     uint32_t txCons;             // last TX consumer seen in the status block
     uint64_t txSeq;              // frames sent since datapath up
@@ -363,6 +365,7 @@ static void dmaFreeAll(IV * v)
     dmaFree(&v->status);
     dmaFree(&v->stdRing);
     dmaFree(&v->retRing);
+    dmaFree(&v->retRing1);
     dmaFree(&v->txRing);
     dmaFree(&v->rxBufs);
     dmaFree(&v->txBufs);
@@ -672,10 +675,12 @@ static bool resetHw(IV * v, uint64_t initFlags)
     // Host-memory rings (tg3_init_rings): clear, post kRxPosted std buffers.
     memset(v->stdRing.va, 0, v->stdRing.len);
     memset(v->retRing.va, 0, v->retRing.len);
+    memset(v->retRing1.va, 0, v->retRing1.len);
     memset(v->txRing.va, 0, v->txRing.len);
     memset(v->status.va, 0, v->status.len);
     v->stdProd = 0;
     v->retCons = 0;
+    v->retCons1 = 0;
     v->txProd = 0;
     v->txCons = 0;
     for (uint32_t i = 0; i < kRxPosted; i++) {
@@ -727,7 +732,12 @@ static bool resetHw(IV * v, uint64_t initFlags)
     for (uint32_t i = 1; i < bcm::kSendRcbCount; i++) {
         sramWrite(v, bcm::kSramSendRcb + i * bcm::kBdInfoSize + bcm::kBdInfoMaxLenFlags, bcm::kBdInfoDisabled);
     }
-    for (uint32_t i = 1; i < bcm::kRxRetRcbCount; i++) {
+    // Return ring 1 is the AVB realtime RX queue (the classifier routes gPTP
+    // frames there and the hardware stamps BD.reserved). Enable it only with
+    // the AVB RX rules; otherwise keep every ring above 0 disabled as tg3 does.
+    const bool avbRing = (initFlags & AVB_INIT_FLAG_AVB_RX_RULES) != 0;
+    const uint32_t firstDisabledRet = avbRing ? 2u : 1u;
+    for (uint32_t i = firstDisabledRet; i < bcm::kRxRetRcbCount; i++) {
         sramWrite(v, bcm::kSramRxRetRcb + i * bcm::kBdInfoSize + bcm::kBdInfoMaxLenFlags, bcm::kBdInfoDisabled);
     }
     wrFlush(v, bcm::kMboxInterrupt0, 1);
@@ -737,6 +747,11 @@ static bool resetHw(IV * v, uint64_t initFlags)
     wr(v, bcm::kHostccStatusBlkLo, static_cast<uint32_t>(v->status.iova));
     sramSetRcb(v, bcm::kSramSendRcb, v->txRing.iova, sendRcbMaxLenFlags());
     sramSetRcb(v, bcm::kSramRxRetRcb, v->retRing.iova, rxRetRcbMaxLenFlags());
+    if (avbRing) {
+        wr(v, bcm::kMboxRxRetCons1, 0);
+        sramSetRcb(v, bcm::kSramRxRetRcb + bcm::kBdInfoSize, v->retRing1.iova, rxRetRcbMaxLenFlags());
+        LOG("AVB realtime return ring 1 enabled at iova 0x%llx", v->retRing1.iova);
+    }
 
     // MAC address registers are left as the bootcode loaded them (read only).
     wr(v, bcm::kMacRxMtu, bcm::kMacRxMtuValue);
@@ -1010,42 +1025,43 @@ static void swPush(IV * v, const AvbRxEntry & e)
     v->swHead = ringNext(v->swHead, kSwRingSize);
 }
 
-static void harvestRx(IV * v)
+// Read a little-endian u16 producer index from the status block at byte `off`.
+static uint32_t rxProducer(IV * v, uint32_t off)
 {
-    uint8_t sb[0x14];
-    readStatusBlock(v, sb);
-    const uint32_t hwProd = le16At(sb, bcm::kSbRxProducer0) & (bcm::kRxRetRingSize - 1);
-    if (hwProd == v->retCons) {
-        return;
-    }
-    const auto * ret = reinterpret_cast<const volatile RxBd *>(v->retRing.va);
+    const volatile uint8_t * p = v->status.va;
+    return (static_cast<uint32_t>(p[off + 1]) << 8) | p[off];
+}
+
+// Drain one RX return ring from *consp up to hwProd: decode each BD, attach the
+// hardware RX timestamp from its reserved field (Apple's path), copy the frame
+// and repost its std buffer. Returns whether any std buffer was reposted.
+static bool drainReturnRing(IV * v, const volatile RxBd * ret, uint32_t * consp, uint32_t hwProd)
+{
     bool reposted = false;
-    while (v->retCons != hwProd && ok(v)) {
+    uint32_t cons = *consp;
+    while (cons != hwProd && ok(v)) {
         RxBd bd;
-        bd.addrHi = ret[v->retCons].addrHi;
-        bd.addrLo = ret[v->retCons].addrLo;
-        bd.idxLen = ret[v->retCons].idxLen;
-        bd.typeFlags = ret[v->retCons].typeFlags;
-        bd.ipTcpCsum = ret[v->retCons].ipTcpCsum;
-        bd.errVlan = ret[v->retCons].errVlan;
-        bd.reserved = ret[v->retCons].reserved;
-        bd.opaque = ret[v->retCons].opaque;
+        bd.addrHi = ret[cons].addrHi;
+        bd.addrLo = ret[cons].addrLo;
+        bd.idxLen = ret[cons].idxLen;
+        bd.typeFlags = ret[cons].typeFlags;
+        bd.ipTcpCsum = ret[cons].ipTcpCsum;
+        bd.errVlan = ret[cons].errVlan;
+        bd.reserved = ret[cons].reserved;
+        bd.opaque = ret[cons].opaque;
         const RxReturn r = decodeRxReturn(bd);
-        const uint64_t now = mach_absolute_time();
 
         AvbRxEntry e{};
-        e.harvest_mach = now;
+        e.harvest_mach = mach_absolute_time();
         e.type_flags = r.flags;
         // Apple's actual RX-timestamp path: the hardware writes the per-frame
-        // low-32 timestamp into the RX BD reserved field (offset 0x18), and the
-        // full time is reconstructed against the EAV clock. The tg3 register
-        // pair (0x6b0/0x6b4) is not wired on the 57766, so prefer the BD field.
+        // low-32 timestamp into the RX BD reserved field (offset 0x18), full
+        // time reconstructed against the EAV clock. The tg3 register pair
+        // (0x6b0/0x6b4) is not wired on the 57766, so prefer the BD field.
         if (bd.reserved != 0) {
             e.hw_ts = reconstructRxTs(v, bd.reserved);
             e.has_ts = 1;
         } else if (r.hasTimestamp) {
-            // Fallback to the tg3 register pair if a PTPSTAT-flagged frame ever
-            // appears; reading LSB then MSB releases the one-deep latch.
             uint64_t ts = 0;
             if (readTs(v, bcm::kRxTstampLsb, bcm::kRxTstampMsb, &ts)) {
                 e.hw_ts = ts & bcm::kTstampMask;
@@ -1064,8 +1080,38 @@ static void harvestRx(IV * v)
         } else {
             LOG("harvest: unexpected return BD opaque 0x%08x", bd.opaque);
         }
-        v->retCons = ringNext(v->retCons, bcm::kRxRetRingSize);
+        cons = ringNext(cons, bcm::kRxRetRingSize);
     }
+    *consp = cons;
+    return reposted;
+}
+
+static void harvestRx(IV * v)
+{
+    uint8_t sb[0x14];
+    readStatusBlock(v, sb);
+    bool reposted = false;
+
+    const uint32_t prod0 = le16At(sb, bcm::kSbRxProducer0) & (bcm::kRxRetRingSize - 1);
+    if (prod0 != v->retCons) {
+        reposted |= drainReturnRing(v, reinterpret_cast<const volatile RxBd *>(v->retRing.va),
+                                    &v->retCons, prod0);
+    }
+
+    // AVB realtime return ring 1: the classifier routes gPTP (0x88F7) frames
+    // here and the hardware stamps BD.reserved. Its producer is the status
+    // block's index-1 slot (0x18); it has its own consumer mailbox.
+    if (v->retRing1.va != nullptr) {
+        const uint32_t prod1 = rxProducer(v, bcm::kSbRxProducer1) & (bcm::kRxRetRingSize - 1);
+        if (prod1 != v->retCons1) {
+            reposted |= drainReturnRing(v, reinterpret_cast<const volatile RxBd *>(v->retRing1.va),
+                                        &v->retCons1, prod1);
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            OSSynchronizeIO();
+            wr(v, bcm::kMboxRxRetCons1, v->retCons1);
+        }
+    }
+
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     OSSynchronizeIO();
     wr(v, bcm::kMboxRxRetCons0, v->retCons);
@@ -1151,6 +1197,7 @@ static kern_return_t initDatapath(IV * v, uint64_t initFlags)
     const bool allocated = dmaAlloc(v, &v->status, 4096) &&
                            dmaAlloc(v, &v->stdRing, bcm::kStdRingSize * sizeof(RxBd)) &&
                            dmaAlloc(v, &v->retRing, bcm::kRxRetRingSize * sizeof(RxBd)) &&
+                           dmaAlloc(v, &v->retRing1, bcm::kRxRetRingSize * sizeof(RxBd)) &&
                            dmaAlloc(v, &v->txRing, bcm::kTxRingSize * sizeof(TxBd)) &&
                            dmaAlloc(v, &v->rxBufs, uint64_t(kRxPosted) * kRxBufSize) &&
                            dmaAlloc(v, &v->txBufs, uint64_t(kTxSlots) * kTxBufSize);

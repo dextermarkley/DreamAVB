@@ -73,6 +73,7 @@ constexpr uint32_t kMboxInterrupt0      = 0x0204;
 constexpr uint32_t kMboxRxStdProd       = 0x026c;
 constexpr uint32_t kMboxRxJumboProd     = 0x0274;
 constexpr uint32_t kMboxRxRetCons0      = 0x0284;
+constexpr uint32_t kMboxRxRetCons1      = 0x028c;      // return ring 1 consumer (0x0284 + 1*8)
 constexpr uint32_t kMboxTxHostProd0     = 0x0304;
 
 // ---------------------------------------------------------------------------
@@ -385,6 +386,7 @@ constexpr uint32_t kSbStatus            = 0x00;
 constexpr uint32_t kSbRxStdConsumer     = 0x0a;        // u16
 constexpr uint32_t kSbRxProducer0       = 0x10;        // u16 (return ring 0 producer)
 constexpr uint32_t kSbTxConsumer0       = 0x12;        // u16
+constexpr uint32_t kSbRxProducer1       = 0x18;        // u16 (return ring 1 producer; 8-byte index stride)
 
 }  // namespace bcm
 
