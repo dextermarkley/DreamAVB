@@ -466,3 +466,28 @@ off its mailbox, and confirm each write sticks (host vs core). That is several
 more build+replug hardware cycles with genuine uncertainty in the undocumented
 RCB/mailbox layout, for a personal-machine-only payoff (the I210 remains the
 shipping timestamping NIC). This is the decision point on whether to invest it.
+
+### Return ring 1 built; routing is the last gap (2026-11-05)
+
+Return ring 1 (AVB realtime RX queue) is implemented and working: enabled with
+its RCB at SRAM 0x210 when AVB rules are set, drained in harvestRx via a shared
+drainReturnRing helper (producer at status-block index-1 0x18, consumer mailbox
+0x28c), attaching hw_ts from BD.reserved + EAV clock. The shim loads cleanly
+(SHM1/DONE, heartbeat climbing).
+
+Hardware result: gPTP frames still arrive on ring 0, untimestamped
+(type_flags=0x0004, has_ts=0). So the classifier rule bank (0x5400-0x561c) alone
+matches the 0x88F7 ethertype but does NOT route those frames to the realtime
+queue. The routing+timestamp-enable is installed separately, by
+`setRealtimeReceiveQueueFilter` -> a framework vtable call (`[rax+0x1c8]` on the
+object at `[this+0x398]`), which builds a 64-bit ingress-filter descriptor
+(queue 0: 0xefff6002ffff22f0, queue 1: 0xefff4002ffff22f0) and programs the
+hardware ingress filter through IONetworkingFamily, below the BCM driver.
+
+So everything host-side is built -- the ring, the BD.reserved read, the EAV
+reconstruction -- and the single missing link is that ingress-filter
+programming, one framework layer down. Next concrete step: RE the vtable method
+at `[rax+0x1c8]` of `[this+0x398]` to find the register writes that install the
+realtime-queue ingress filter (what actually routes 0x88F7 to the queue and
+arms per-frame BD.reserved stamping), then replicate them from the shim/dext.
+This is a deeper RE layer (framework, not the BCM driver) with real uncertainty.
