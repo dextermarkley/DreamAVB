@@ -24,6 +24,11 @@ use io_kit_sys::{
 use crate::abi::{self, sel, AvbInfo, ClockSample, Counters, RxBatch, StreamFilter};
 use crate::nic::{self, NicProfile};
 
+/// The clean-room BCM RX-CPU stamping firmware (driver/bcm-fw), committed so no
+/// MIPS toolchain is needed here. Big-endian MIPS, loaded at
+/// `abi::RX_CPU_SCRATCH_BASE` by [`Device::load_stamp_firmware`].
+pub const STAMP_FIRMWARE: &[u8] = include_bytes!("../../../driver/bcm-fw/bcmfw.img");
+
 /// `IOReturn` / `kern_return_t` values the AVB tools name or act on.
 pub mod kr {
     pub const ERROR: u32 = 0xe000_02bc;
@@ -382,6 +387,19 @@ impl Device {
             "ShutdownDatapath",
         )?;
         Ok(())
+    }
+
+    /// Load the clean-room RX-CPU stamping firmware (driver/bcm-fw) into the
+    /// BCM scratch pad and start it. Call after `init_datapath(... RXCPU_STAMP)`
+    /// is up; the firmware installs its gPTP receive rule and begins stamping,
+    /// and the dext's harvest then attaches each gPTP frame's EAV timestamp.
+    /// Returns `(halted, post_release_mode)` from the load.
+    pub fn load_stamp_firmware(&self) -> Result<(bool, u32)> {
+        let mut image = STAMP_FIRMWARE.to_vec();
+        while !image.len().is_multiple_of(4) {
+            image.push(0);
+        }
+        self.load_core_image(abi::RX_CPU_SCRATCH_BASE, &image)
     }
 
     /// BCM M1: load a clean-room image into the RX-CPU scratch pad at

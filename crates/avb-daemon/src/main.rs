@@ -64,6 +64,11 @@ struct Cli {
     /// Log level: error|warn|info|debug.
     #[arg(long, global = true, default_value = "info")]
     log_level: String,
+
+    /// Which NIC to drive: i210 (default), bcm (BCM57762 Thunderbolt adapter,
+    /// via the RX-CPU stamping firmware), or auto (I210 first, then BCM).
+    #[arg(long, global = true, default_value = "i210")]
+    nic: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -237,8 +242,18 @@ fn run() -> Result<(), Exit> {
     let level = crate::log::Level::parse(&cli.log_level).ok_or(Exit::Usage)?;
     validate::validate_timeout(cli.discover_timeout)?;
     validate::validate_timeout(cli.link_timeout)?;
+    let nic = match cli.nic.as_str() {
+        "i210" => avb_dext::iokit::NicSelect::I210,
+        "bcm" | "bcm57762" => avb_dext::iokit::NicSelect::Bcm,
+        "auto" => avb_dext::iokit::NicSelect::Auto,
+        other => {
+            eprintln!("unknown --nic '{other}' (expected i210, bcm, or auto)");
+            return Err(Exit::Usage);
+        }
+    };
 
     let opts = stack::GlobalOpts {
+        nic,
         discover_timeout: cli.discover_timeout,
         link_timeout: cli.link_timeout,
         level,

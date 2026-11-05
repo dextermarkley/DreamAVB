@@ -19,6 +19,9 @@ use crate::realdext::RealDext;
 
 /// Global options shared by every subcommand.
 pub struct GlobalOpts {
+    /// Which dext/NIC to drive (design: I210 is the default; the BCM57762
+    /// Thunderbolt adapter is supported via the RX-CPU stamping firmware).
+    pub nic: NicSelect,
     pub discover_timeout: u64,
     pub link_timeout: u64,
     pub level: Level,
@@ -53,10 +56,10 @@ pub fn shutdown_requested() -> bool {
 /// `RealDext` ready for protocol traffic, or the documented exit code.
 fn bring_up(opts: &GlobalOpts, log: &Logger) -> Result<RealDext, Exit> {
     // Step 1: open.
-    let dev = match Device::open(NicSelect::I210) {
+    let dev = match Device::open(opts.nic) {
         Ok(d) => d,
         Err(e) => {
-            log.log(Level::Error, "dext", &format!("open i210: {e}"));
+            log.log(Level::Error, "dext", &format!("open NIC: {e}"));
             return Err(Exit::ServiceNotFound);
         }
     };
@@ -81,19 +84,29 @@ fn bring_up(opts: &GlobalOpts, log: &Logger) -> Result<RealDext, Exit> {
     if info.fault != 0 {
         return Err(Exit::DextFault);
     }
+    // The BCM57762 dext has no mapped shared-memory rings or StepClock (those
+    // are I210-only); its RX arrives via the PollRx batch path, which
+    // `RealDext::rx_ctl` falls back to when no rings are mapped. So skip
+    // RingAttach / attach_rings for it.
+    let is_bcm = info.nic_kind == avb_dext::abi::NIC_BCM57762;
     // Step 3: RingAttach(0) — becomes the owner. out[0] = mapping generation.
-    let generation = match dev.ring_attach(0) {
-        Ok((gen, _rx_sz, _cons_sz)) => gen,
-        Err(e) => {
-            if avb_dext::iokit::io_return_of(&e) == Some(avb_dext::iokit::kr::EXCLUSIVE_ACCESS) {
-                log.log(
-                    Level::Error,
-                    "dext",
-                    "the I210 rings are owned by another client (another avb-daemon); stop it first",
-                );
-                return Err(Exit::Owned);
+    let generation = if is_bcm {
+        0
+    } else {
+        match dev.ring_attach(0) {
+            Ok((gen, _rx_sz, _cons_sz)) => gen,
+            Err(e) => {
+                if avb_dext::iokit::io_return_of(&e) == Some(avb_dext::iokit::kr::EXCLUSIVE_ACCESS)
+                {
+                    log.log(
+                        Level::Error,
+                        "dext",
+                        "the rings are owned by another client (another avb-daemon); stop it first",
+                    );
+                    return Err(Exit::Owned);
+                }
+                return Err(Exit::Internal);
             }
-            return Err(Exit::Internal);
         }
     };
     // Steps 4–6 (map, validate header, InitDatapath) and step 7 (link wait)
@@ -104,9 +117,35 @@ fn bring_up(opts: &GlobalOpts, log: &Logger) -> Result<RealDext, Exit> {
     // in the control ring / PollRx; without it `rx_ctl` sees nothing and the
     // port never completes a Pdelay exchange. PROMISC matches the Phase 0
     // probe's bring-up so unicast/multicast gPTP both arrive (design §5.2).
-    let init_flags = avb_dext::abi::INIT_FLAG_PROMISC | avb_dext::abi::INIT_FLAG_RX_PTP_V2_L2;
+    // On the BCM57762 the MAC RX_TSTAMP latch never fires; RX timestamps come
+    // from our RX-CPU stamping firmware, enabled by RXCPU_STAMP and loaded
+    // below. The I210 ignores the flag.
+    let mut init_flags = avb_dext::abi::INIT_FLAG_PROMISC | avb_dext::abi::INIT_FLAG_RX_PTP_V2_L2;
+    if is_bcm {
+        init_flags |= avb_dext::abi::INIT_FLAG_RXCPU_STAMP;
+    }
     if dev.init_datapath(init_flags).is_err() {
         return Err(Exit::DextFault);
+    }
+    // BCM: load the stamping firmware now that the datapath is up, so the
+    // dext's harvest attaches each gPTP frame's EAV timestamp (without it,
+    // `hw_ts` is never set and the port never completes a Pdelay exchange).
+    if is_bcm {
+        match dev.load_stamp_firmware() {
+            Ok((halted, mode)) => log.log(
+                Level::Info,
+                "dext",
+                &format!("bcm rx-cpu stamper loaded (halted={halted} mode=0x{mode:08x})"),
+            ),
+            Err(e) => {
+                log.log(
+                    Level::Error,
+                    "dext",
+                    &format!("bcm rx-cpu stamper load failed: {e}"),
+                );
+                return Err(Exit::DextFault);
+            }
+        }
     }
     // Step 7: wait ≤ link_timeout for LINK_UP.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(opts.link_timeout);
@@ -130,10 +169,13 @@ fn bring_up(opts: &GlobalOpts, log: &Logger) -> Result<RealDext, Exit> {
     let mut dext = RealDext::new(dev, numer, denom);
     // Steps 4–6: map the RX + consumer memory and validate the header against
     // the attach generation. This is what makes `rx_ctl` able to drain the
-    // control ring; gPTP RX arrives there after RingAttach.
-    if let Err(what) = dext.attach_rings(generation) {
-        log.log(Level::Error, "dext", &format!("map rings: {what}"));
-        return Err(Exit::AbiMismatch);
+    // control ring; gPTP RX arrives there after RingAttach. The BCM57762 has no
+    // mapped rings, so `rx_ctl` falls back to PollRx and we skip the mapping.
+    if !is_bcm {
+        if let Err(what) = dext.attach_rings(generation) {
+            log.log(Level::Error, "dext", &format!("map rings: {what}"));
+            return Err(Exit::AbiMismatch);
+        }
     }
     Ok(dext)
 }

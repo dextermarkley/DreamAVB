@@ -105,6 +105,13 @@ impl GptpService {
         // SYSTIM step), every Pdelay exchange looks like it straddles a step
         // and is discarded.
         let clock_gen = dext.clock_gen();
+        // Per-NIC timestamp-point latency profile (BCM uses the RX-CPU stamp
+        // path, whose RX latency differs from the I210's MAC capture).
+        let cfg = if info.nic_kind == avb_dext::abi::NIC_BCM57762 {
+            PortConfig::bcm57762(mac, tb)
+        } else {
+            PortConfig::i210(mac, tb)
+        };
         // Start the NIC clock at the rate the servo assumes: 0 ppb. TIMINCA
         // survives a daemon exit, so without this a run inherits whatever the
         // last servo applied (measured: -74.6 ppm, left by a holdover) while
@@ -113,7 +120,7 @@ impl GptpService {
         // Sync again until it was power-cycled.
         dext.adj_freq(0);
         Ok(Self {
-            port: Port::new(PortConfig::i210(mac, tb), now, clock_gen),
+            port: Port::new(cfg, now, clock_gen),
             tb,
             out: Outbox::default(),
             held: None,

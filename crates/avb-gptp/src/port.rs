@@ -146,6 +146,15 @@ impl PortConfig {
             initial_ppb: 0.0,
         }
     }
+
+    pub fn bcm57762(mac: MacAddr, timebase: Timebase) -> Self {
+        Self {
+            mac,
+            timebase,
+            latency: LatencyProfile::BCM57762_1000,
+            initial_ppb: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

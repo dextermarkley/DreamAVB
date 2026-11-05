@@ -93,6 +93,18 @@ impl LatencyProfile {
         rx_ns: 448,
     };
 
+    /// BCM57762 at 1000 Mb/s with our RX-CPU stamping firmware. Empirical fit
+    /// (docs/bcm-firmware-shim-design.md): the raw Pdelay one-way delay on a
+    /// direct cable to the 16R measured ~1372 ns (sd ~49). The RX timestamp is
+    /// taken when the firmware services the RDIQ, not at the MDI, so rx_ns
+    /// carries that (dominant) service latency; tx_ns is the MAC-TX-to-MDI
+    /// estimate. The sum centres the compensated delay near the physical
+    /// minimum; the split is estimated and wants a reference measurement.
+    pub const BCM57762_1000: LatencyProfile = LatencyProfile {
+        tx_ns: 200,
+        rx_ns: 2444,
+    };
+
     pub const fn tx_c(self, raw: u64) -> u64 {
         raw.saturating_add_signed(self.tx_ns)
     }
