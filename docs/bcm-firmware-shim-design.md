@@ -811,3 +811,37 @@ time out for the first few `datapath up` cycles (link/time-sync settling, seen
 on every dext version); a `datapath down/up` or two clears it, after which TX
 latches 8/8. Not specific to the stamping firmware (reproduced with
 AVB_SKIP_STAMPER).
+
+### 2026-11-05 — Daemon gPTP on BCM: rate lock works; absolute sync needs a software offset
+
+`avb-daemon --nic bcm gptp` now runs the real servo on the Broadcom (commit
+abc6b48): `--nic {i210|bcm|auto}`; bring_up skips RingAttach/attach_rings for
+BCM (no mapped rings — I210-only) so rx_ctl uses the PollRx fallback, sets
+RXCPU_STAMP, and loads the stamping firmware; gptpsvc uses PortConfig::bcm57762
+with LatencyProfile::BCM57762_1000 (tx 200 / rx 2444 ns).
+
+Validated vs the 16R: **state=SLAVE, asCapable=true, servo=TRACKING, path_delay
+~2-81 ns, nrr -0.08 ppm** — the port syntonizes (rate-locks) and is asCapable.
+
+Two limits block full absolute-time use on BCM, both rooted in the hardware:
+
+1. **The EAV clock cannot be set.** `EAV_REF_CLCK_MSB` reads 0 (so `ReadClock`
+   returns a 32-bit time) AND `SetClock` is ineffective: writing 50000 s then
+   reading the TX latch still showed the free-running ~1228 s. Only the RATE is
+   adjustable (AdjFreq, confirmed in Phase 0 G2b). So the servo decides
+   `Set 42670 s` every tick but can never apply it — the offset never closes.
+   The fix is a "syntonize in hardware, synchronize in software" servo mode for
+   BCM: never step the clock; maintain GM_time = hw_freerun + software_offset
+   and apply that offset when producing/consuming GM timestamps. The RX-stamp
+   64-bit reconstruction (eavHi) already gives a consistent hardware timebase to
+   build that offset on.
+
+2. **No mapped audio rings.** The BCM dext implements only the base selectors +
+   PollRx; the shared-memory RX/audio rings (and StepClock, counters) are
+   I210-only. gPTP works through PollRx, but the daemon's AAF audio path needs
+   the mapped audio ring. Streaming on BCM needs the BCM dext to grow the
+   mapped-ring datapath (or a PollRx-based audio path).
+
+So on BCM today: gPTP timing foundation (asCapable + rate lock) is solid; the
+two items above are the remaining work to stream audio with GM-accurate media
+timing. The I210 remains the fully-working path for production audio.
