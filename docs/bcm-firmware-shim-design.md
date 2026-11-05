@@ -790,3 +790,24 @@ its true ~1.4 us.
 
 Needs the device to re-enumerate (replug) to bind 308.18.29, then `pdelay`
 should report a small positive link delay.
+
+### 2026-11-05 — VALIDATED END TO END (dext 308.18.29)
+
+`avb-probe --nic bcm pdelay --count 8` against the live 16R, full Pdelay
+exchanges with our own RX-CPU firmware supplying t4:
+
+- TX timestamps 8/8; complete exchanges 8/8 (t1, t2, t3, t4 all present).
+- Link delay mean **1372 ns, sd 49 ns** (1275-1415) — small, positive, stable.
+- neighborRateRatio **-1.86 ppm, sd 0.12 ppm**.
+- t4 now 64-bit and epoch-aligned with t1 (e.g. t1=144988417216,
+  t4=144988444704, t4-t1=27488 ns), confirming the EAV high-word fix.
+
+This closes the Phase 0 G3 blocker ("BCM RX packet timestamps don't work"):
+the BCM57762 produces gPTP RX timestamps via our clean-room RX-CPU firmware +
+the dext harvest attach, with precision suitable for gPTP asCapable.
+
+Known operational quirk: immediately after a Thunderbolt replug, TX timestamps
+time out for the first few `datapath up` cycles (link/time-sync settling, seen
+on every dext version); a `datapath down/up` or two clears it, after which TX
+latches 8/8. Not specific to the stamping firmware (reproduced with
+AVB_SKIP_STAMPER).
