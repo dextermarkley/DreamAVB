@@ -234,11 +234,12 @@ fn bcm_tx_egresses(dev: &Device, mac: [u8; 6]) -> bool {
     false
 }
 
-/// After a BCM power-on, the first bring-up with the stamper loaded has been
-/// seen to leave TX dead: send BDs are consumed but MAC TX octets stay 0, so
-/// nothing reaches the 16R. One bring-up with the stock RX-CPU cleared it on
-/// hardware, after which stamper bring-ups transmit normally. Check egress,
-/// and if dead, do that recovery once.
+/// After a BCM power-on, TX can come up dead: send BDs are consumed but MAC TX
+/// octets stay 0, so nothing reaches the 16R. Re-running InitDatapath alone
+/// (with or without the stamper) does not clear it (seen on hardware). What
+/// does: ShutdownDatapath, then InitDatapath with the stock RX-CPU. After that,
+/// a shutdown + stamper bring-up transmits normally (4 of 4 cycles). Check
+/// egress, and if dead, run exactly that sequence once.
 fn bcm_ensure_tx(
     dev: &Device,
     opts: &GlobalOpts,
@@ -253,8 +254,9 @@ fn bcm_ensure_tx(
     log.log(
         Level::Warn,
         "dext",
-        "bcm tx check: no frame left the MAC (TX octets 0); re-initialising once without the stamper, then with it",
+        "bcm tx check: no frame left the MAC (TX octets 0); shutting the datapath down and re-initialising once without the stamper, then with it",
     );
+    shutdown_for_recovery(dev, log)?;
     datapath_up(dev, opts, log, flags, false)?;
     let plain = bcm_tx_egresses(dev, mac);
     log.log(
@@ -262,6 +264,7 @@ fn bcm_ensure_tx(
         "dext",
         &format!("bcm tx check without the stamper: egress={plain}"),
     );
+    shutdown_for_recovery(dev, log)?;
     datapath_up(dev, opts, log, flags, true)?;
     if bcm_tx_egresses(dev, mac) {
         log.log(
@@ -277,6 +280,34 @@ fn bcm_ensure_tx(
         "bcm tx check: still no egress after recovery; replug the Thunderbolt adapter",
     );
     Err(Exit::DextFault)
+}
+
+/// ShutdownDatapath for the TX recovery. Since the abortHw change it no longer
+/// latches a fault on a block-stop timeout; refuse to continue if it did.
+fn shutdown_for_recovery(dev: &Device, log: &Logger) -> Result<(), Exit> {
+    if dev.shutdown_datapath().is_err() {
+        log.log(
+            Level::Error,
+            "dext",
+            "bcm tx recovery: ShutdownDatapath failed",
+        );
+        return Err(Exit::DextFault);
+    }
+    match dev.info() {
+        Ok(i) if i.fault == 0 => Ok(()),
+        Ok(i) => {
+            log.log(
+                Level::Error,
+                "dext",
+                &format!(
+                    "bcm tx recovery: dext fault {} after shutdown; replug the adapter",
+                    i.fault
+                ),
+            );
+            Err(Exit::DextFault)
+        }
+        Err(_) => Err(Exit::DextFault),
+    }
 }
 
 // --- Subcommand runners ---
