@@ -37,9 +37,20 @@ void shim_main(void)
     REG(RX_RULE_CTRL(RX_RULE_GPTP)) = RULE_GPTP_FIELDS;
     REG(RX_RULE_CTRL(RX_RULE_GPTP)) = RULE_GPTP_CTRL;
 
-    /* Arm the MAC's own RX PTP latch (V2 L2 events + interlock) so each frame's
-     * hardware arrival time can be compared with the core's EAV read. */
-    REG(RX_PTP_CTL) = RX_PTP_ENABLE;
+    /* Do NOT arm RX_PTP_CTL's HWTS_INTERLOCK here. On this chip the MAC RX PTP
+     * latch never fires (RX_TSTAMP stays 0, PTPSTAT never set), but arming the
+     * interlock FREEZES the EAV reference-clock read at 0x6900 until a captured
+     * timestamp's MSB is read to release it -- which never happens, so the
+     * clock read stays stuck. Instead disarm it and flush any pending latch by
+     * reading the RX_TSTAMP pair (LSB then MSB releases the interlock) and the
+     * EAV pair, so a previously-frozen clock read recovers. The stamp source is
+     * the free-running EAV clock read when we service the frame. */
+    REG(RX_PTP_CTL) = 0;
+    (void)REG(RX_TSTAMP_LSB);
+    (void)REG(RX_TSTAMP_LSB + 4u);
+    (void)REG(EAV_REF_CLK_LSB);
+    (void)REG(EAV_REF_CLK_LSB + 4u);
+    SCRATCH(DIAG_PTPCTL_AFTER) = REG(RX_PTP_CTL);
 
     /* Wake the RX CPU on EMAC receive (RDIQ) events. */
     REG(RXCPU_EVENT_EN) = REG(RXCPU_EVENT_EN) | EVENT_EMAC | EVENT_RDIQ;

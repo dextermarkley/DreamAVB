@@ -105,5 +105,13 @@
 #define TS_RING_ENTRIES   256u     /* power of two */
 #define TS_MAC_TS         0xBFECu  /* last RX_TSTAMP_LSB read (host: 0x0800BFEC) */
 #define TS_MAC_RING       0xD000u  /* per-slot RX_TSTAMP_LSB (host: 0x0800D000) */
+#define DIAG_GRC_BEFORE   0xBFE0u  /* GRC_MODE before EAV-mode write */
+#define DIAG_GRC_AFTER    0xBFE4u  /* GRC_MODE after */
+#define DIAG_PTPCTL_AFTER 0xBFE8u  /* RX_PTP_CTL readback after the core's write */
+
+/* GRC mode (0x6800). Bit 18: eav_mode_enable in the Tigon3 register model
+ * (MSB-first field 14); tg3 names the same bit GRC_MODE_HTX2B_ENABLE. */
+#define GRC_MODE_REG        0x6800u
+#define GRC_EAV_MODE_ENABLE 0x00040000u
 /* Absolute NIC-memory read (not a scratch offset): rxmbuf etc. */
 #define NIC_MEM(addr)     (*(volatile uint32_t *)(uint32_t)(addr))

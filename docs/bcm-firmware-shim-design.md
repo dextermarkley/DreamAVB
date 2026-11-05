@@ -673,3 +673,35 @@ skip b19 / pass b18, head `(peek>>9)&0x1ff`).
    it `HTX2B_ENABLE`); GRC_MODE is currently `0x041b0034` with that bit clear.
 3. Connecting the ring to the gPTP daemon: match on sequenceId +
    messageType, and extend `eav_lo` to 64 bits from `EAV_REF_CLK_MSB`.
+
+### 2026-11-05 — eav_mode_enable experiment wedged the EAV clock; interlock arming removed
+
+Tried GRC_MODE bit 18 (ThunderGate `eav_mode_enable` / tg3 `HTX2B_ENABLE`,
+0x00040000) plus arming `RX_PTP_CTL = V2_L2 | ALL_V2 | HWTS_INTERLOCK` from the
+core, to get the MAC's own RX_TSTAMP latch (0x6b0) working. Result:
+
+- The MAC latch still never fired: RX_TSTAMP stayed 0, PTPSTAT never set. The
+  tg3-documented MAC RX-PTP path is simply not wired on this 57766-class part
+  (matches Phase 0 and Linux never setting PTP_CAPABLE for it).
+- **It wedged the EAV reference-clock read.** 0x6900/0x6904 now read 0 and
+  won't accept writes (SetClock's stop/write/resume leaves CTL and LSB at 0),
+  from BOTH the host register window AND the core's own `REG(0x6900)` (the
+  stamp ring's `eav_lo` reads 0 for every frame). The underlying counter is
+  still running — the TX latch (0x5c0/0x5c4) reads a live, advancing ~28902 s
+  value in the same timebase — so only the 0x6900 read path is frozen.
+- A full `datapath down/up` does NOT recover it, and that path does a real
+  core-clock reset (GRC_MISC_CFG CORECLK_RESET + bootcode ~MAGIC handshake).
+  So the time-sync block is in the always-on power domain; recovery needs a
+  Thunderbolt power cycle (unplug/replug the adapter).
+
+Cause: `HWTS_INTERLOCK` freezes the EAV clock read until a captured timestamp's
+MSB is read to release it; the committed stamper armed it but read only the
+LSB, so the read stayed interlocked. Combined with the eav_mode_enable write,
+the block latched in a state a chip reset doesn't clear.
+
+Fix (this commit): the stamper no longer arms RX_PTP_CTL. It writes
+`RX_PTP_CTL = 0` and reads the RX_TSTAMP and EAV pairs (LSB then MSB) to flush
+any pending interlock, then uses the free-running EAV clock as the stamp
+source. This prevents recurrence, but does not un-wedge an already-frozen
+block — that still needs a replug. The earlier working stamp results
+(1 s deltas, forwarding) stand; they were taken before this experiment.

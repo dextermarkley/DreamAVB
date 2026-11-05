@@ -122,6 +122,12 @@ enum Cmd {
         #[arg(long, default_value_t = 0x300)]
         end: u32,
     },
+    /// Load the NIC clock through the dext's SetClock sequence (stop, write,
+    /// resume), then sample it twice to confirm it advances.
+    SetClock {
+        #[arg(long)]
+        ns: u64,
+    },
     /// info, clock 10 s, adjfreq +-100000 ppb, datapath up, rx-ptp 10 s, pdelay 30, datapath down.
     All,
 }
@@ -932,6 +938,14 @@ fn cmd_stamp_watch(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()
     }
     let mac_ts = dev.read_core_mem(0x0800_BFEC)?;
     println!("  last RX_TSTAMP_LSB seen by core: 0x{mac_ts:08x}");
+    let (grc_before, grc_after, ptpctl) = (
+        dev.read_core_mem(0x0800_BFE0)?,
+        dev.read_core_mem(0x0800_BFE4)?,
+        dev.read_core_mem(0x0800_BFE8)?,
+    );
+    println!(
+        "  core view: GRC_MODE 0x{grc_before:08x} -> 0x{grc_after:08x}, RX_PTP_CTL after write 0x{ptpctl:08x}"
+    );
     if peeks == 0 {
         println!("=> no RDIQ events: the receive rule did not route gPTP to the core.");
     } else if count == 0 {
@@ -1439,6 +1453,19 @@ fn main() -> Result<()> {
         Cmd::StampWatch { seconds } => cmd_stamp_watch(&dev, json, seconds),
         Cmd::RxTstampPoll { seconds } => cmd_rx_tstamp_poll(&dev, json, seconds),
         Cmd::SramDump { start, end } => cmd_sram_dump(&dev, json, start, end),
+        Cmd::SetClock { ns } => {
+            let back = dev.set_clock(ns)?;
+            let a = dev.read_clock(1)?[0];
+            nap(Duration::from_millis(100));
+            let b = dev.read_clock(1)?[0];
+            println!(
+                "set_clock {ns}: readback {back}; samples {} -> {} ({} ns over ~100 ms)",
+                a.eav_ns,
+                b.eav_ns,
+                b.eav_ns.wrapping_sub(a.eav_ns) as i64
+            );
+            Ok(())
+        }
         Cmd::All => cmd_all(&dev, json),
     }
 }
