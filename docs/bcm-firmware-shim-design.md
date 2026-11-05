@@ -740,3 +740,32 @@ I210 only and uses `PortConfig::i210`. A BCM run needs NIC selection plus a
 calibrated BCM `LatencyProfile` — and the RX stamp is taken at RDIQ service
 time (not MAC ingress), so its rx-latency constant must be measured on hardware
 once the clock is back. Left as a follow-up rather than shipped untuned.
+
+### 2026-11-05 — Validated RX stamping on hardware; fixed a TX-timestamp conflict
+
+After two replugs (to recover the wedged EAV clock and to bind the new dext),
+the stamp ring + dext attach work end to end:
+
+- `rx-ptp` shows **has_ts=1** on every gPTP frame, with `hw_ts` deltas of
+  ~1,000,200,000 ns matching the 16R's 1 s Pdelay cadence. (A 2^32 ns wrap
+  artifact appears on the first sample after load — the EAV LSB wraps every
+  ~4.29 s; the daemon unwraps with `stats::unwrap32`, and the steady-state
+  interval is correct.)
+
+**TX-timestamp conflict found and fixed.** With the stamper active, `pdelay`
+TX timestamps timed out (0/N), while they latched 3/3 with `AVB_SKIP_STAMPER`
+(no firmware → no ring reads). Cause: the stamp ring is only reachable through
+the **config-space register window** (0x78/0x80) — the memory window (0x7c/0x84)
+reads garbage at 0x30000, so it does not alias the scratch. A config-space
+indirect access landing in the ~13 us TX_TSTAMP latch window corrupts the
+latch, and `rxCpuStampReady` probed the DONE signature on every 2 ms harvest,
+reliably clobbering it. Fix: `drainReturnRing` now short-circuits ALL ring
+reads while `v->tsPending` (a timestamped TX is outstanding), so no config-space
+access occurs in the latch window. The firmware keeps stamping into the
+256-entry ring, so frames are picked up on a later harvest once tsPending
+clears. TX timestamps latch within ~13 us (Phase 0 G4), so RX stamping defers
+only briefly.
+
+Pending validation of the fix: dext 308.17.16 activated; needs the device to
+re-enumerate (replug) to bind, then `pdelay` should show BOTH t1 (TX) and t4
+(RX) → a complete exchange with a hardware link delay.

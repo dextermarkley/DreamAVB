@@ -1097,7 +1097,14 @@ static bool drainReturnRing(IV * v, const volatile RxBd * ret, uint32_t * consp,
 {
     bool reposted = false;
     uint32_t cons = *consp;
-    const bool stampReady = rxCpuStampReady(v);
+    // Reading the RX-CPU stamp ring goes through the config-space register
+    // window, and a config-space indirect access landing in the ~13 us window
+    // after a TX doorbell corrupts the MAC's TX_TSTAMP latch. While a
+    // timestamped TX is outstanding, skip ALL ring reads (short-circuit so not
+    // even the DONE-signature probe runs); the firmware keeps stamping into the
+    // 256-entry ring, so the frame is picked up on a later harvest once the TX
+    // timestamp has latched and tsPending clears.
+    const bool stampReady = !v->tsPending && rxCpuStampReady(v);
     while (cons != hwProd && ok(v)) {
         RxBd bd;
         bd.addrHi = ret[cons].addrHi;
