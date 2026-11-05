@@ -351,3 +351,36 @@ Findings:
   (and 0xd20/0x5c8) is the next and most likely hypothesis.
 
 Shim rebuilt to 388 bytes; rodata table verified against the trace.
+
+### Rebuilt-classifier hardware run (2026-11-05): still no timestamp
+
+Loaded the rebuilt shim (388 bytes, Apple's exact classifier sequence). Shim ran
+(`SHM1`/`DONE`, heartbeat climbing), but `rx-ptp` still shows
+`type_flags=0x0004 has_ts=0` on every Pdelay_Req. So an exact classifier replay,
+from the core, is **not sufficient** to arm the capture. This narrows it hard:
+
+- The documented tg3 path our harvest reads (RX_PTP_CTL 0x6c8 + descriptor
+  PTPSTAT 0x0210 + RX_TSTAMP 0x6b0/0x6b4) does not engage on the 57766: 0x6c8 is
+  inert (reads 0 from host and after a core write), and no PTPSTAT bit ever
+  appears. This is consistent with Linux tg3 never marking the 57766
+  `PTP_CAPABLE` -- the register-driven RX-PTP mechanism is simply not wired on
+  this variant.
+- Apple's working path does NOT use 0x6c8. It uses the classifier PLUS the
+  realtime-AVB receive queue that `setupAVB` builds through IOEthernetController
+  (`setNumberOfRealtimeReceiveQueues` / `createRealtimeAVBPacketPool`, 125/250 us
+  latencies) and the `0xd20`/`0x5c8` DMA writes computed from that queue's
+  buffers. The timestamp is almost certainly delivered through that realtime
+  queue's own descriptors, not the standard RX BD our harvest reads.
+
+So the wall is specific and now well-understood: on the 57766 the RX timestamp
+rides Apple's realtime-AVB-queue machinery (a kernel IOEthernetController
+subsystem), not the public tg3 register path. Replicating it clean-room means
+reverse-engineering that queue's descriptor format and the superclass framework
+writes -- a large effort against undocumented Apple AVB internals, well beyond
+the classifier.
+
+Cheap next probe before any of that: poll RX_TSTAMP 0x6b0/0x6b4 directly during
+gPTP traffic. If it advances, the capture hardware IS latching and only the
+delivery/flagging differs (recoverable); if it stays put, the capture never
+arms without the realtime queue. That one read decides whether to go deeper or
+stop with the I210 as the shipping timestamping NIC.
