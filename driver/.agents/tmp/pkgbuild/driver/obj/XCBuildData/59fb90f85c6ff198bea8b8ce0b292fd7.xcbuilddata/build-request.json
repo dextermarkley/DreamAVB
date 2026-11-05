@@ -1,0 +1,70 @@
+{
+  "buildCommand" : {
+    "command" : "build",
+    "skipDependencies" : false,
+    "style" : "buildOnly"
+  },
+  "configuredTargets" : [
+    {
+      "guid" : "8156ee0d85c0abfc040acc82773a1f7de4fb689b42415201162728a2269ffdd3"
+    }
+  ],
+  "containerPath" : "/Users/dexter/AVB-Audio/driver/AVBBcmDriver.xcodeproj",
+  "continueBuildingAfterErrors" : false,
+  "dependencyScope" : "workspace",
+  "enableIndexBuildArena" : false,
+  "hideShellScriptEnvironment" : false,
+  "parameters" : {
+    "action" : "build",
+    "activeArchitecture" : "undefined_arch",
+    "activeRunDestination" : {
+      "disableOnlyActiveArch" : true,
+      "hostTargetedPlatform" : null,
+      "platform" : "driverkit",
+      "sdk" : "driverkit25.5",
+      "sdkVariant" : "driverkit",
+      "supportedArchitectures" : [
+        "arm64",
+        "arm64e",
+        "x86_64",
+        "x86_64h"
+      ],
+      "targetArchitecture" : "undefined_arch"
+    },
+    "arenaInfo" : {
+      "buildIntermediatesPath" : "/Users/dexter/AVB-Audio/.agents/tmp/DerivedData/Build/Intermediates.noindex",
+      "buildProductsPath" : "/Users/dexter/AVB-Audio/.agents/tmp/DerivedData/Build/Products",
+      "derivedDataPath" : "/Users/dexter/AVB-Audio/.agents/tmp/DerivedData",
+      "indexDataStoreFolderPath" : "/Users/dexter/AVB-Audio/.agents/tmp/DerivedData/Index.noindex/DataStore",
+      "indexEnableDataStore" : true,
+      "indexPCHPath" : "/Users/dexter/AVB-Audio/.agents/tmp/DerivedData/Index.noindex/PrecompiledHeaders",
+      "pchPath" : "/Users/dexter/AVB-Audio/.agents/tmp/DerivedData/Build/Intermediates.noindex/PrecompiledHeaders"
+    },
+    "configurationName" : "Debug",
+    "overrides" : {
+      "commandLine" : {
+        "table" : {
+          "CODE_SIGNING_ALLOWED" : "NO",
+          "OBJROOT" : ".agents/tmp/pkgbuild/driver/obj",
+          "SDKROOT" : "driverkit25.5",
+          "SYMROOT" : ".agents/tmp/pkgbuild/driver"
+        }
+      },
+      "synthesized" : {
+        "table" : {
+          "ACTION" : "build",
+          "ENABLE_PREVIEWS" : "NO",
+          "ENABLE_XOJIT_PREVIEWS" : "YES",
+          "ONLY_ACTIVE_ARCH" : "YES",
+          "TOOLCHAINS" : "com.apple.dt.toolchain.Metal.32023.883 $(inherited)"
+        }
+      }
+    }
+  },
+  "schemeCommand" : "launch",
+  "showNonLoggedProgress" : true,
+  "useDryRun" : false,
+  "useImplicitDependencies" : true,
+  "useLegacyBuildLocations" : false,
+  "useParallelTargets" : true
+}

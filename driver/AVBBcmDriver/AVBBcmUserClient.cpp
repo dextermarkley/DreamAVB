@@ -74,6 +74,9 @@ const IOUserClientMethodDispatch kDispatchLoadCoreImage =
 const IOUserClientMethodDispatch kDispatchReadCoreMem =
     /* 17 ReadCoreMem: scalarIn virt_addr, scalarOut word */
     {dispatchToDriver, 0, 1, 0, 1, 0};
+const IOUserClientMethodDispatch kDispatchReadSram =
+    /* 18 ReadSram: scalarIn nic_sram_addr, scalarOut word */
+    {dispatchToDriver, 0, 1, 0, 1, 0};
 
 }  // namespace
 
@@ -143,6 +146,9 @@ AVBBcmUserClient::ExternalMethod(uint64_t selector,
     }
     if (selector == kAvbSelReadCoreMem) {
         return super::ExternalMethod(selector, arguments, &kDispatchReadCoreMem, this, nullptr);
+    }
+    if (selector == kAvbSelReadSram) {
+        return super::ExternalMethod(selector, arguments, &kDispatchReadSram, this, nullptr);
     }
     if (selector >= kAvbSelBaseCount) {
         // 10..15 (shared rings, StepClock, counters) are I210-only.

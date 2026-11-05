@@ -106,6 +106,15 @@ enum Cmd {
         #[arg(long, default_value_t = 10.0)]
         seconds: f64,
     },
+    /// Dump a range of NIC SRAM (default the send/return-ring RCB region
+    /// 0x100-0x300) via the memory window. For capturing Apple's realtime-queue
+    /// ring control blocks.
+    SramDump {
+        #[arg(long, default_value_t = 0x100)]
+        start: u32,
+        #[arg(long, default_value_t = 0x300)]
+        end: u32,
+    },
     /// info, clock 10 s, adjfreq +-100000 ppb, datapath up, rx-ptp 10 s, pdelay 30, datapath down.
     All,
 }
@@ -784,6 +793,31 @@ fn cmd_core_load_shim(dev: &Device, json: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+fn cmd_sram_dump(dev: &Device, json: Option<&Path>, start: u32, end: u32) -> Result<()> {
+    let start = start & !3;
+    let end = end.max(start + 4);
+    let mut words = Vec::new();
+    let mut addr = start;
+    while addr < end {
+        let w = dev.read_sram(addr)?;
+        words.push(w);
+        if w != 0 {
+            println!("  0x{addr:04x}: 0x{w:08x}");
+        }
+        addr += 4;
+    }
+    println!(
+        "SRAM 0x{start:04x}-0x{end:04x}: {} words, {} non-zero",
+        words.len(),
+        words.iter().filter(|&&w| w != 0).count()
+    );
+    emit(
+        json,
+        "sram_dump",
+        &serde_json::json!({ "start": start, "end": end, "words": words }),
+    )
+}
+
 fn cmd_rx_tstamp_poll(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()> {
     let info = dev.info()?;
     if info.stage != abi::STAGE_DATAPATH {
@@ -1273,6 +1307,7 @@ fn main() -> Result<()> {
         Cmd::CoreSelftest => cmd_core_selftest(&dev, json),
         Cmd::CoreLoadShim => cmd_core_load_shim(&dev, json),
         Cmd::RxTstampPoll { seconds } => cmd_rx_tstamp_poll(&dev, json, seconds),
+        Cmd::SramDump { start, end } => cmd_sram_dump(&dev, json, start, end),
         Cmd::All => cmd_all(&dev, json),
     }
 }

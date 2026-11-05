@@ -1672,6 +1672,14 @@ AVBBcmDriver::HandleUserMethod(uint64_t selector, IOUserClientMethodArguments * 
         return ret;
     }
 
+    case kAvbSelReadSram: {
+        if (!ok(v)) {
+            return kIOReturnNotReady;
+        }
+        a->scalarOutput[0] = sramRead(v, static_cast<uint32_t>(a->scalarInput[0]));
+        return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
+    }
+
     default:
         return kIOReturnUnsupported;
     }

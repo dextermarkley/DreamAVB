@@ -110,6 +110,8 @@ pub mod sel {
     pub const LOAD_CORE_IMAGE: u32 = 16;
     /// BCM only: in virtual scratch address (0x0800xxxx); out one word.
     pub const READ_CORE_MEM: u32 = 17;
+    /// BCM only: in NIC SRAM address; out one word (via the memory window).
+    pub const READ_SRAM: u32 = 18;
     /// Selectors every NIC dext implements (the BCM dext: only these).
     /// 32..47 are reserved for the talker path.
     pub const BASE_COUNT: u32 = 10;

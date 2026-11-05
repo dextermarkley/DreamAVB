@@ -57,6 +57,7 @@ enum AvbSelector : uint32_t {
     // untouched. The BCM userclient routes these two explicitly.
     kAvbSelLoadCoreImage    = 16, // BCM: in: load_addr + struct image bytes  out: halted, mode
     kAvbSelReadCoreMem      = 17, // BCM: in: scratch addr (0x0800xxxx)        out: word
+    kAvbSelReadSram         = 18, // BCM: in: NIC SRAM addr   out: word (memory window)
     // 32..47 reserved: talker TX ring / Qav (not built in Phase 1a)
 };
 

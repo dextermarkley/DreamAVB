@@ -414,6 +414,20 @@ impl Device {
         Ok(out[0] as u32)
     }
 
+    /// BCM: read one word of NIC SRAM by address (via the memory window).
+    pub fn read_sram(&self, nic_addr: u32) -> Result<u32> {
+        let mut out = [0u64; 1];
+        self.call(
+            sel::READ_SRAM,
+            &[u64::from(nic_addr)],
+            &[],
+            &mut out,
+            None,
+            "ReadSram",
+        )?;
+        Ok(out[0] as u32)
+    }
+
     /// Drain up to `max` frames whose ethertype matches (0 = all).
     pub fn poll_rx(&self, ethertype: u16, max: usize) -> Result<Box<RxBatch>> {
         let mut batch = Box::<RxBatch>::default();
