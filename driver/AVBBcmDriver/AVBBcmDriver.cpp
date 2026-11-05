@@ -260,10 +260,16 @@ static void regWinWrite(IV * v, uint32_t winAddr, uint32_t word)
 
 static uint32_t regWinRead(IV * v, uint32_t winAddr)
 {
+    // The register-window data port round-trips the written value unchanged
+    // through ConfigurationRead32/Write32 (confirmed on hardware: writing a
+    // big-endian-assembled word reads back identical, and the RX CPU fetches
+    // it correctly). No byte swap here -- ThunderGate's htonl compensated for
+    // its own Python/userclient layer, which DriverKit config access does not
+    // impose.
     cfgWr32(v, bcm::kRegWinBase, winAddr);
     const uint32_t raw = cfgRd32Raw(v, bcm::kRegWinData);
     cfgWr32(v, bcm::kRegWinBase, 0);
-    return __builtin_bswap32(raw);
+    return raw;
 }
 
 static uint64_t nsToMach(IV * v, uint64_t ns)
