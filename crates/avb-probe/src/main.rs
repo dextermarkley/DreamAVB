@@ -98,6 +98,13 @@ enum Cmd {
     /// the RX CPU after `datapath up`, confirm it ran, and report whether
     /// RX_PTP_CTL now holds the enable. Follow with `rx-ptp`.
     CoreLoadShim,
+    /// BCM: load the frame-stamping RX-CPU firmware and watch its scratch
+    /// diagnostics while gPTP flows — valid RDIQ events (routing), last
+    /// ethertype (mbuf access), and the per-frame timestamp ring (stamping).
+    StampWatch {
+        #[arg(long, default_value_t = 12.0)]
+        seconds: f64,
+    },
     /// M3 (BCM): poll RX_TSTAMP (0x6b0/0x6b4) directly during gPTP traffic to
     /// tell whether the hardware capture latches at all, independent of the RX
     /// descriptor flag path. Reports the EAV clock (0x6900) as a liveness
@@ -818,6 +825,93 @@ fn cmd_sram_dump(dev: &Device, json: Option<&Path>, start: u32, end: u32) -> Res
     )
 }
 
+fn cmd_stamp_watch(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()> {
+    let info = dev.info()?;
+    if info.stage != abi::STAGE_DATAPATH {
+        bail!(
+            "datapath is not up (stage {}); run `avb-probe datapath up` first",
+            abi::stage_name(info.stage)
+        );
+    }
+    // Stamper scratch diagnostics (driver/bcm-fw/regs.h).
+    const TS_PROD: u32 = 0x0800_BFF0;
+    const TS_COUNT: u32 = 0x0800_BFF4;
+    const TS_PEEKS: u32 = 0x0800_BFF8;
+    const TS_LASTETYPE: u32 = 0x0800_BFFC;
+    const TS_RING: u32 = 0x0800_C000;
+
+    let mut image = BCMFW_IMAGE.to_vec();
+    while !image.len().is_multiple_of(4) {
+        image.push(0);
+    }
+    let (halted, mode) = dev.load_core_image(abi::RX_CPU_SCRATCH_BASE, &image)?;
+    println!(
+        "stamper loaded: halted={halted} mode=0x{mode:08x} ({} bytes)",
+        image.len()
+    );
+    let run = dev.read_core_mem(0x0800_F000)?;
+    let done = dev.read_core_mem(0x0800_F004)?;
+    println!(
+        "  started={} config_applied={}",
+        run == 0x5348_4D31,
+        done == 0x444F_4E45
+    );
+
+    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    let (mut last_peeks, mut last_count) = (u32::MAX, u32::MAX);
+    while Instant::now() < end && !interrupted() {
+        let peeks = dev.read_core_mem(TS_PEEKS)?;
+        let count = dev.read_core_mem(TS_COUNT)?;
+        let etype = dev.read_core_mem(TS_LASTETYPE)?;
+        if peeks != last_peeks || count != last_count {
+            println!("  rdiq_events={peeks}  gptp_stamped={count}  last_ethertype=0x{etype:04x}");
+            last_peeks = peeks;
+            last_count = count;
+        }
+        nap(Duration::from_millis(200));
+    }
+
+    let prod = dev.read_core_mem(TS_PROD)?;
+    let peeks = dev.read_core_mem(TS_PEEKS)?;
+    let count = dev.read_core_mem(TS_COUNT)?;
+    let etype = dev.read_core_mem(TS_LASTETYPE)?;
+    println!(
+        "final: rdiq_events={peeks} gptp_stamped={count} last_ethertype=0x{etype:04x} prod={prod}"
+    );
+    // Dump the last few timestamp-ring entries.
+    // Always dump fixed ring slots 0 and 1 (diagnostic builds park register
+    // read-backs there regardless of the producer index).
+    let slot0 = dev.read_core_mem(TS_RING)?;
+    let slot0b = dev.read_core_mem(TS_RING + 4)?;
+    let slot1 = dev.read_core_mem(TS_RING + 8)?;
+    let slot1b = dev.read_core_mem(TS_RING + 12)?;
+    println!("  slot0: 0x{slot0:08x} 0x{slot0b:08x}   slot1: 0x{slot1:08x} 0x{slot1b:08x}");
+
+    let mut ring = Vec::new();
+    let n = prod.min(8);
+    for i in 0..n {
+        let slot = (prod - 1 - i) & (256 - 1);
+        let ts = dev.read_core_mem(TS_RING + slot * 8)?;
+        let seq = dev.read_core_mem(TS_RING + slot * 8 + 4)?;
+        println!("  ring[{slot}]: seq={seq} ts=0x{ts:08x}");
+        ring.push((seq, ts));
+    }
+    if peeks == 0 {
+        println!("=> no RDIQ events: the receive rule did not route gPTP to the core.");
+    } else if count == 0 {
+        println!(
+            "=> events but no gPTP match: mbuf/ethertype access is off (last_ethertype above)."
+        );
+    } else {
+        println!("=> STAMPING: the core saw {count} gPTP frames and recorded timestamps.");
+    }
+    emit(
+        json,
+        "stamp_watch",
+        &serde_json::json!({ "peeks": peeks, "count": count, "last_ethertype": etype, "prod": prod, "ring": ring }),
+    )
+}
+
 fn cmd_rx_tstamp_poll(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()> {
     let info = dev.info()?;
     if info.stage != abi::STAGE_DATAPATH {
@@ -1306,6 +1400,7 @@ fn main() -> Result<()> {
         Cmd::Pdelay { count } => cmd_pdelay(&dev, json, count),
         Cmd::CoreSelftest => cmd_core_selftest(&dev, json),
         Cmd::CoreLoadShim => cmd_core_load_shim(&dev, json),
+        Cmd::StampWatch { seconds } => cmd_stamp_watch(&dev, json, seconds),
         Cmd::RxTstampPoll { seconds } => cmd_rx_tstamp_poll(&dev, json, seconds),
         Cmd::SramDump { start, end } => cmd_sram_dump(&dev, json, start, end),
         Cmd::All => cmd_all(&dev, json),

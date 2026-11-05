@@ -524,3 +524,67 @@ queue from first principles rather than copy Apple. That is a large, open-ended
 effort. Everything up to it is built and proven: feasibility, toolchain, the
 RX-CPU load path (M1), the BD.reserved timestamp read, return ring 1, and the
 full classifier replay.
+
+---
+
+## 2026-11-04 — Own-firmware frame-stamping: hardware result (RX-CPU not in the RX datapath)
+
+After the capture/replay paths were ruled out, we built our own clean-room
+frame-stamping RX-CPU firmware (`driver/bcm-fw/`, `stamp-watch` probe command)
+and tested it on hardware against the live 16R gPTP source. The firmware's job:
+route gPTP (0x88F7) to the RX CPU with a basic EMAC receive rule, wake per frame
+on the RDIQ event, read the EAV clock, and write a per-frame timestamp to a
+scratch ring the host reads with `ReadCoreMem`.
+
+### What is proven to WORK (hardware)
+- **RX-CPU executes our code.** `started`/`config_applied` signatures (SHM1/DONE
+  at scratch 0xF000/0xF004) read back every run.
+- **RX-CPU reads chip registers live.** The EAV clock (`REG(0xC0000000+0x6900)`)
+  returns a large, monotonically advancing counter (e.g. two reads 200k-spin
+  apart differed by ~104 ticks; later 0xca77b938). So `REG(0xC0000000+off)` is
+  the correct register view and EAV timestamping is available to the core.
+- **Scratch-ring delivery round-trips perfectly.** A sentinel build wrote
+  0x11111111/0x22222222/0x33333333/0x44444444 to the TS_* scratch offsets
+  (0xBFF0..0xBFFC) and the host read them back exactly. The earlier "garbage"
+  was the real loop self-corrupting on an empty/garbage FTQ, not a plumbing bug.
+
+### What is BLOCKED (hardware)
+- **`activate_rxcpu` receive rules do not divert frames to the RX CPU.** With a
+  rule set (confirmed stuck: mask_value 0xFFFF88F7; control 0x00080025 for an
+  offset-0 dest-MAC match), the FTQ RDIQ count (0x5CF4) and peek (0x5CFC) stay
+  **0**, and gPTP **keeps reaching the host ring** (`rx-ptp` shows ~21
+  Pdelay_Req/s from 00:0a:92:ff:fe:03:3b:a9 with the rule active). The frames
+  are DMA'd to the host return ring by hardware and are never made visible to
+  the core.
+
+### Register-format finding (BCM57762 vs ThunderGate's 5719)
+- The rule control register has **bits 27 and 28 hardwired 0** (writing
+  0xFFFFFFFF reads back 0xE7FFFFFF). ThunderGate's 5719 treats b24–31 as an
+  8-bit `offset` field, so `offset=12` (0x0C000000, needs bit 27) cannot be
+  encoded here — it reads back as 4. Our dext already uses the Linux tg3 rule
+  format (`kRcvRule0Default=0xc2000000`, `kRcvRule1Default=0x86000004`,
+  `kRcvRuleDisableMask=0x7fffffff`), which differs from the ThunderGate
+  bitfield. Matching the gPTP multicast dest MAC at offset 0 sidesteps the dead
+  bits — but still routes nothing, because the blocker above is not the offset.
+
+### Root cause
+On the BCM57762 in our **hardware-DMA** datapath, the RX CPU is **not the
+receive processor**: halting/replacing it does not stop host RX, and the RDIQ is
+not populated for the core. ThunderGate's RDIQ-peek model works because its
+firmware does a full **cold bring-up** where the core owns the entire receive
+path (and forwards frames to the host itself via WDMA + return rings). The
+`activate_rxcpu` rule bit is inert in hardware-DMA mode.
+
+### Forward options
+1. **Full receive-processor firmware** (ThunderGate model): the RX CPU owns RX —
+   drains the RDIQ, gathers mbuf clusters, stamps gPTP, and re-DMAs every frame
+   to the host return ring via WDMA. This is a much larger firmware (mbuf
+   walk, WDMA/return-BD management, net-rx re-injection) and must not regress
+   the host datapath. It is the only identified path that makes RX-CPU
+   interception work on this chip.
+2. **Stop pursuing BCM RX timestamps.** The I210 path already does full gPTP +
+   streaming to the 16R. The BCM (Apple Thunderbolt adapter) remains usable for
+   non-timestamped traffic; gPTP stays on the I210.
+
+The stamper firmware (`driver/bcm-fw/shim.c`) is kept as the correct stamping
+logic, with a header note marking it blocked pending option 1's routing work.
