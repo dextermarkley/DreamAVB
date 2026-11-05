@@ -857,9 +857,23 @@ fn cmd_stamp_watch(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()
         done == 0x444F_4E45
     );
 
+    // Drain anything the host ring held from before the load.
+    let _ = dev.poll_rx(ptp::ETHERTYPE_PTP, abi::RX_BATCH_MAX)?;
+
     let end = Instant::now() + Duration::from_secs_f64(seconds);
     let (mut last_peeks, mut last_count) = (u32::MAX, u32::MAX);
+    // Host-side view over the same window: which gPTP sequenceIds reach the
+    // host ring, and how many non-PTP frames (`dropped`) still arrive.
+    let mut host_seqs: Vec<u16> = Vec::new();
+    let mut host_other = 0u64;
     while Instant::now() < end && !interrupted() {
+        let batch = dev.poll_rx(ptp::ETHERTYPE_PTP, abi::RX_BATCH_MAX)?;
+        host_other += u64::from(batch.dropped);
+        for e in batch.entries() {
+            if let Some(m) = ptp::parse_frame(e.bytes()) {
+                host_seqs.push(m.seq);
+            }
+        }
         let peeks = dev.read_core_mem(TS_PEEKS)?;
         let count = dev.read_core_mem(TS_COUNT)?;
         let etype = dev.read_core_mem(TS_LASTETYPE)?;
@@ -870,6 +884,11 @@ fn cmd_stamp_watch(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()
         }
         nap(Duration::from_millis(200));
     }
+    println!(
+        "  host ring over the same window: {} gPTP frames {:?}, {host_other} non-PTP frames",
+        host_seqs.len(),
+        host_seqs
+    );
 
     let prod = dev.read_core_mem(TS_PROD)?;
     let peeks = dev.read_core_mem(TS_PEEKS)?;
@@ -892,10 +911,27 @@ fn cmd_stamp_watch(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()
     for i in 0..n {
         let slot = (prod - 1 - i) & (256 - 1);
         let ts = dev.read_core_mem(TS_RING + slot * 8)?;
-        let seq = dev.read_core_mem(TS_RING + slot * 8 + 4)?;
-        println!("  ring[{slot}]: seq={seq} ts=0x{ts:08x}");
-        ring.push((seq, ts));
+        let meta = dev.read_core_mem(TS_RING + slot * 8 + 4)?;
+        let (mtype, seq) = (meta >> 16, meta & 0xffff);
+        let mac = dev.read_core_mem(0x0800_D000 + slot * 4)?;
+        println!(
+            "  ring[{slot}]: ptp_type=0x{mtype:x} seq={seq} eav_lo=0x{ts:08x} mac_lo=0x{mac:08x} core-mac={} ns",
+            ts.wrapping_sub(mac) as i32
+        );
+        ring.push((meta, ts));
     }
+    // Spacing between consecutive stamps, in EAV ticks (ns).
+    for w in ring.windows(2) {
+        let d = w[0].1.wrapping_sub(w[1].1);
+        println!(
+            "  delta seq {}->{}: {} ns",
+            w[1].0 & 0xffff,
+            w[0].0 & 0xffff,
+            d
+        );
+    }
+    let mac_ts = dev.read_core_mem(0x0800_BFEC)?;
+    println!("  last RX_TSTAMP_LSB seen by core: 0x{mac_ts:08x}");
     if peeks == 0 {
         println!("=> no RDIQ events: the receive rule did not route gPTP to the core.");
     } else if count == 0 {

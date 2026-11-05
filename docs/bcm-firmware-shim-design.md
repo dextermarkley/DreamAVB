@@ -625,3 +625,51 @@ obtain a capability the I210 already provides cleanly.
 16R already work fully on the Intel I210. Keep the Broadcom adapter for
 non-timestamped use; leave this firmware and its probes in the tree as the
 documented record of why the on-core interception path is closed on this chip.
+
+### 2026-11-05 — Bit-order correction: the stamper WORKS (supersedes the two sections above)
+
+The "RX-CPU not in the receive path" and "offset bits 27/28 hardwired" results
+above are **wrong**. Both came from our own encoding bug.
+
+**Cause.** ThunderGate's register headers are C bitfields built for big-endian
+MIPS. GCC lays bitfields out per the target ABI, and on this target the first
+listed field is the most significant bit. We decoded them LSB-first. Checks:
+- `mips-elf-gcc -mtigon` compiles `enable=1` to `0x80000000`,
+  `activate_rxcpu=1` to `0x20000000` and `offset=12` to `0x0000000C`.
+- Linux tg3 writes rule 0 as `0xc2000000` and disables rules with
+  `RCV_RULE_DISABLE_MASK 0x7fffffff`, so enable is bit 31.
+- Our readback of `0xFFFFFFFF` → `0xE7FFFFFF` clears exactly the two
+  `reserved:1` fields at bits 28/27.
+
+So our rule control `0x0C080025` had **enable clear**, and the event-enable,
+RDIQ-peek valid/skip/pass and head-pointer constants were also wrong. The
+empty FTQs and the silent EMAC event were exactly what a disabled rule
+produces. `driver/bcm-fw/regs.h` now uses MSB-first constants (rule
+`0xA400010C`, event emac `0x02000000` / rdiq `0x00000100`, peek valid b20 /
+skip b19 / pass b18, head `(peek>>9)&0x1ff`).
+
+**Hardware result with the corrected constants** (16R live, `stamp-watch`):
+- The core receives every gPTP frame: ethertype `0x88f7`, PTP messageType 2
+  (Pdelay_Req), consecutive sequenceIds, no gaps.
+- Consecutive EAV stamps are 1,000,200,000–1,000,202,300 ns apart for the 16R's
+  1 s Pdelay_Req interval, with ~2 µs spread.
+- **Forwarding works with `pass`.** With RDIQ `pass` (b18) the frame continues
+  to normal receive placement: the same sequenceIds the core stamped also
+  arrived on the host ring. With `skip` + mbuf-cluster free (`0x5CC8`) the core
+  consumes the frame and the host never sees it. The default build uses
+  `pass`; `-DFWD_CONSUME` selects the other.
+- No non-PTP frames reached the host during these runs, even after a
+  `datapath down/up` with no firmware loaded. That is the 16R's traffic at
+  the time (no audio stream), not a firmware stall.
+
+**Still open.**
+1. The stamp is the EAV clock read when the core services the RDIQ, so it
+   includes queueing latency. The ~2 µs spread above is an upper bound on
+   that jitter for 1 frame/s. The I210 gives ns-level MAC stamps.
+2. The MAC's own latch (`RX_TSTAMP` 0x6b0/0x6b4) reads 0, and `RX_PTP_CTL`
+   (0x6c8) reads back 0 even right after the core writes `0x0480000f`. Either
+   the register is not writable from this context or it needs another enable.
+   ThunderGate's `grc_mode` names bit `0x00040000` `eav_mode_enable` (tg3 calls
+   it `HTX2B_ENABLE`); GRC_MODE is currently `0x041b0034` with that bit clear.
+3. Connecting the ring to the gPTP daemon: match on sequenceId +
+   messageType, and extend `eav_lo` to 64 bits from `EAV_REF_CLK_MSB`.

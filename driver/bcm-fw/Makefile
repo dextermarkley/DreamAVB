@@ -18,7 +18,7 @@ OBJCOPY := $(TOOLCHAIN)/bin/mips-elf-objcopy
 # Tigon MIPS: soft-float, no mul/div/unaligned, non-PIC, no abicalls (-mtigon).
 CFLAGS  := -mtigon -mips2 -march=r6000 -mfix-r4000 -msoft-float -G0 \
            -fno-pic -mno-abicalls -mno-llsc -ffreestanding -fno-builtin \
-           -fomit-frame-pointer -Os -Wall -Wextra -std=gnu11
+           -fomit-frame-pointer -Os -Wall -Wextra -std=gnu11 $(EXTRA_CFLAGS)
 LDFLAGS := -nostdlib -static -T image.ld --build-id=none
 
 OBJ := entry.o shim.o
