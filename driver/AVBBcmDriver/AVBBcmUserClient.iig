@@ -7,6 +7,7 @@
 
 #include <Availability.h>
 #include <DriverKit/IOUserClient.iig>
+#include <DriverKit/IOMemoryDescriptor.iig>
 
 class AVBBcmUserClient : public IOUserClient
 {
@@ -30,9 +31,20 @@ public:
                    OSObject * target,
                    void * reference) override;
 
+    virtual kern_return_t
+    CopyClientMemoryForType(uint64_t type, uint64_t * options, IOMemoryDescriptor ** memory) override;
+
     // Runs the call on the driver's default queue (see AVBBcmUserClient.cpp).
     kern_return_t
     Forward(IOUserClientMethodArguments * arguments) LOCALONLY;
+
+    // One RingAttach per connection (CopyClientMemoryForType must return the
+    // same descriptor per type for the life of a user client).
+    void
+    MarkRingsUsed() LOCALONLY;
+
+    bool
+    RingsUsed() LOCALONLY;
 };
 
 #endif /* AVBBcmUserClient_h */

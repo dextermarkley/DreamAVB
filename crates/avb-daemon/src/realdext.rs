@@ -53,9 +53,15 @@ impl RealDext {
         // Ask the dext what it implements. A failed GetInfo here is not fatal:
         // the stack reads info separately and exits on a real fault, so the
         // safe reading is "no batched selector" and the per-frame path.
+        // The BCM dext reports the shared ABI version but does not implement
+        // SendFrames (the I210-only batched selector), so it always takes the
+        // per-frame path.
         let send_frames = dev
             .info()
-            .map(|i| avb_dext::abi::abi_has_send_frames(i.abi_version))
+            .map(|i| {
+                avb_dext::abi::abi_has_send_frames(i.abi_version)
+                    && i.nic_kind != avb_dext::abi::NIC_BCM57762
+            })
             .unwrap_or(false);
         Self {
             dev,

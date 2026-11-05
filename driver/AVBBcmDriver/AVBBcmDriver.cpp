@@ -36,22 +36,29 @@
 #include <PCIDriverKit/PCIDriverKit.h>
 
 #include "AVBBcmDriver.h"
+#include "AVBBcmUserClient.h"
 #include "../AVBShared.h"
+#include "../AVBRxCommon.hpp"
 #include "Bcm57762Regs.h"
 #include "Tg3Logic.hpp"
 
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "AVBBcm: " fmt, ##__VA_ARGS__)
 
 using namespace tg3logic;
+using namespace avbrx;
 
 namespace {
 
-constexpr uint32_t kRxPosted      = 64;     // std RX buffers posted
+// 256 posted buffers hold ~16 ms of one 8 kpkt/s AAF stream, or ~2 ms of all
+// eight 16R streams, against a 1 ms harvest tick. The std ring holds 512 and
+// the return ring 1024, so both still exceed what is posted.
+constexpr uint32_t kRxPosted      = 256;    // std RX buffers posted
 constexpr uint32_t kRxBufSize     = 2048;   // per RX buffer (DMA size 1536)
 constexpr uint32_t kTxSlots       = 16;     // TX bounce buffers / max in flight
 constexpr uint32_t kTxBufSize     = 2048;
 constexpr uint32_t kSwRingSize    = 256;    // software RX ring (power of two)
-constexpr uint64_t kTimerPeriodNs = 2000000;      // 2 ms
+constexpr uint64_t kTimerPeriodNs = 1000000;      // 1 ms
+static_assert(kRxPosted < bcm::kStdRingSize && kRxPosted < bcm::kRxRetRingSize, "posted fits the rings");
 constexpr uint64_t kTxTsTimeoutNs = 300000000;    // 300 ms (tg3: 3 x 100 ms)
 constexpr uint64_t kLinkWaitMs    = 5000;
 
@@ -134,6 +141,23 @@ struct AVBBcmDriver_IVars {
     uint32_t swDropped;
 
     AvbRxBatch * batch;          // scratch for kAvbSelPollRx
+
+    // ABI v3 shared RX rings, same layout as the I210 dext (AVBShared.h).
+    // While attached and the datapath is up, the harvester classifies each
+    // frame (avbrx::classifyRx) into the control or audio ring instead of the
+    // software ring, and the daemon reads them zero-copy.
+    AVBBcmUserClient * owner;    // not retained; cleared by RingDetach/ClientGone
+    IOBufferMemoryDescriptor * rxMem;
+    IOBufferMemoryDescriptor * consumerMem;
+    uint8_t * rxVa;
+    AvbShmHeader * hdr;          // == rxVa while attached, else nullptr
+    AvbShmConsumer * cons;
+    uint32_t generation;         // RingAttach count since Start
+    uint64_t ctlHead;
+    uint64_t audioHead;
+    AvbStreamFilter filter;
+    bool producerRunning;
+    AvbCounters ctr;
 };
 
 using IV = AVBBcmDriver_IVars;
@@ -1108,6 +1132,73 @@ static void swPush(IV * v, const AvbRxEntry & e)
     v->swHead = ringNext(v->swHead, kSwRingSize);
 }
 
+// Per-harvest view of the shared rings: how many slots the producer may still
+// fill (validated against the client-writable consumer tails).
+struct RingTick {
+    bool ringMode;
+    uint64_t ctlFree;
+    uint64_t audioFree;
+};
+
+static RingTick ringTickBegin(IV * v)
+{
+    RingTick t{v->producerRunning && v->hdr != nullptr && v->cons != nullptr, 0, 0};
+    if (!t.ringMode) {
+        return t;
+    }
+    const uint64_t tailC = __atomic_load_n(&v->cons->ctl_tail, __ATOMIC_ACQUIRE);
+    const uint64_t tailA = __atomic_load_n(&v->cons->audio_tail, __ATOMIC_ACQUIRE);
+    const RingSpace c = ringFree(v->ctlHead, tailC, AVB_RX_CTL_SLOTS);
+    const RingSpace a = ringFree(v->audioHead, tailA, AVB_RX_AUDIO_SLOTS);
+    if (!c.valid || !a.valid) {
+        v->ctr.c[kAvbCtrConsumerIndexInvalid]++;
+    }
+    t.ctlFree = c.free;  // 0 (treated as full) when invalid
+    t.audioFree = a.free;
+    return t;
+}
+
+// Ring mode: classify the whole frame (the tag stays in the frame on this part:
+// RX_MODE KEEP_VLAN), then copy it into the control or audio ring. Drop-newest
+// on overrun, exactly as the I210 dext does.
+static void deliverRing(IV * v, RingTick * t, const uint8_t * frame, uint32_t flen, const AvbRxEntry & e)
+{
+    if (flen > AVB_RX_SLOT_DATA_MAX) {
+        v->ctr.c[kAvbCtrRxOversize]++;
+        return;
+    }
+    const RxVerdict verdict = classifyRx(frame, flen, v->mac, v->filter, false, 0);
+    if (!rxDelivered(verdict)) {
+        v->ctr.c[rxVerdictCounter(verdict)]++;
+        return;
+    }
+    const bool audio = verdict == RxVerdict::Stream;
+    uint64_t * freeSlots = audio ? &t->audioFree : &t->ctlFree;
+    uint64_t * head = audio ? &v->audioHead : &v->ctlHead;
+    if (*freeSlots == 0) {
+        v->ctr.c[audio ? kAvbCtrRingOverrunAudio : kAvbCtrRingOverrunCtl]++;
+        return;
+    }
+    const uint64_t base = audio ? AVB_RX_AUDIO_OFFSET : AVB_RX_CTL_OFFSET;
+    const uint64_t mask = (audio ? AVB_RX_AUDIO_SLOTS : AVB_RX_CTL_SLOTS) - 1;
+    auto * slot = reinterpret_cast<AvbRxSlot *>(v->rxVa + base + (*head & mask) * AVB_RX_SLOT_SIZE);
+    slot->hw_ts_ns = e.has_ts ? e.hw_ts : 0;
+    slot->harvest_mach = e.harvest_mach;
+    slot->index = *head;
+    slot->status_error = e.type_flags;
+    slot->len = static_cast<uint16_t>(flen);
+    slot->vlan_tci = 0;
+    slot->flags = static_cast<uint16_t>(rxVlanFlags(false, frame, flen) | (e.has_ts ? AVB_RXF_TS_HW : 0u));
+    slot->cls = static_cast<uint8_t>(verdict);
+    slot->pad0 = 0;
+    slot->desc_len = flen;
+    slot->clock_gen = 0;  // the BCM clock is never stepped (software GM offset in the daemon)
+    memcpy(slot->data, frame, flen);
+    (*head)++;
+    (*freeSlots)--;
+    v->ctr.c[rxVerdictCounter(verdict)]++;
+}
+
 // Read a little-endian u16 producer index from the status block at byte `off`.
 static uint32_t rxProducer(IV * v, uint32_t off)
 {
@@ -1118,7 +1209,8 @@ static uint32_t rxProducer(IV * v, uint32_t off)
 // Drain one RX return ring from *consp up to hwProd: decode each BD, attach the
 // hardware RX timestamp from its reserved field (Apple's path), copy the frame
 // and repost its std buffer. Returns whether any std buffer was reposted.
-static bool drainReturnRing(IV * v, const volatile RxBd * ret, uint32_t * consp, uint32_t hwProd)
+static bool drainReturnRing(IV * v, RingTick * tick, const volatile RxBd * ret, uint32_t * consp,
+                            uint32_t hwProd)
 {
     bool reposted = false;
     uint32_t cons = *consp;
@@ -1160,17 +1252,26 @@ static bool drainReturnRing(IV * v, const volatile RxBd * ret, uint32_t * consp,
             }
         }
         if (r.fromStdRing && r.stdIndex < kRxPosted) {
-            if (!r.error) {
-                e.len = r.len;
-                const uint32_t n = r.len < AVB_RX_COPY_BYTES ? r.len : AVB_RX_COPY_BYTES;
-                memcpy(e.data, v->rxBufs.va + uint64_t(r.stdIndex) * kRxBufSize, n);
+            v->ctr.c[kAvbCtrRxFrames]++;
+            if (r.error) {
+                v->ctr.c[kAvbCtrRxErrors]++;
+            } else {
+                const uint8_t * frame = v->rxBufs.va + uint64_t(r.stdIndex) * kRxBufSize;
+                const uint32_t flen = r.len < kRxBufSize ? r.len : kRxBufSize;
+                e.len = flen;
                 // Our own RX-timestamp path: attach the RX-CPU firmware's EAV
                 // stamp for gPTP frames. This overrides the bd.reserved/MAC
                 // latch path (neither works on this 57766-class part).
                 if (stampReady) {
-                    attachRxCpuStamp(v, e.data, n, e);
+                    attachRxCpuStamp(v, frame, flen, e);
                 }
-                swPush(v, e);
+                if (tick->ringMode) {
+                    deliverRing(v, tick, frame, flen, e);
+                } else {
+                    const uint32_t n = flen < AVB_RX_COPY_BYTES ? flen : AVB_RX_COPY_BYTES;
+                    memcpy(e.data, frame, n);
+                    swPush(v, e);
+                }
             }
             postStdBuffer(v, r.stdIndex);
             reposted = true;
@@ -1196,9 +1297,10 @@ static void harvestRx(IV * v)
         (void)eavSample(v);
     }
 
+    RingTick tick = ringTickBegin(v);
     const uint32_t prod0 = le16At(sb, bcm::kSbRxProducer0) & (bcm::kRxRetRingSize - 1);
     if (prod0 != v->retCons) {
-        reposted |= drainReturnRing(v, reinterpret_cast<const volatile RxBd *>(v->retRing.va),
+        reposted |= drainReturnRing(v, &tick, reinterpret_cast<const volatile RxBd *>(v->retRing.va),
                                     &v->retCons, prod0);
     }
 
@@ -1208,12 +1310,17 @@ static void harvestRx(IV * v)
     if (v->retRing1.va != nullptr) {
         const uint32_t prod1 = rxProducer(v, bcm::kSbRxProducer1) & (bcm::kRxRetRingSize - 1);
         if (prod1 != v->retCons1) {
-            reposted |= drainReturnRing(v, reinterpret_cast<const volatile RxBd *>(v->retRing1.va),
+            reposted |= drainReturnRing(v, &tick, reinterpret_cast<const volatile RxBd *>(v->retRing1.va),
                                         &v->retCons1, prod1);
             __atomic_thread_fence(__ATOMIC_SEQ_CST);
             OSSynchronizeIO();
             wr(v, bcm::kMboxRxRetCons1, v->retCons1);
         }
+    }
+    if (tick.ringMode) {
+        // Slots are written before the heads are released (§3.4 order).
+        __atomic_store_n(&v->hdr->ctl_head, v->ctlHead, __ATOMIC_RELEASE);
+        __atomic_store_n(&v->hdr->audio_head, v->audioHead, __ATOMIC_RELEASE);
     }
 
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -1410,6 +1517,205 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
 // ---------------------------------------------------------------------------
 // IOService
 
+// ---------------------------------------------------------------------------
+// Shared rings (ABI v3, same layout and rules as the I210 dext). Only the
+// rings confer ownership; PollRx/legacy callers keep working when unattached.
+
+static void storeRel32(uint32_t * p, uint32_t x) { __atomic_store_n(p, x, __ATOMIC_RELEASE); }
+
+// Live header fields, refreshed every harvest tick on the driver queue.
+static void publishHeader(IV * v, uint64_t tickMach)
+{
+    v->producerRunning = producerRunning(v->hdr != nullptr, v->stage, v->fault);
+    if (v->hdr == nullptr) {
+        return;
+    }
+    __atomic_store_n(&v->hdr->last_tick_mach, tickMach, __ATOMIC_RELEASE);
+    storeRel32(&v->hdr->stage, v->stage);
+    storeRel32(&v->hdr->fault, v->fault);
+    storeRel32(&v->hdr->flags, v->flags);
+    storeRel32(&v->hdr->producer_running, v->producerRunning ? 1u : 0u);
+    for (uint32_t i = 0; i < kAvbCtrCount; i++) {
+        __atomic_store_n(&v->hdr->counters.c[i], v->ctr.c[i], __ATOMIC_RELAXED);
+    }
+}
+
+// Zeroed, client-mappable memory of exactly `len` bytes.
+static uint8_t * allocShared(uint64_t len, IOBufferMemoryDescriptor ** out)
+{
+    *out = nullptr;
+    IOBufferMemoryDescriptor * md = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, len, 16384, &md);
+    if (ret != kIOReturnSuccess || md == nullptr) {
+        LOG("rings: IOBufferMemoryDescriptor::Create(%llu) failed 0x%x", len, ret);
+        return nullptr;
+    }
+    ret = md->SetLength(len);
+    IOAddressSegment range{};
+    if (ret == kIOReturnSuccess) {
+        ret = md->GetAddressRange(&range);
+    }
+    if (ret != kIOReturnSuccess || range.address == 0 || range.length < len) {
+        LOG("rings: shared buffer setup (%llu) failed 0x%x", len, ret);
+        OSSafeReleaseNULL(md);
+        return nullptr;
+    }
+    auto * va = reinterpret_cast<uint8_t *>(range.address);
+    memset(va, 0, len);
+    *out = md;
+    return va;
+}
+
+// A client's existing mapping holds its own reference to the memory.
+static void releaseRings(IV * v)
+{
+    v->producerRunning = false;
+    v->hdr = nullptr;
+    v->cons = nullptr;
+    v->rxVa = nullptr;
+    OSSafeReleaseNULL(v->rxMem);
+    OSSafeReleaseNULL(v->consumerMem);
+}
+
+static kern_return_t ringAttach(IV * v, AVBBcmUserClient * client, uint64_t flags, uint64_t * out)
+{
+    if (flags != 0) {
+        return kIOReturnBadArgument;
+    }
+    if (v->stage < kAvbStageTimeSync) {
+        return kIOReturnNotReady;
+    }
+    if (v->owner != nullptr && v->owner != client) {
+        return kIOReturnExclusiveAccess;
+    }
+    if (v->owner == client && v->hdr != nullptr) {  // idempotent for the owner
+        out[0] = v->generation;
+        out[1] = AVB_RX_MEM_SIZE;
+        out[2] = AVB_CONSUMER_MEM_SIZE;
+        return kIOReturnSuccess;
+    }
+    if (client->RingsUsed()) {
+        LOG("rings: reattach on same connection; reopen");
+        return kIOReturnNotPermitted;
+    }
+    IOBufferMemoryDescriptor * rxMd = nullptr;
+    IOBufferMemoryDescriptor * consMd = nullptr;
+    uint8_t * rxVa = allocShared(AVB_RX_MEM_SIZE, &rxMd);
+    uint8_t * consVa = rxVa != nullptr ? allocShared(AVB_CONSUMER_MEM_SIZE, &consMd) : nullptr;
+    if (rxVa == nullptr || consVa == nullptr) {
+        OSSafeReleaseNULL(rxMd);
+        OSSafeReleaseNULL(consMd);
+        LOG("rings: attach failed: no memory");
+        return kIOReturnNoMemory;
+    }
+    auto * h = reinterpret_cast<AvbShmHeader *>(rxVa);
+    h->magic = AVB_SHM_MAGIC;
+    h->abi_version = AVB_ABI_VERSION;
+    h->header_size = AVB_SHM_HEADER_SIZE;
+    h->slot_size = AVB_RX_SLOT_SIZE;
+    h->ctl_slots = AVB_RX_CTL_SLOTS;
+    h->audio_slots = AVB_RX_AUDIO_SLOTS;
+    h->ctl_offset = AVB_RX_CTL_OFFSET;
+    h->audio_offset = AVB_RX_AUDIO_OFFSET;
+    h->total_size = AVB_RX_MEM_SIZE;
+    h->generation = ++v->generation;
+    h->stage = v->stage;
+    h->fault = v->fault;
+    h->producer_running = 0;
+    memcpy(h->mac, v->mac, sizeof(h->mac));
+    h->clock_gen = 0;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+
+    v->rxMem = rxMd;
+    v->consumerMem = consMd;
+    v->rxVa = rxVa;
+    v->hdr = h;
+    v->cons = reinterpret_cast<AvbShmConsumer *>(consVa);
+    v->ctlHead = 0;
+    v->audioHead = 0;
+    memset(&v->filter, 0, sizeof(v->filter));
+    v->owner = client;
+    client->MarkRingsUsed();
+    v->flags |= AVB_FLAG_RINGS_ATTACHED | AVB_FLAG_OWNED;
+    publishHeader(v, mach_absolute_time());  // producer runs once the datapath is up
+    LOG("rings: attached generation %u (stage %u, producer %d)", v->generation, v->stage, v->producerRunning);
+    out[0] = v->generation;
+    out[1] = AVB_RX_MEM_SIZE;
+    out[2] = AVB_CONSUMER_MEM_SIZE;
+    return kIOReturnSuccess;
+}
+
+static void detachRings(IV * v)
+{
+    v->producerRunning = false;
+    if (v->hdr != nullptr) {
+        storeRel32(&v->hdr->producer_running, 0);
+    }
+    memset(&v->filter, 0, sizeof(v->filter));
+    v->flags &= ~(AVB_FLAG_RINGS_ATTACHED | AVB_FLAG_OWNED);
+    if (v->hdr != nullptr) {
+        storeRel32(&v->hdr->flags, v->flags);
+    }
+    releaseRings(v);
+    v->owner = nullptr;
+}
+
+static kern_return_t ringDetach(IV * v, AVBBcmUserClient * client)
+{
+    if (v->hdr == nullptr) {
+        return kIOReturnNotReady;
+    }
+    if (client != v->owner) {
+        return kIOReturnExclusiveAccess;
+    }
+    detachRings(v);
+    LOG("rings: detached generation %u", v->generation);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+AVBBcmDriver::CopyRingMemory(AVBBcmUserClient * client, uint64_t type, uint64_t * options,
+                             IOMemoryDescriptor ** memory)
+{
+    IV * v = ivars;
+    if (v->hdr == nullptr) {
+        return kIOReturnNotReady;
+    }
+    if (client != v->owner) {
+        return kIOReturnExclusiveAccess;
+    }
+    switch (type) {
+    case kAvbMemRx:
+        v->rxMem->retain();  // one reference is consumed by the caller
+        *memory = v->rxMem;
+        *options = kIOUserClientMemoryReadOnly;
+        return kIOReturnSuccess;
+    case kAvbMemConsumer:
+        v->consumerMem->retain();
+        *memory = v->consumerMem;
+        *options = 0;
+        return kIOReturnSuccess;
+    default:
+        return kIOReturnBadArgument;
+    }
+}
+
+// The owning connection went away: stop the producer, take the datapath down
+// and release the rings, in the I210's §3.3 order.
+void
+AVBBcmDriver::ClientGone(AVBBcmUserClient * client)
+{
+    IV * v = ivars;
+    if (client == nullptr || client != v->owner) {
+        return;
+    }
+    v->producerRunning = false;
+    shutdownDatapath(v);
+    v->tsPending = false;
+    detachRings(v);
+    LOG("uc: closed (owner): datapath down, rings of generation %u released", v->generation);
+}
+
 bool
 AVBBcmDriver::init()
 {
@@ -1433,6 +1739,7 @@ AVBBcmDriver::free()
         OSSafeReleaseNULL(ivars->timerAction);
         OSSafeReleaseNULL(ivars->timer);
         OSSafeReleaseNULL(ivars->queue);
+        releaseRings(ivars);
         IOSafeDeleteNULL(ivars->sw, AvbRxEntry, kSwRingSize);
         IOSafeDeleteNULL(ivars->batch, AvbRxBatch, 1);
     }
@@ -1561,9 +1868,11 @@ IMPL(AVBBcmDriver, TimerFired)
     (void)time;
     IV * v = ivars;
     v->timerRunning = false;
+    publishHeader(v, mach_absolute_time());  // first, every tick
     if (v->stage != kAvbStageDatapath || !ok(v)) {
         return;
     }
+    v->ctr.c[kAvbCtrHarvestTicks]++;
     harvestRx(v);
     checkTx(v);
     if (ok(v) && v->stage == kAvbStageDatapath) {
@@ -1584,7 +1893,7 @@ static kern_return_t setStructOut(IOUserClientMethodArguments * a, const void * 
 }
 
 kern_return_t
-AVBBcmDriver::HandleUserMethod(uint64_t selector, IOUserClientMethodArguments * a)
+AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOUserClientMethodArguments * a)
 {
     IV * v = ivars;
     switch (selector) {
@@ -1793,6 +2102,39 @@ AVBBcmDriver::HandleUserMethod(uint64_t selector, IOUserClientMethodArguments * 
         a->scalarOutput[0] = sramRead(v, static_cast<uint32_t>(a->scalarInput[0]));
         return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
     }
+
+    case kAvbSelGetCounters:
+        return setStructOut(a, &v->ctr, sizeof(v->ctr));
+
+    case kAvbSelSetStreamFilter: {
+        if (v->hdr == nullptr) {
+            return kIOReturnNotReady;
+        }
+        if (client != v->owner) {
+            return kIOReturnExclusiveAccess;
+        }
+        if (a->structureInput == nullptr || a->structureInput->getLength() != sizeof(AvbStreamFilter)) {
+            return kIOReturnBadArgument;
+        }
+        const void * bytes = a->structureInput->getBytesNoCopy();
+        if (bytes == nullptr) {
+            return kIOReturnBadArgument;
+        }
+        AvbStreamFilter f{};
+        memcpy(&f, bytes, sizeof(f));
+        if (!streamFilterValid(f)) {
+            return kIOReturnBadArgument;
+        }
+        v->filter = f;  // same queue as the harvester: applied from the next tick
+        LOG("rings: stream filter set (%u entries)", f.count);
+        return kIOReturnSuccess;
+    }
+
+    case kAvbSelRingAttach:
+        return ringAttach(v, client, a->scalarInput[0], a->scalarOutput);
+
+    case kAvbSelRingDetach:
+        return ringDetach(v, client);
 
     default:
         return kIOReturnUnsupported;

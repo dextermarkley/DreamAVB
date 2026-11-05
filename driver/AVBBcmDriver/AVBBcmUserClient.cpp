@@ -11,6 +11,7 @@
 #include <DriverKit/IOUserServer.h>
 #include <DriverKit/IODispatchQueue.h>
 #include <DriverKit/IOUserClient.h>
+#include <DriverKit/IOMemoryDescriptor.h>
 
 #include "AVBBcmUserClient.h"
 #include "AVBBcmDriver.h"
@@ -21,12 +22,14 @@
 struct AVBBcmUserClient_IVars {
     AVBBcmDriver * driver;
     IODispatchQueue * driverQueue;
+    bool ringsUsed;
 };
 
 namespace {
 
 struct ForwardCtx {
     AVBBcmDriver * driver;
+    AVBBcmUserClient * client;
     uint64_t selector;
     IOUserClientMethodArguments * args;
     kern_return_t ret;
@@ -35,7 +38,42 @@ struct ForwardCtx {
 void runOnDriverQueue(void * context)
 {
     auto * c = static_cast<ForwardCtx *>(context);
-    c->ret = c->driver->HandleUserMethod(c->selector, c->args);
+    c->ret = c->driver->HandleUserMethod(c->client, c->selector, c->args);
+}
+
+struct MemoryCtx {
+    AVBBcmDriver * driver;
+    AVBBcmUserClient * client;
+    uint64_t type;
+    uint64_t * options;
+    IOMemoryDescriptor ** memory;
+    kern_return_t ret;
+};
+
+void copyMemoryOnDriverQueue(void * context)
+{
+    auto * c = static_cast<MemoryCtx *>(context);
+    c->ret = c->driver->CopyRingMemory(c->client, c->type, c->options, c->memory);
+}
+
+struct GoneCtx {
+    AVBBcmDriver * driver;
+    AVBBcmUserClient * client;
+};
+
+void clientGoneOnDriverQueue(void * context)
+{
+    auto * c = static_cast<GoneCtx *>(context);
+    c->driver->ClientGone(c->client);
+}
+
+void runSync(IODispatchQueue * q, void * ctx, IODispatchFunction fn)
+{
+    if (q->OnQueue()) {
+        fn(ctx);
+    } else {
+        q->DispatchSync_f(ctx, fn);
+    }
 }
 
 kern_return_t dispatchToDriver(OSObject * target, void * reference, IOUserClientMethodArguments * args)
@@ -74,6 +112,16 @@ const IOUserClientMethodDispatch kDispatchLoadCoreImage =
 const IOUserClientMethodDispatch kDispatchReadCoreMem =
     /* 17 ReadCoreMem: scalarIn virt_addr, scalarOut word */
     {dispatchToDriver, 0, 1, 0, 1, 0};
+// ABI v3 shared rings and the selectors that go with them (same shapes as the
+// I210 dispatch table).
+const IOUserClientMethodDispatch kDispatchGetCounters =
+    /* 11 GetCounters     */ {dispatchToDriver, 0, 0, 0, 0, kVar};
+const IOUserClientMethodDispatch kDispatchSetStreamFilter =
+    /* 12 SetStreamFilter */ {dispatchToDriver, 0, 0, kVar, 0, 0};
+const IOUserClientMethodDispatch kDispatchRingAttach =
+    /* 13 RingAttach      */ {dispatchToDriver, 0, 1, 0, 3, 0};
+const IOUserClientMethodDispatch kDispatchRingDetach =
+    /* 14 RingDetach      */ {dispatchToDriver, 0, 0, 0, 0, 0};
 const IOUserClientMethodDispatch kDispatchReadSram =
     /* 18 ReadSram: scalarIn nic_sram_addr, scalarOut word */
     {dispatchToDriver, 0, 1, 0, 1, 0};
@@ -127,8 +175,40 @@ IMPL(AVBBcmUserClient, Start)
 kern_return_t
 IMPL(AVBBcmUserClient, Stop)
 {
+    // The driver releases the rings (and takes the datapath down) if this
+    // connection owned them.
+    if (ivars != nullptr && ivars->driver != nullptr && ivars->driverQueue != nullptr) {
+        GoneCtx ctx{ivars->driver, this};
+        runSync(ivars->driverQueue, &ctx, clientGoneOnDriverQueue);
+    }
     LOG("closed");
     return Stop(provider, SUPERDISPATCH);
+}
+
+kern_return_t
+IMPL(AVBBcmUserClient, CopyClientMemoryForType)
+{
+    if (ivars == nullptr || ivars->driver == nullptr || ivars->driverQueue == nullptr || options == nullptr ||
+        memory == nullptr) {
+        return kIOReturnNotReady;
+    }
+    MemoryCtx ctx{ivars->driver, this, type, options, memory, kIOReturnError};
+    runSync(ivars->driverQueue, &ctx, copyMemoryOnDriverQueue);
+    return ctx.ret;
+}
+
+void
+AVBBcmUserClient::MarkRingsUsed()
+{
+    if (ivars != nullptr) {
+        ivars->ringsUsed = true;
+    }
+}
+
+bool
+AVBBcmUserClient::RingsUsed()
+{
+    return ivars != nullptr && ivars->ringsUsed;
 }
 
 kern_return_t
@@ -150,8 +230,21 @@ AVBBcmUserClient::ExternalMethod(uint64_t selector,
     if (selector == kAvbSelReadSram) {
         return super::ExternalMethod(selector, arguments, &kDispatchReadSram, this, nullptr);
     }
+    if (selector == kAvbSelGetCounters) {
+        return super::ExternalMethod(selector, arguments, &kDispatchGetCounters, this, nullptr);
+    }
+    if (selector == kAvbSelSetStreamFilter) {
+        return super::ExternalMethod(selector, arguments, &kDispatchSetStreamFilter, this, nullptr);
+    }
+    if (selector == kAvbSelRingAttach) {
+        return super::ExternalMethod(selector, arguments, &kDispatchRingAttach, this, nullptr);
+    }
+    if (selector == kAvbSelRingDetach) {
+        return super::ExternalMethod(selector, arguments, &kDispatchRingDetach, this, nullptr);
+    }
     if (selector >= kAvbSelBaseCount) {
-        // 10..15 (shared rings, StepClock, counters) are I210-only.
+        // 10 StepClock and 15 SendFrames are I210-only (the BCM clock is
+        // disciplined in software; frames go out one SendFrame at a time).
         return kIOReturnUnsupported;
     }
     return super::ExternalMethod(selector, arguments, &kDispatch[selector], this, nullptr);
@@ -163,11 +256,7 @@ AVBBcmUserClient::Forward(IOUserClientMethodArguments * arguments)
     if (ivars == nullptr || ivars->driver == nullptr || ivars->driverQueue == nullptr) {
         return kIOReturnNotReady;
     }
-    ForwardCtx ctx{ivars->driver, arguments->selector, arguments, kIOReturnError};
-    if (ivars->driverQueue->OnQueue()) {
-        runOnDriverQueue(&ctx);
-    } else {
-        ivars->driverQueue->DispatchSync_f(&ctx, runOnDriverQueue);
-    }
+    ForwardCtx ctx{ivars->driver, this, arguments->selector, arguments, kIOReturnError};
+    runSync(ivars->driverQueue, &ctx, runOnDriverQueue);
     return ctx.ret;
 }

@@ -13,7 +13,7 @@ $(OUT)/tg3logic_tests: tg3logic_tests.cpp ../AVBBcmDriver/Tg3Logic.hpp ../AVBBcm
 	@mkdir -p "$(OUT)"
 	TMPDIR="$(OUT)" $(CXX) $(CXXFLAGS) -o "$@" tg3logic_tests.cpp
 
-$(OUT)/i210logic_tests: i210logic_tests.cpp ../AVBI210Driver/I210Logic.hpp ../AVBI210Driver/I210Regs.h ../AVBShared.h
+$(OUT)/i210logic_tests: i210logic_tests.cpp ../AVBRxCommon.hpp ../AVBI210Driver/I210Logic.hpp ../AVBI210Driver/I210Regs.h ../AVBShared.h
 	@mkdir -p "$(OUT)"
 	TMPDIR="$(OUT)" $(CXX) $(CXXFLAGS) -o "$@" i210logic_tests.cpp
 

@@ -84,29 +84,32 @@ fn bring_up(opts: &GlobalOpts, log: &Logger) -> Result<RealDext, Exit> {
     if info.fault != 0 {
         return Err(Exit::DextFault);
     }
-    // The BCM57762 dext has no mapped shared-memory rings or StepClock (those
-    // are I210-only); its RX arrives via the PollRx batch path, which
-    // `RealDext::rx_ctl` falls back to when no rings are mapped. So skip
-    // RingAttach / attach_rings for it.
     let is_bcm = info.nic_kind == avb_dext::abi::NIC_BCM57762;
     // Step 3: RingAttach(0) — becomes the owner. out[0] = mapping generation.
-    let generation = if is_bcm {
-        0
-    } else {
-        match dev.ring_attach(0) {
-            Ok((gen, _rx_sz, _cons_sz)) => gen,
-            Err(e) => {
-                if avb_dext::iokit::io_return_of(&e) == Some(avb_dext::iokit::kr::EXCLUSIVE_ACCESS)
-                {
-                    log.log(
-                        Level::Error,
-                        "dext",
-                        "the rings are owned by another client (another avb-daemon); stop it first",
-                    );
-                    return Err(Exit::Owned);
-                }
+    // Both dexts implement the ABI v3 shared rings. An older BCM dext does
+    // not; then `rings` stays false and `rx_ctl` falls back to PollRx (gPTP
+    // works that way, but stream audio needs the rings).
+    let (generation, rings) = match dev.ring_attach(0) {
+        Ok((gen, _rx_sz, _cons_sz)) => (gen, true),
+        Err(e) => {
+            let code = avb_dext::iokit::io_return_of(&e);
+            if code == Some(avb_dext::iokit::kr::EXCLUSIVE_ACCESS) {
+                log.log(
+                    Level::Error,
+                    "dext",
+                    "the rings are owned by another client (another avb-daemon); stop it first",
+                );
+                return Err(Exit::Owned);
+            }
+            if !is_bcm {
                 return Err(Exit::Internal);
             }
+            log.log(
+                Level::Warn,
+                "dext",
+                "this BCM dext has no shared rings; PollRx fallback (gPTP only, no stream audio)",
+            );
+            (0, false)
         }
     };
     // Steps 4–6 (map, validate header, InitDatapath) and step 7 (link wait)
@@ -169,9 +172,9 @@ fn bring_up(opts: &GlobalOpts, log: &Logger) -> Result<RealDext, Exit> {
     let mut dext = RealDext::new(dev, numer, denom);
     // Steps 4–6: map the RX + consumer memory and validate the header against
     // the attach generation. This is what makes `rx_ctl` able to drain the
-    // control ring; gPTP RX arrives there after RingAttach. The BCM57762 has no
-    // mapped rings, so `rx_ctl` falls back to PollRx and we skip the mapping.
-    if !is_bcm {
+    // control ring; gPTP RX arrives there after RingAttach. Without rings (an
+    // older BCM dext) `rx_ctl` falls back to PollRx and we skip the mapping.
+    if rings {
         if let Err(what) = dext.attach_rings(generation) {
             log.log(Level::Error, "dext", &format!("map rings: {what}"));
             return Err(Exit::AbiMismatch);

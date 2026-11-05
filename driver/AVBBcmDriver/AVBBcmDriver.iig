@@ -10,6 +10,9 @@
 #include <DriverKit/IOService.iig>
 #include <DriverKit/IOUserClient.iig>
 #include <DriverKit/IOTimerDispatchSource.iig>
+#include <DriverKit/IOMemoryDescriptor.iig>
+
+class AVBBcmUserClient;
 
 class AVBBcmDriver : public IOService
 {
@@ -31,8 +34,20 @@ public:
 
     // Entry point for AVBBcmUserClient. Always called on this driver's
     // default queue, so it is serialized with TimerFired and Start/Stop.
+    // `client` is the calling connection (ring ownership checks).
     kern_return_t
-    HandleUserMethod(uint64_t selector, IOUserClientMethodArguments * arguments) LOCALONLY;
+    HandleUserMethod(AVBBcmUserClient * client, uint64_t selector,
+                     IOUserClientMethodArguments * arguments) LOCALONLY;
+
+    // CopyClientMemoryForType of `client`, on the driver queue (ABI v3 rings).
+    kern_return_t
+    CopyRingMemory(AVBBcmUserClient * client, uint64_t type, uint64_t * options,
+                   IOMemoryDescriptor ** memory) LOCALONLY;
+
+    // The connection `client` is going away (user client Stop), on the
+    // driver queue. Releases the rings and stops the datapath if it owns them.
+    void
+    ClientGone(AVBBcmUserClient * client) LOCALONLY;
 
     // 2 ms poll timer: harvests the RX return ring and the pending TX timestamp.
     virtual void
