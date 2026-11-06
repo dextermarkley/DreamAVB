@@ -102,6 +102,12 @@ async function refreshStatus() {
     // The status poll is where the driver state is known, so it is also
     // where a NIC-list rebuild can be decided.
     await maybeReloadNics(st.state);
+    // While active, the dropdown shows the NIC DreamAVB is actually on, so a
+    // mismatch between the picker and the running driver cannot hide.
+    if (st.nic && st.nic.id && !busy) {
+      const sel = el("nic");
+      if (Array.from(sel.options).some((o) => o.value === st.nic.id)) sel.value = st.nic.id;
+    }
   } catch (e) {
     console.error(e);
   }
@@ -522,8 +528,25 @@ let nicChosen = false;
 
 // A manual pick counts as a choice: never let auto-select or a poll move it
 // afterwards.
-el("nic").addEventListener("change", () => {
+el("nic").addEventListener("change", async (ev) => {
   nicChosen = true;
+  // With DreamAVB already on, picking another NIC used to do nothing: the
+  // power switch was already checked, so enable_driver never ran and the
+  // daemon stayed on the old NIC. Switch to the picked one now.
+  if (!el("power").checked || busy) return;
+  busy = true;
+  ev.target.disabled = true;
+  try {
+    paintStatus({ state: "pending", summary: "Switching NIC…" });
+    await invoke("enable_driver", { nicId: ev.target.value });
+  } catch (e) {
+    showError(String(e));
+  } finally {
+    ev.target.disabled = false;
+    busy = false;
+    await refreshStatus();
+    await refreshAudio();
+  }
 });
 
 async function refreshLaunchAtLogin() {

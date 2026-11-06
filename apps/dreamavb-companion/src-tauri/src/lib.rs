@@ -435,7 +435,25 @@ async fn enable_driver(nic_id: String) -> Result<Status, String> {
     cfg.active_nic = Some(kind.id());
     cfg.save()
         .map_err(|e| format!("could not save settings: {e}"))?;
-    run_installer(&["activate", "--dext", kind.id()])?;
+    // Already enabled and attached (switching between two plugged-in NICs):
+    // nothing to activate, the recorded choice is the whole change.
+    let already =
+        classify_sysext(&sysext_listing(), kind) == DextSysextState::Enabled && dext_owns(kind);
+    if !already {
+        run_installer(&["activate", "--dext", kind.id()])?;
+    }
+    // A running daemon is bound to the NIC it was started on; move it.
+    let running = {
+        let mut guard = match AUDIO.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        audio_status_locked(&mut guard).running
+    };
+    if running {
+        let _ = stop_audio().await?;
+        let _ = start_audio().await?;
+    }
     Ok(current_status())
 }
 
