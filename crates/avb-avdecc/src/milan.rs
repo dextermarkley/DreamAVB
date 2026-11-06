@@ -11,6 +11,32 @@ pub const MVU_PROTOCOL_ID: [u8; 6] = [0x00, 0x1B, 0xC5, 0x0A, 0xC1, 0x00];
 /// MVU command types (Milan v1.2 §5.4.4.2). GET_MILAN_INFO is command 0x0000.
 pub mod mvu_cmd {
     pub const GET_MILAN_INFO: u16 = 0x0000;
+    /// Milan v1.3 §5.4.4.8, Table 5.15.
+    pub const GET_STREAM_INPUT_INFO_EX: u16 = 0x0007;
+}
+
+/// MVU status PAYLOAD_TOO_SHORT (Milan v1.3 Table 5.16).
+pub const MVU_PAYLOAD_TOO_SHORT: u8 = 13;
+
+/// GET_STREAM_INPUT_INFO_EX response payload after command_type (Figure
+/// 5.12): reserved(2), descriptor_type(2), descriptor_index(2),
+/// talker_entity_id(8), talker_unique_id(2), pbsta(3)|acmpsta(5), reserved(1).
+pub fn encode_stream_input_info_ex(
+    descriptor_index: u16,
+    talker_entity_id: [u8; 8],
+    talker_unique_id: u16,
+    pbsta: u8,
+    acmpsta: u8,
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(18);
+    v.extend_from_slice(&0u16.to_be_bytes());
+    v.extend_from_slice(&crate::constants::desc::STREAM_INPUT.to_be_bytes());
+    v.extend_from_slice(&descriptor_index.to_be_bytes());
+    v.extend_from_slice(&talker_entity_id);
+    v.extend_from_slice(&talker_unique_id.to_be_bytes());
+    v.push(((pbsta & 0x07) << 5) | (acmpsta & 0x1F));
+    v.push(0);
+    v
 }
 
 /// Milan `protocol_version` reported by GET_MILAN_INFO (Milan v1.2 §5.4.4.3).
@@ -103,8 +129,9 @@ pub mod milan_features {
     pub const TALKER_SIGNAL_PRESENCE: u32 = 0x0000_0008;
 }
 
-/// `probing_status` in the Milan GET_STREAM_INFO response (Milan v1.2
-/// §5.4.2.10, Table 15).
+/// Probing status (Milan v1.3 §5.3.8.6, Table 5.5), reported as `pbsta` by
+/// GET_STREAM_INPUT_INFO_EX (§5.4.4.8). Milan v1.2 carried it in an extended
+/// GET_STREAM_INFO response instead.
 pub mod probing_status {
     pub const DISABLED: u8 = 0;
     pub const PASSIVE: u8 = 1;

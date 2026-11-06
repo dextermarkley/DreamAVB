@@ -524,6 +524,10 @@ pub struct TalkerEntity {
     default_transit_ns: u64,
     /// SET_MAX_TRANSIT_TIME overrides by STREAM_OUTPUT index.
     transit_ns: std::collections::BTreeMap<u16, u64>,
+    /// Per STREAM_INPUT: the GET_STREAM_INPUT_INFO_EX payload and the
+    /// TA / Talker Failed registration last reported. `None` until first
+    /// sampled.
+    input_info_ex_sent: Option<Vec<(Vec<u8>, bool, bool)>>,
 }
 
 /// Milan v1.3 §5.3.7.6 default presentation time offset.
@@ -548,6 +552,7 @@ impl TalkerEntity {
             output_srp: Vec::new(),
             default_transit_ns: DEFAULT_MAX_TRANSIT_NS,
             transit_ns: std::collections::BTreeMap::new(),
+            input_info_ex_sent: None,
         }
     }
 
@@ -898,9 +903,86 @@ impl TalkerEntity {
                 }
                 .encode();
             }
+            mvu_cmd::GET_STREAM_INPUT_INFO_EX => {
+                let (status, payload) = self.stream_input_info_ex(&cmd.payload);
+                resp.status = status;
+                resp.payload = payload;
+            }
             _ => resp.status = aecp_status::NOT_IMPLEMENTED,
         }
         resp
+    }
+
+    /// GET_STREAM_INPUT_INFO_EX (Milan v1.3 §5.4.4.8). `p` is the payload
+    /// after command_type: reserved(2), descriptor_type(2), descriptor_index(2).
+    fn stream_input_info_ex(&self, p: &[u8]) -> (u8, Vec<u8>) {
+        let (Some(ty), Some(index)) = (be_u16(p, 2), be_u16(p, 4)) else {
+            return (crate::milan::MVU_PAYLOAD_TOO_SHORT, p.to_vec());
+        };
+        if ty != dt::STREAM_INPUT {
+            return (aecp_status::BAD_ARGUMENTS, p.to_vec());
+        }
+        match self.input_info_ex_payload(index) {
+            Some(v) => (aecp_status::SUCCESS, v),
+            None => (aecp_status::NO_SUCH_DESCRIPTOR, p.to_vec()),
+        }
+    }
+
+    fn input_info_ex_payload(&self, index: u16) -> Option<Vec<u8>> {
+        let sm = self.sink_sms.get(usize::from(index))?;
+        let (tid, tuid) = sm
+            .bound_to()
+            .map_or(([0; 8], 0), |b| (b.talker_entity_id.0, b.talker_unique_id));
+        Some(crate::milan::encode_stream_input_info_ex(
+            index,
+            tid,
+            tuid,
+            sm.probing_status(),
+            sm.acmp_status(),
+        ))
+    }
+
+    /// Unsolicited GET_STREAM_INPUT_INFO_EX notifications (Milan v1.3 Table
+    /// 5.21) for every STREAM_INPUT whose talker, probing status, ACMP status
+    /// or MSRP Talker registration changed since the last call. Call it after
+    /// anything that may move a sink's state machine. The first call reports
+    /// nothing; it only records the starting state.
+    pub fn input_info_ex_changes(&mut self) -> Vec<(MacAddr, MvuPdu)> {
+        let now: Vec<(Vec<u8>, bool, bool)> = (0..self.model.sink_count())
+            .filter_map(|i| {
+                let sm = self.sink_sms.get(usize::from(i))?;
+                Some((
+                    self.input_info_ex_payload(i)?,
+                    sm.ta_registered(),
+                    sm.talker_failed_registered(),
+                ))
+            })
+            .collect();
+        let Some(prev) = self.input_info_ex_sent.replace(now.clone()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (i, snap) in now.iter().enumerate() {
+            if prev.get(i) == Some(snap) {
+                continue;
+            }
+            for c in self.control.unsol_controllers() {
+                out.push((
+                    c.mac,
+                    MvuPdu {
+                        message_type: aecp_msg::VENDOR_UNIQUE_RESPONSE,
+                        status: aecp_status::SUCCESS,
+                        target_entity_id: self.model.entity_id,
+                        controller_entity_id: c.entity_id,
+                        sequence_id: 0,
+                        unsolicited: true,
+                        command_type: mvu_cmd::GET_STREAM_INPUT_INFO_EX,
+                        payload: snap.0.clone(),
+                    },
+                ));
+            }
+        }
+        out
     }
 
     /// Handle an AEM command addressed to us, returning the response to send
@@ -3206,6 +3288,74 @@ mod tests {
 
     /// CONNECT_RX binds the sink, and GET_RX_STATE then reports the binding
     /// (Table 5.44) rather than the zeroes of Table 5.37.
+    #[test]
+    fn get_stream_input_info_ex_reports_binding_and_notifies_changes() {
+        use crate::milan::{mvu_cmd, probing_status as pb};
+        let mut e = duplex_entity();
+        let id = e.entity_id();
+        let mvu = |ty: u16, ix: u16| MvuPdu {
+            message_type: aecp_msg::VENDOR_UNIQUE_COMMAND,
+            status: 0,
+            target_entity_id: id,
+            controller_entity_id: Eui64([9; 8]),
+            sequence_id: 3,
+            unsolicited: false,
+            command_type: mvu_cmd::GET_STREAM_INPUT_INFO_EX,
+            payload: [0u16, ty, ix]
+                .iter()
+                .flat_map(|v| v.to_be_bytes())
+                .collect(),
+        };
+        let expect = |ix: u16, tid: [u8; 8], tuid: u16, pbsta: u8| {
+            crate::milan::encode_stream_input_info_ex(ix, tid, tuid, pbsta, 0)
+        };
+        // Unbound: PROBING_DISABLED, no talker. Figure 5.12 is 18 bytes here.
+        let r = e.handle_mvu(&mvu(dt::STREAM_INPUT, 0));
+        assert_eq!(r.status, aecp_status::SUCCESS);
+        assert_eq!(r.payload.len(), 18);
+        assert_eq!(r.payload, expect(0, [0; 8], 0, pb::DISABLED));
+        // Wrong type, missing index, short payload.
+        assert_eq!(
+            e.handle_mvu(&mvu(dt::STREAM_OUTPUT, 0)).status,
+            aecp_status::BAD_ARGUMENTS
+        );
+        let n = e.model().sink_count();
+        assert_eq!(
+            e.handle_mvu(&mvu(dt::STREAM_INPUT, n)).status,
+            aecp_status::NO_SUCH_DESCRIPTOR
+        );
+        let mut short = mvu(dt::STREAM_INPUT, 0);
+        short.payload.truncate(4);
+        assert_eq!(
+            e.handle_mvu(&short).status,
+            crate::milan::MVU_PAYLOAD_TOO_SHORT
+        );
+
+        // A registered controller is told when sink 0 binds, and only then.
+        let me = Eui64([7; 8]);
+        let mut reg = cmd(aem_cmd::REGISTER_UNSOLICITED_NOTIFICATION, vec![], id);
+        reg.controller_entity_id = me;
+        e.handle_aecp(&reg, OUR_MAC, 0);
+        assert!(
+            e.input_info_ex_changes().is_empty(),
+            "first call only samples"
+        );
+        assert!(e.input_info_ex_changes().is_empty(), "nothing changed");
+        let c = rx_cmd(acmp_msg::CONNECT_RX_COMMAND, id, 0);
+        e.handle_acmp_listener(&c, 0, 0).expect("answered");
+        let notes = e.input_info_ex_changes();
+        assert_eq!(notes.len(), 1);
+        let (dst, pdu) = &notes[0];
+        assert_eq!(*dst, OUR_MAC);
+        assert!(pdu.unsolicited);
+        assert_eq!(pdu.message_type, aecp_msg::VENDOR_UNIQUE_RESPONSE);
+        assert_eq!(pdu.controller_entity_id, me);
+        let bound = expect(0, c.talker_entity_id.0, c.talker_unique_id, pb::PASSIVE);
+        assert_eq!(pdu.payload, bound);
+        assert_eq!(e.handle_mvu(&mvu(dt::STREAM_INPUT, 0)).payload, bound);
+        assert!(e.input_info_ex_changes().is_empty());
+    }
+
     #[test]
     fn connect_rx_binds_a_sink_and_get_rx_state_then_reports_it() {
         let mut e = duplex_entity();

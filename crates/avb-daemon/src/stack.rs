@@ -712,6 +712,7 @@ fn aem_dump_loop(
             target_entity_id: talker,
             controller_entity_id: our_id,
             sequence_id: 0xFFFF,
+            unsolicited: false,
             command_type: mvu_cmd::GET_MILAN_INFO,
             // The command carries no arguments; the response appends the
             // payload. Milan v1.2 §5.4.4.3.
@@ -4759,15 +4760,7 @@ fn talker_loop(
                             == avb_avdecc::constants::aecp_msg::VENDOR_UNIQUE_COMMAND
                     {
                         let resp = entity.handle_mvu(&mvu);
-                        let hdr = EthHeader {
-                            dst: p.hdr.src,
-                            src: our_mac,
-                            vlan: None,
-                            ethertype: avb_avtp::common::ETHERTYPE_AVTP,
-                        };
-                        if let Ok(frame) = TxFrame::build(&hdr, &resp.encode(), false, 0) {
-                            let _ = dext.send(frame.bytes(), false, 0);
-                        }
+                        send_mvu(dext, our_mac, p.hdr.src, &resp);
                         mvu_answered += 1;
                         log.log(
                             Level::Info,
@@ -5603,6 +5596,13 @@ fn talker_loop(
                         }
                     }
                 }
+            }
+            // Milan v1.3 Table 5.21: tell registered controllers when a
+            // STREAM_INPUT's talker, probing/ACMP status or Talker
+            // registration changed. Sampled on the same 100 ms tick.
+            for (dst, pdu) in entity.input_info_ex_changes() {
+                send_mvu(dext, our_mac, dst, &pdu);
+                unsol_sent += 1;
             }
         }
         // Run the MRP timers and put whatever they produced on the wire.
@@ -7909,6 +7909,30 @@ fn send_aem_response(
         ethertype: ETHERTYPE_AVTP,
     };
     if let Ok(f) = TxFrame::build(&hdr, &resp.encode(), false, 0) {
+        let _ = dext.send(f.bytes(), false, 0);
+    }
+}
+
+/// Send one MVU AECPDU (a response or notification) unicast to `dst`.
+fn send_mvu(
+    dext: &mut RealDext,
+    our_mac: avb_core::MacAddr,
+    dst: avb_core::MacAddr,
+    pdu: &avb_avdecc::aecp::MvuPdu,
+) {
+    use avb_avtp::common::ETHERTYPE_AVTP;
+    use avb_core::eth::EthHeader;
+    use avb_core::TxFrame;
+
+    use crate::dextio::DextPort;
+
+    let hdr = EthHeader {
+        dst,
+        src: our_mac,
+        vlan: None,
+        ethertype: ETHERTYPE_AVTP,
+    };
+    if let Ok(f) = TxFrame::build(&hdr, &pdu.encode(), false, 0) {
         let _ = dext.send(f.bytes(), false, 0);
     }
 }

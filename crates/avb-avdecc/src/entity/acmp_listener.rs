@@ -203,6 +203,8 @@ pub struct ListenerSm {
     /// that is what the flag is for -- so START_STREAMING is what starts it.
     /// A bind without the flag is started immediately.
     started: bool,
+    /// ACMP status that sent the sink to PRB_W_RETRY (see `acmp_status`).
+    retry_acmp_status: u8,
     pub counters: SmCounters,
 }
 
@@ -222,7 +224,30 @@ impl ListenerSm {
             a5_classified: false,
             streaming_wait: false,
             started: false,
+            retry_acmp_status: 0,
             counters: SmCounters::default(),
+        }
+    }
+
+    /// Probing status (Milan v1.3 §5.3.8.6, Table 5.5), from the state.
+    pub fn probing_status(&self) -> u8 {
+        use crate::milan::probing_status as p;
+        match self.state {
+            State::Unbound => p::DISABLED,
+            State::PrbWAvail => p::PASSIVE,
+            State::PrbWDelay | State::PrbWResp | State::PrbWResp2 | State::PrbWRetry => p::ACTIVE,
+            State::SettledNoRsv | State::SettledRsvOk => p::COMPLETED,
+        }
+    }
+
+    /// ACMP status (§5.3.8.6): the error of the last probe sequence. Only
+    /// PRB_W_RETRY carries one (§5.5.3.6.18 step 3, §5.5.3.6.23); every other
+    /// transition sets it back to 0.
+    pub fn acmp_status(&self) -> u8 {
+        if self.state == State::PrbWRetry {
+            self.retry_acmp_status
+        } else {
+            0
         }
     }
 
@@ -388,6 +413,7 @@ impl ListenerSm {
                         )));
                     }
                     // probe_cycles unchanged (the talker answered).
+                    self.retry_acmp_status = status;
                     self.arm(State::PrbWRetry, now_ns, timers::RETRY_NS, &mut out);
                 }
                 None
@@ -583,6 +609,8 @@ impl ListenerSm {
                 if self.probe_cycles >= PROBE_FALLBACK_CYCLES {
                     self.fallback(now_ns, rand01_ns, &mut out);
                 } else {
+                    // §5.5.3.6.23 step 2.
+                    self.retry_acmp_status = acmp_status::LISTENER_TALKER_TIMEOUT;
                     self.arm(State::PrbWRetry, now_ns, timers::RETRY_NS, &mut out);
                 }
             }
@@ -879,6 +907,24 @@ mod tests {
         assert!(s.a5_classified());
         assert!(acts.iter().any(|a| matches!(a, Action::Log(_))));
         assert_eq!(s.probe_cycles(), 0); // unchanged; talker answered
+                                         // §5.5.3.6.18 step 3: ACMP status is the response's status.
+        assert_eq!(s.probing_status(), crate::milan::probing_status::ACTIVE);
+        assert_eq!(s.acmp_status(), acmp_status::TALKER_NO_BANDWIDTH);
+        // Leaving PRB_W_RETRY sets it back to 0.
+        s.on_timer(10_000_000_000, 250_000_000);
+        assert_eq!(s.state(), State::PrbWDelay);
+        assert_eq!(s.acmp_status(), 0);
+    }
+
+    #[test]
+    fn probing_status_follows_the_state_table_5_5() {
+        use crate::milan::probing_status as p;
+        let mut s = sm();
+        assert_eq!((s.probing_status(), s.acmp_status()), (p::DISABLED, 0));
+        s.on_event(bind(false, None), 0, 0);
+        assert_eq!(s.probing_status(), p::PASSIVE);
+        let s = settled_no_rsv();
+        assert_eq!((s.probing_status(), s.acmp_status()), (p::COMPLETED, 0));
     }
 
     // Row: PRB_W_RESP2 + timeout -> PRB_W_RETRY (probe_cycles += 1)
@@ -891,6 +937,8 @@ mod tests {
         s.on_timer(2 * timers::PROBE_RESP_NS, 0); // timeout
         assert_eq!(s.state(), State::PrbWRetry);
         assert_eq!(s.probe_cycles(), 1);
+        // §5.5.3.6.23 step 2.
+        assert_eq!(s.acmp_status(), acmp_status::LISTENER_TALKER_TIMEOUT);
     }
 
     // Row: PRB_W_RETRY + timer -> PRB_W_DELAY

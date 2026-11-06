@@ -97,6 +97,9 @@ pub struct MvuPdu {
     pub target_entity_id: Eui64,
     pub controller_entity_id: Eui64,
     pub sequence_id: u16,
+    /// The `u` bit (Milan v1.3 §5.4.3.2.2): set on a response sent as a
+    /// notification, clear on commands and direct responses.
+    pub unsolicited: bool,
     pub command_type: u16,
     pub payload: Vec<u8>,
 }
@@ -125,7 +128,7 @@ impl MvuPdu {
         if proto != MVU_PROTOCOL_ID {
             return None;
         }
-        let command_type = r.u16()? & 0x7FFF;
+        let u_ct = r.u16()?;
         let payload = r.rest().to_vec();
         Some(Self {
             message_type,
@@ -133,7 +136,8 @@ impl MvuPdu {
             target_entity_id,
             controller_entity_id,
             sequence_id,
-            command_type,
+            unsolicited: u_ct & 0x8000 != 0,
+            command_type: u_ct & 0x7FFF,
             payload,
         })
     }
@@ -149,7 +153,7 @@ impl MvuPdu {
         w.put(&self.controller_entity_id.0);
         w.u16(self.sequence_id);
         w.put(&MVU_PROTOCOL_ID);
-        w.u16(self.command_type & 0x7FFF);
+        w.u16((u16::from(self.unsolicited) << 15) | (self.command_type & 0x7FFF));
         w.put(&self.payload);
         w.into_vec()
     }
@@ -442,11 +446,21 @@ mod tests {
             target_entity_id: tgt,
             controller_entity_id: ctrl,
             sequence_id: 7,
+            unsolicited: false,
             command_type: mvu_cmd::GET_MILAN_INFO,
             payload: vec![],
         };
         let bytes = m.encode();
-        assert_eq!(MvuPdu::decode(&bytes), Some(m));
+        assert_eq!(MvuPdu::decode(&bytes), Some(m.clone()));
+        // The u bit is bit 15 of the command_type word, and round-trips.
+        let n = MvuPdu {
+            unsolicited: true,
+            command_type: mvu_cmd::GET_STREAM_INPUT_INFO_EX,
+            ..m
+        };
+        let nb = n.encode();
+        assert_eq!(nb.get(28..30), Some(&[0x80, 0x07][..]));
+        assert_eq!(MvuPdu::decode(&nb), Some(n));
         // A VENDOR_UNIQUE PDU with a different protocol id is not MVU.
         let mut bad = bytes.clone();
         if let Some(b) = bad.get_mut(24) {
