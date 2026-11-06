@@ -600,43 +600,9 @@ pub fn session_devices(map: Option<&RoutingMap>, chosen: u64, present: &[u64]) -
     mapped.into_iter().map(|(_, e)| e).collect()
 }
 
-/// The first DreamAVB OUTPUT channel of each of a device's sinks, in sink
-/// order, for at most `n_sinks` sinks.
-///
-/// Outputs are not mapped separately yet (the DAW routes outputs), so they
-/// follow the input map: a device gets the same blocks on the output side as
-/// its streams occupy on the input side, lowest first. With no saved map,
-/// the pre-map layout: sink `i` on outputs `i * block ..`.
-pub fn output_firsts(
-    map: Option<&RoutingMap>,
-    entity_id: u64,
-    n_sinks: usize,
-    block: u16,
-    width: u16,
-) -> Vec<u16> {
-    match map {
-        None => (0..n_sinks)
-            .map(|i| (i as u16).saturating_mul(block))
-            .take_while(|&f| u32::from(f) + u32::from(block) <= u32::from(width))
-            .collect(),
-        Some(m) => {
-            let mut f: Vec<u16> = m
-                .routes()
-                .iter()
-                .filter(|r| {
-                    r.direction == Direction::Input
-                        && r.entity_id == entity_id
-                        && r.stream_channel == 0
-                        && r.count == block
-                })
-                .map(|r| r.first)
-                .collect();
-            f.sort_unstable();
-            f.truncate(n_sinks);
-            f
-        }
-    }
-}
+// Outputs are not mapped here: the daemon offers every DreamAVB output to
+// every device as fixed 8-channel streams, and each device picks (its own
+// stream selection / routing). This map covers inputs only.
 
 #[cfg(test)]
 mod tests {
@@ -667,25 +633,6 @@ mod tests {
             session_devices(Some(&RoutingMap::default()), R16, &[R16]),
             vec![R16]
         );
-    }
-
-    #[test]
-    fn outputs_follow_the_input_map() {
-        let m = two_device_map();
-        assert_eq!(
-            output_firsts(Some(&m), R24, 8, 8, 128),
-            (0..8).map(|i| i * 8).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            output_firsts(Some(&m), R16, 8, 8, 128),
-            (0..8).map(|i| 64 + i * 8).collect::<Vec<_>>()
-        );
-        // Fewer mapped blocks than sinks: only that many outputs.
-        assert_eq!(output_firsts(Some(&m), R16, 3, 8, 128), vec![64, 72, 80]);
-        // No map: the old layout.
-        assert_eq!(output_firsts(None, R16, 8, 8, 128).last(), Some(&56));
-        // An unmapped device gets no outputs.
-        assert!(output_firsts(Some(&m), 0x99, 8, 8, 128).is_empty());
     }
 
     #[test]

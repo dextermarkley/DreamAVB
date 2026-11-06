@@ -2919,7 +2919,7 @@ fn talker_loop(
         target_mac: listener_mac,
     };
 
-    // ---- Outbound: one of our streams per device sink -----------------------
+    // ---- Outbound: every output offered; default bindings per device sink ---
     //
     // How many streams the ATTACHED dext can carry: its TX token bucket was
     // sized for 8 class A streams before ABI v5. Read from the dext, never
@@ -7384,10 +7384,11 @@ fn talker_loop(
 /// The AVB stream destination MAC for our talker stream, from the MAAP dynamic
 /// allocation pool (IEEE 1722-2016 Annex B).
 ///
-/// We do not run the MAAP protocol itself yet — no probe, no defend — so the
-/// block is derived deterministically from our own MAC by
-/// [`avb_core::maap_stream_dest`]. The 16R learns the address from our SRP
-/// Talker Advertise either way.
+/// The block is derived deterministically from our own MAC by
+/// [`avb_core::maap_stream_dest`], and MAAP probes and defends exactly that
+/// block (`Maap::new` in `talker_loop`). KNOWN GAP (Milan v1.3 §4.3.5.1): if
+/// MAAP has to MOVE the block after a conflict, the streams still use this
+/// address; nothing re-derives it from `maap.block()` yet.
 ///
 /// This previously used `91:E0:F0:01:xx:xx`, one octet above the pool, to keep
 /// clear of the dext's AVDECC fallback classifier (which claims all of
@@ -9239,10 +9240,6 @@ fn get_rx_state_frame(
     avb_core::TxFrame::build(&hdr, &pdu.encode(), false, 0).ok()
 }
 
-/// Whether a sink's reported binding is a stale one of OURS that we may
-/// release: a nonzero stream id carrying our MAC in its top 48 bits
-/// (1722-2016 §4.4.4.30), and not the stream we want on that sink. A binding
-/// to any other talker is never ours to undo.
 /// A PROBE_TX keeps a stream's Talker Advertise valid this long (Milan v1.3
 /// §4.3.3.1 condition 2).
 const PROBE_TX_VALID_NS: u64 = 15_000_000_000;
@@ -9295,6 +9292,11 @@ fn default_output_stream(base: usize, k: usize, n_streams: usize) -> usize {
     (base + k) % n_streams.max(1)
 }
 
+/// Whether a (media-clock) sink's reported binding is a stale one of OURS
+/// that we may release: a nonzero stream id carrying our MAC in its top 48
+/// bits (1722-2016 §4.4.4.30), and not the stream we want on that sink. A
+/// binding to any other talker is never ours to undo. Audio sinks use
+/// `sinkpolicy` instead.
 fn stale_own_binding(reported_sid: u64, wanted_sid: u64, any_own_sid: u64) -> bool {
     reported_sid != 0 && reported_sid != wanted_sid && reported_sid >> 16 == any_own_sid >> 16
 }

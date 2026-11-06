@@ -616,14 +616,10 @@ fn cmd_datapath(dev: &Device, json: Option<&Path>, up: bool) -> Result<()> {
         // stamps, and passes frames on to the host ring. AVB_SKIP_STAMPER
         // leaves the stock RX-CPU in place (to isolate TX-timestamp effects).
         if bcm && std::env::var_os("AVB_SKIP_STAMPER").is_none() {
-            let mut image = BCMFW_IMAGE.to_vec();
-            while !image.len().is_multiple_of(4) {
-                image.push(0);
-            }
-            let (halted, mode) = dev.load_core_image(abi::RX_CPU_SCRATCH_BASE, &image)?;
+            let (halted, mode) = dev.load_stamp_firmware()?;
             println!(
                 "  rx-cpu stamper loaded: halted={halted} mode=0x{mode:08x} ({} bytes)",
-                image.len()
+                BCMFW_IMAGE.len()
             );
         }
         let info = dev.info()?;
@@ -761,7 +757,9 @@ fn cmd_core_selftest(dev: &Device, json: Option<&Path>) -> Result<()> {
 
 /// The clean-room shim built by driver/bcm-fw (committed, so no toolchain is
 /// needed here). Big-endian MIPS, loaded at RX_CPU_SCRATCH_BASE.
-const BCMFW_IMAGE: &[u8] = include_bytes!("../../../driver/bcm-fw/bcmfw.img");
+/// The stamping firmware (one copy, in `avb-dext`). Loaded through
+/// `Device::load_stamp_firmware`; used here only for the reported size.
+const BCMFW_IMAGE: &[u8] = avb_dext::iokit::STAMP_FIRMWARE;
 /// Handshake words the shim writes (driver/bcm-fw/regs.h).
 const SHIM_RUN_ADDR: u32 = 0x0800_F000;
 const SHIM_DONE_ADDR: u32 = 0x0800_F004;
@@ -927,14 +925,10 @@ fn cmd_stamp_watch(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()
     const TS_LASTETYPE: u32 = 0x0800_BFFC;
     const TS_RING: u32 = 0x0800_C000;
 
-    let mut image = BCMFW_IMAGE.to_vec();
-    while !image.len().is_multiple_of(4) {
-        image.push(0);
-    }
-    let (halted, mode) = dev.load_core_image(abi::RX_CPU_SCRATCH_BASE, &image)?;
+    let (halted, mode) = dev.load_stamp_firmware()?;
     println!(
         "stamper loaded: halted={halted} mode=0x{mode:08x} ({} bytes)",
-        image.len()
+        BCMFW_IMAGE.len()
     );
     let run = dev.read_core_mem(0x0800_F000)?;
     let done = dev.read_core_mem(0x0800_F004)?;
