@@ -3352,6 +3352,23 @@ fn talker_loop(
         ),
     );
     let mut entity = avb_avdecc::entity::TalkerEntity::new(model);
+    // GET_STREAM_INFO reports each output's real destination and the latency
+    // and VLAN our Talker Advertise declares, from the start rather than only
+    // once the 16R has answered Listener Ready.
+    let dests: Vec<avb_core::MacAddr> = entity
+        .model()
+        .streams
+        .iter()
+        .map(|s| stream_dest_mac(s.stream_id))
+        .collect();
+    let first_dest = dests.first().copied().unwrap_or(avb_core::MacAddr([0; 6]));
+    entity.set_output_dest_macs(dests);
+    entity.set_stream_info(avb_avdecc::entity::StreamInfo {
+        connected: false,
+        dest_mac: first_dest,
+        vlan_id: DEFAULT_DOMAIN.vid,
+        msrp_accumulated_latency_ns: avb_srp::attr::TALKER_INITIAL_ACCUMULATED_LATENCY_NS,
+    });
 
     // Announce ourselves now that the model is real — it carries the format we
     // just derived, so this ADP advertises an entity_model_id that will not
@@ -4085,7 +4102,8 @@ fn talker_loop(
     // Inbound peak |sample| per (stream_id, channel), sampled every 8th PDU,
     // so the run summary can say which 16R channels actually carried signal.
     let mut in_peak: std::collections::BTreeMap<(u64, u16), i64> = Default::default();
-    let mut in_peak_tick: u64 = 0;
+    // Per-stream PDU counters for that sampling (see `peak_sample_due`).
+    let mut in_peak_tick: std::collections::BTreeMap<u64, u64> = Default::default();
 
     loop {
         // One queued control frame per pass. A probe round used to send its
@@ -5755,8 +5773,9 @@ fn talker_loop(
                                 &dump_aaf_pdu("RX 16R's", p.payload, gptp.now_ns(now_mach())),
                             );
                         }
-                        in_peak_tick = in_peak_tick.wrapping_add(1);
-                        if in_peak_tick.is_multiple_of(8) && pdu.hdr.bit_depth == 32 {
+                        if pdu.hdr.bit_depth == 32
+                            && peak_sample_due(&mut in_peak_tick, pdu.hdr.stream.stream_id.0, 8)
+                        {
                             note_channel_peaks(&mut in_peak, &pdu);
                         }
                         lrx.on_pdu(log, &pdu, elapsed);
@@ -8121,6 +8140,17 @@ fn uid_label(uid: Option<u16>) -> String {
     }
 }
 
+/// Whether this PDU is one the inbound peak meter samples: every `every`th PDU
+/// OF ITS OWN STREAM. One counter shared by all streams locks onto a single
+/// stream once arrival is regular: the 16R sends one PDU per stream per
+/// interval in a fixed order, so with 8 streams "every 8th PDU" is always the
+/// same stream (seen: only source 5 reported signal on a clean run).
+fn peak_sample_due(ticks: &mut std::collections::BTreeMap<u64, u64>, sid: u64, every: u64) -> bool {
+    let t = ticks.entry(sid).or_insert(0);
+    *t = t.wrapping_add(1);
+    t.is_multiple_of(every.max(1))
+}
+
 /// Fold one AAF PDU's samples into the per-(stream_id, channel) peak map.
 /// 32-bit big-endian interleaved, `channels_per_frame` channels per sample
 /// frame.
@@ -9396,7 +9426,39 @@ mod talker_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::tx_probe_frame;
+    use super::{peak_sample_due, tx_probe_frame};
+
+    #[test]
+    fn peak_sampling_covers_every_interleaved_stream() {
+        // 8 streams, one PDU each per interval in a fixed order, 64 intervals.
+        let mut ticks = std::collections::BTreeMap::new();
+        let mut sampled = [0u32; 8];
+        for _ in 0..64 {
+            for (s, n) in sampled.iter_mut().enumerate() {
+                if peak_sample_due(&mut ticks, 0x000a_9203_3ba9_0001 + s as u64, 8) {
+                    *n += 1;
+                }
+            }
+        }
+        assert_eq!(
+            sampled, [8; 8],
+            "each stream sampled on 1 in 8 of its own PDUs"
+        );
+
+        // The shared-counter version this replaces: only one stream is seen.
+        let mut shared = 0u64;
+        let mut seen = [false; 8];
+        for _ in 0..64 {
+            for (s, hit) in seen.iter_mut().enumerate() {
+                shared += 1;
+                if shared.is_multiple_of(8) {
+                    *hit = s == 7 || *hit;
+                    assert_eq!(s, 7);
+                }
+            }
+        }
+        assert_eq!(seen.iter().filter(|&&h| h).count(), 1);
+    }
 
     #[test]
     fn tx_probe_frame_is_self_addressed_min_size() {
