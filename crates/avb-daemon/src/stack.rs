@@ -4113,6 +4113,14 @@ fn talker_loop(
     // Inbound peak |sample| per (stream_id, channel), sampled every 8th PDU,
     // so the run summary can say which 16R channels actually carried signal.
     let mut in_peak: std::collections::BTreeMap<(u64, u16), i64> = Default::default();
+    let no_audio_tx = std::env::var_os("AVB_DEBUG_NO_AUDIO_TX").is_some();
+    if no_audio_tx {
+        log.log(
+            Level::Warn,
+            dir,
+            "TEST HOOK: AVB_DEBUG_NO_AUDIO_TX set — no audio frame will be transmitted",
+        );
+    }
     // Per-stream PDU counters for that sampling (see `peak_sample_due`).
     let mut in_peak_tick: std::collections::BTreeMap<u64, u64> = Default::default();
 
@@ -6740,6 +6748,13 @@ fn talker_loop(
         // wire. Ignoring that once made the summary report 441 232 PDUs
         // "sent" in a run where only 58 820 arrived, which hid the real
         // fault.
+        // Test hook (AVB_DEBUG_NO_AUDIO_TX=1): everything else as normal --
+        // entity, MSRP Talker Advertise, ACMP, gPTP, inbound -- but no audio
+        // frame goes on the wire. Separates "the 16R reacts to our audio
+        // packets" from "it reacts to us as a talker entity".
+        if no_audio_tx {
+            tx_staged_len = 0;
+        }
         if tx_staged_len > 0 {
             let mut batch: [&[u8]; avb_dext::abi::tx_batch::MAX] =
                 [&[]; avb_dext::abi::tx_batch::MAX];
