@@ -2491,6 +2491,41 @@ AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOU
         return kIOReturnSuccess;
     }
 
+    case kAvbSelReadPhyMmd: {
+        // One clause-45 register read through the clause-22 MMD access
+        // registers (IEEE 802.3 Annex 22D; tg3 behaviour reference): write
+        // MMD_CTRL (13) = devad, MMD_ADDR (14) = reg, MMD_CTRL = 0x4000|devad
+        // (data, no increment), read 14. Only registers 13/14 are written;
+        // 13 is restored to the value it held before (logged).
+        if (!ok(v)) {
+            return kIOReturnNotReady;
+        }
+        const uint64_t devad = a->scalarInput[0];
+        const uint64_t reg = a->scalarInput[1];
+        if (devad > 31 || reg > 0xffff) {
+            return kIOReturnBadArgument;
+        }
+        constexpr uint32_t kMmdCtrl = 13;
+        constexpr uint32_t kMmdAddr = 14;
+        uint16_t saved = 0;
+        if (!miRead(v, kMmdCtrl, &saved)) {
+            return kIOReturnIOError;
+        }
+        uint16_t val = 0;
+        const bool okRead = miWrite(v, kMmdCtrl, static_cast<uint16_t>(devad)) &&
+                            miWrite(v, kMmdAddr, static_cast<uint16_t>(reg)) &&
+                            miWrite(v, kMmdCtrl, static_cast<uint16_t>(0x4000 | devad)) &&
+                            miRead(v, kMmdAddr, &val);
+        const bool okRestore = miWrite(v, kMmdCtrl, saved);
+        LOG("phy mmd read %llu.0x%04llx = 0x%04x (reg13 was 0x%04x, restored %d)", devad, reg, val, saved,
+            okRestore);
+        if (!okRead) {
+            return kIOReturnIOError;
+        }
+        a->scalarOutput[0] = val;
+        return kIOReturnSuccess;
+    }
+
     case kAvbSelReadSram: {
         if (!ok(v)) {
             return kIOReturnNotReady;

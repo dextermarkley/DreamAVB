@@ -59,6 +59,8 @@ enum AvbSelector : uint32_t {
     kAvbSelReadCoreMem      = 17, // BCM: in: scratch addr (0x0800xxxx)        out: word
     kAvbSelReadSram         = 18, // BCM: in: NIC SRAM addr   out: word (memory window)
     kAvbSelReadPhy          = 19, // BCM: in: clause-22 PHY reg 0..31  out: value (MDIO read only)
+    kAvbSelReadPhyMmd       = 20, // BCM: in: devad 0..31, reg 0..0xffff  out: value (clause-45 via
+                                  //      clause-22 regs 13/14, IEEE 802.3 Annex 22D; reg 13 restored)
     // 32..47 reserved: talker TX ring / Qav (not built in Phase 1a)
 };
 

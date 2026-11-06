@@ -448,6 +448,21 @@ impl Device {
         Ok(out[0] as u16)
     }
 
+    /// BCM only: read clause-45 register `devad.reg` through the clause-22
+    /// MMD access registers 13/14. Writes only 13/14 (13 is restored).
+    pub fn read_phy_mmd(&self, devad: u8, reg: u16) -> Result<u16> {
+        let mut out = [0u64; 1];
+        self.call(
+            sel::READ_PHY_MMD,
+            &[u64::from(devad), u64::from(reg)],
+            &[],
+            &mut out,
+            None,
+            "ReadPhyMmd",
+        )?;
+        Ok(out[0] as u16)
+    }
+
     pub fn read_sram(&self, nic_addr: u32) -> Result<u32> {
         let mut out = [0u64; 1];
         self.call(

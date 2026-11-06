@@ -122,6 +122,11 @@ enum Cmd {
     /// and decode autonegotiation, pause and link-partner abilities.
     /// Read-only.
     Phy,
+    /// BCM only: Energy-Efficient Ethernet state. PHY clause-45 7.60 (our
+    /// EEE advertisement), 7.61 (link partner's), the Broadcom EEE
+    /// resolution status 7.0x803E, PCS status 3.1 (LPI indications), and the
+    /// MAC's CPMU EEE registers. Writes only PHY regs 13/14 (MMD access).
+    Eee,
     SramDump {
         #[arg(long, default_value_t = 0x100)]
         start: u32,
@@ -989,6 +994,71 @@ fn cmd_phy(dev: &Device, json: Option<&Path>) -> Result<()> {
     emit(json, "phy", &serde_json::json!({ "regs": r.to_vec() }))
 }
 
+/// EEE ability bits shared by 7.60 / 7.61 (IEEE 802.3 45.2.7.13-14).
+fn eee_modes(v: u16) -> String {
+    let mut m = Vec::new();
+    if v & (1 << 1) != 0 {
+        m.push("100BASE-TX");
+    }
+    if v & (1 << 2) != 0 {
+        m.push("1000BASE-T");
+    }
+    if v & (1 << 3) != 0 {
+        m.push("10GBASE-T");
+    }
+    if m.is_empty() {
+        "none".into()
+    } else {
+        m.join(" ")
+    }
+}
+
+fn cmd_eee(dev: &Device, json: Option<&Path>) -> Result<()> {
+    let adv = dev.read_phy_mmd(7, 60)?;
+    let lp = dev.read_phy_mmd(7, 61)?;
+    let res = dev.read_phy_mmd(7, 0x803e)?;
+    let pcs = dev.read_phy_mmd(3, 1)?;
+    println!(
+        "7.60   we advertise EEE      0x{adv:04x}  {}",
+        eee_modes(adv)
+    );
+    println!("7.61   16R advertises EEE    0x{lp:04x}  {}", eee_modes(lp));
+    println!(
+        "7.803E EEE resolution        0x{res:04x}  ({})",
+        match res {
+            0x0004 => "ACTIVE at 1000BASE-T",
+            0x0002 => "ACTIVE at 100BASE-TX",
+            0 => "not active",
+            _ => "unrecognised",
+        }
+    );
+    println!(
+        "3.1    PCS status            0x{pcs:04x}  RX LPI received {}, TX LPI indicated {}, RX LPI now {}, TX LPI now {}",
+        pcs & (1 << 11) != 0,
+        pcs & (1 << 10) != 0,
+        pcs & (1 << 9) != 0,
+        pcs & (1 << 8) != 0
+    );
+    let mode = dev.read_reg32(0x36b0)?;
+    let dbt1 = dev.read_reg32(0x36b4)?;
+    println!(
+        "CPMU 0x36B0 0x{mode:08x}  EEE enable {}, LPI enable {}, LPI in TX {}, LPI in RX {}",
+        mode & 0x0010_0000 != 0,
+        mode & 0x80 != 0,
+        mode & 0x100 != 0,
+        mode & 0x200 != 0
+    );
+    println!(
+        "CPMU 0x36B4 0x{dbt1:08x}  TX link-idle timer {} us",
+        dbt1 & 0xffff
+    );
+    emit(
+        json,
+        "eee",
+        &serde_json::json!({"adv": adv, "lp": lp, "res": res, "pcs": pcs, "mode": mode, "dbtmr1": dbt1}),
+    )
+}
+
 fn cmd_peek(dev: &Device, json: Option<&Path>, offsets: &[String]) -> Result<()> {
     let mut rec = serde_json::Map::new();
     for s in offsets {
@@ -1713,6 +1783,7 @@ fn main() -> Result<()> {
         Cmd::RxTstampPoll { seconds } => cmd_rx_tstamp_poll(&dev, json, seconds),
         Cmd::SramDump { start, end } => cmd_sram_dump(&dev, json, start, end),
         Cmd::Phy => cmd_phy(&dev, json),
+        Cmd::Eee => cmd_eee(&dev, json),
         Cmd::Peek { ref offsets } => cmd_peek(&dev, json, offsets),
         Cmd::WinTiming { n } => cmd_win_timing(&dev, json, n),
         Cmd::AecpPing { target, seconds } => cmd_aecp_ping(&dev, &target, seconds),

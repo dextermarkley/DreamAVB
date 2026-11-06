@@ -114,6 +114,8 @@ pub mod sel {
     pub const READ_SRAM: u32 = 18;
     /// BCM: one clause-22 MDIO read of the internal PHY (register 0..=31).
     pub const READ_PHY: u32 = 19;
+    /// BCM: one clause-45 read via clause-22 regs 13/14 (devad, register).
+    pub const READ_PHY_MMD: u32 = 20;
     /// Selectors every NIC dext implements (the BCM dext: only these).
     /// 32..47 are reserved for the talker path.
     pub const BASE_COUNT: u32 = 10;
