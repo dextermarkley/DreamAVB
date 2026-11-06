@@ -36,6 +36,10 @@ pub struct AafTalker {
     samples_per_pdu: usize,
     /// AAF `stream_data_length` for a full PDU = samples_per_pdu × wire_bps.
     pdu_data_len: usize,
+    /// AVTP `tu` (timestamp uncertain, 1722-2016 §4.4.4.7) for the next PDUs.
+    /// Milan v1.3 §4.3.5.2 / Annex B.1.1: set while the gPTP time may be
+    /// unreliable (holdover, no asCapable) and for 0.25 s after a GM change.
+    tu: bool,
 }
 
 /// Why a packetize call produced no PDU.
@@ -63,7 +67,13 @@ impl AafTalker {
             wire_bps,
             samples_per_pdu,
             pdu_data_len,
+            tu: false,
         })
+    }
+
+    /// Set the `tu` bit carried by every following PDU.
+    pub fn set_tu(&mut self, tu: bool) {
+        self.tu = tu;
     }
 
     /// Total AVTPDU length a full PDU occupies (header + payload).
@@ -118,7 +128,7 @@ impl AafTalker {
                 mr: false,
                 tv,
                 seq: self.seq,
-                tu: false,
+                tu: self.tu,
                 stream_id: self.stream_id,
                 avtp_timestamp,
             },
@@ -179,6 +189,20 @@ mod tests {
     fn q6_48k_8ch_32() -> AafFormat {
         // 0x0205022002006000: nsr 5 (48k), INT_32BIT, depth 32, 8 ch, 6 spf.
         StreamFormat(0x0205_0220_0200_6000).aaf().unwrap()
+    }
+
+    #[test]
+    fn tu_bit_follows_set_tu() {
+        let sid = StreamId::from_be_bytes([0x00, 0x0a, 0x92, 0x03, 0x3b, 0xa9, 0x00, 0x01]);
+        let mut t = AafTalker::new(sid, q6_48k_8ch_32()).unwrap();
+        let samples = vec![0u8; 8 * 6 * 4];
+        let mut out = [0u8; 512];
+        for want in [false, true, false] {
+            t.set_tu(want);
+            let n = t.packetize(&samples, 7, true, &mut out).unwrap();
+            let pdu = aaf::decode(&out[..n]).unwrap();
+            assert_eq!(pdu.hdr.stream.tu, want);
+        }
     }
 
     #[test]
