@@ -162,18 +162,27 @@ pub fn is_maap_dynamic(mac: MacAddr) -> bool {
 /// A talker's stream destination address for stream `uid`, taken from the MAAP
 /// dynamic pool (IEEE 1722-2016 Annex B).
 ///
-/// A fully conformant talker CLAIMS its block by running the MAAP protocol —
-/// probe the candidate range, defend it against other claimants, and move on a
-/// conflict. We do not run MAAP yet, so this derives a stable pseudo-random
-/// base from our own MAC instead: two different machines land on different
-/// blocks with high probability, and the same machine always picks the same one
-/// so a listener's saved connection stays valid across restarts.
+/// This is the address in the INITIAL block (relocation attempt 0). The base
+/// is a stable pseudo-random function of our own MAC: two machines land on
+/// different blocks with high probability, and the same machine always picks
+/// the same one, so a listener's saved connection stays valid across
+/// restarts. The daemon claims and defends the block with MAAP; after a
+/// conflict it moves to [`maap_block_base`] with a higher attempt and the
+/// streams follow via [`maap_block_addr`].
 ///
 /// The address MUST come from this pool. The 16R demonstrates it by example
 /// (`91:E0:F0:00:CE:F4`..`FB`), and a Milan listener will reserve bandwidth for
 /// a stream addressed outside it — SRP does not police the block — while never
 /// media-locking to the audio.
 pub fn maap_stream_dest(our_mac: MacAddr, uid: u16, block_len: u16) -> MacAddr {
+    maap_block_addr(maap_block_base(our_mac, 0, block_len), uid)
+}
+
+/// The first address of our MAAP block of `block_len` addresses on
+/// relocation `attempt` (0 = the initial claim). Each attempt moves the block
+/// one whole block further on, wrapping inside the dynamic pool, so every
+/// candidate leaves room for `block_len` addresses before the pool ends.
+pub fn maap_block_base(our_mac: MacAddr, attempt: u32, block_len: u16) -> MacAddr {
     // FNV-1a over the MAC, so the base does not correlate with the OUI (every
     // Mac of one vendor would otherwise crowd into the same part of the pool).
     let mut h: u32 = 0x811c_9dc5;
@@ -181,10 +190,22 @@ pub fn maap_stream_dest(our_mac: MacAddr, uid: u16, block_len: u16) -> MacAddr {
         h ^= u32::from(b);
         h = h.wrapping_mul(0x0100_0193);
     }
-    let span = MAAP_DYNAMIC_COUNT.saturating_sub(u32::from(block_len).max(1));
-    let base = if span == 0 { 0 } else { h % span };
-    let off = (base + u32::from(uid)) & 0xFFFF;
+    let len = u32::from(block_len).max(1);
+    let span = MAAP_DYNAMIC_COUNT.saturating_sub(len);
+    let off = if span == 0 {
+        0
+    } else {
+        ((u64::from(h % span) + u64::from(attempt) * u64::from(len)) % u64::from(span)) as u32
+    };
     MacAddr([0x91, 0xE0, 0xF0, 0x00, (off >> 8) as u8, off as u8])
+}
+
+/// Address `uid` of the block starting at `base` (the stream with unique id
+/// `uid` uses it).
+pub fn maap_block_addr(base: MacAddr, uid: u16) -> MacAddr {
+    let lo = u16::from_be_bytes([base.0[4], base.0[5]]).wrapping_add(uid);
+    let [hi, lo] = lo.to_be_bytes();
+    MacAddr([base.0[0], base.0[1], base.0[2], base.0[3], hi, lo])
 }
 
 #[cfg(test)]
@@ -206,6 +227,26 @@ mod tests {
         MacAddr([0x91, 0xE0, 0xF0, 0x00, 0xCE, 0xFA]),
         MacAddr([0x91, 0xE0, 0xF0, 0x00, 0xCE, 0xFB]),
     ];
+
+    #[test]
+    fn relocated_blocks_stay_in_the_pool_and_streams_follow_the_base() {
+        for uid in 0..64 {
+            assert_eq!(
+                maap_block_addr(maap_block_base(OUR_MAC, 0, 64), uid),
+                maap_stream_dest(OUR_MAC, uid, 64)
+            );
+        }
+        let b0 = maap_block_base(OUR_MAC, 0, 64);
+        let b1 = maap_block_base(OUR_MAC, 1, 64);
+        assert_ne!(b0, b1);
+        // Every attempt leaves a whole block inside the pool, even after it
+        // wraps past the end.
+        for attempt in 0..2_000 {
+            let b = maap_block_base(OUR_MAC, attempt, 64);
+            assert!(is_maap_dynamic(b));
+            assert!(is_maap_dynamic(maap_block_addr(b, 63)), "attempt {attempt}");
+        }
+    }
 
     #[test]
     fn the_16rs_own_stream_addresses_are_in_the_maap_dynamic_pool() {

@@ -20,8 +20,8 @@ pub mod time;
 pub use counter::Counter;
 pub use eth::{EthFrame, EthHeader, VlanSource, VlanTag};
 pub use mac::{
-    is_avdecc_dest, is_maap_dynamic, maap_stream_dest, Eui64, MacAddr, StreamId, AVDECC_MULTICAST,
-    MAAP_DYNAMIC_COUNT, MAAP_DYNAMIC_FIRST, MAAP_DYNAMIC_LAST,
+    is_avdecc_dest, is_maap_dynamic, maap_block_addr, maap_block_base, maap_stream_dest, Eui64,
+    MacAddr, StreamId, AVDECC_MULTICAST, MAAP_DYNAMIC_COUNT, MAAP_DYNAMIC_FIRST, MAAP_DYNAMIC_LAST,
 };
 pub use outbox::{FrameTooLong, Outbox, TxFrame, TxFull};
 pub use rx::{DropReason, Now, RxMeta};

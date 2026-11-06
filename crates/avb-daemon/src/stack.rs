@@ -4061,6 +4061,9 @@ fn talker_loop(
         64,
         0,
     );
+    // The media clock's Talker Advertise after a MAAP relocation withdrew it:
+    // its AVTPDU length, redeclared on the new address once MAAP acquires.
+    let mut crf_ta_pending: Option<usize> = None;
     let mut last_connect = now_mach();
     let mut last_advert = now_mach();
     // AEM commands we answered, and how many we had to refuse. A run where the
@@ -4369,14 +4372,9 @@ fn talker_loop(
                         let before = maap.block().0;
                         let act = maap.on_rx(&m, ns_since(start), |attempt| {
                             // Relocate through the SAME derivation the stream
-                            // addresses come from, offset by the attempt, so a
-                            // moved block stays inside the MAAP pool and the
-                            // per-stream addresses keep following the base.
-                            avb_core::maap_stream_dest(
-                                our_mac,
-                                attempt.saturating_mul(64) as u16,
-                                64,
-                            )
+                            // addresses come from, one whole block on per
+                            // attempt, wrapping inside the MAAP pool.
+                            avb_core::maap_block_base(our_mac, attempt, 64)
                         });
                         if maap.block().0 != before {
                             log.log(
@@ -4384,12 +4382,44 @@ fn talker_loop(
                                 "maap",
                                 &format!(
                                     "conflict on our block {:02x?} from {:02x?} — moved to \
-                                     {:02x?} and re-probing",
+                                     {:02x?} and re-probing; stream addresses follow",
                                     before.octets(),
                                     p.hdr.src.octets(),
                                     maap.block().0.octets()
                                 ),
                             );
+                            // Milan v1.3 §4.3.5.1: the streams move with the
+                            // block. While MAAP re-probes, `ta_wanted` is false,
+                            // so every audio Talker Advertise (on the old
+                            // address) is withdrawn on the next tick and
+                            // redeclared on the new one once MAAP acquires it.
+                            // The media clock's TA is declared outside that
+                            // path, so move it here.
+                            let dests: Vec<avb_core::MacAddr> = entity
+                                .model()
+                                .streams
+                                .iter()
+                                .map(|s| block_dest(&maap, s.stream_id))
+                                .collect();
+                            entity.set_output_dest_macs(dests);
+                            for idx in 0..entity.model().stream_count() {
+                                for (dst, resp) in entity.unsolicited_desc(
+                                    avb_avdecc::constants::aem_cmd::GET_STREAM_INFO,
+                                    avb_avdecc::constants::desc::STREAM_OUTPUT,
+                                    idx,
+                                ) {
+                                    send_aem_response(dext, our_mac, dst, &resp);
+                                    unsol_sent += 1;
+                                }
+                            }
+                            if let Some(t) = &crf_talker {
+                                srp.withdraw(
+                                    now_mach(),
+                                    avb_srp::attr::App::Msrp,
+                                    avb_srp::attr::AttrKey::Talker(crf_stream_id),
+                                );
+                                crf_ta_pending = Some(t.pdu_len());
+                            }
                         }
                         if let Some(avb_avtp::maap::Action::Send(d)) = act {
                             let hdr = EthHeader {
@@ -4627,7 +4657,7 @@ fn talker_loop(
                         our_id,
                         our_unique_id: uid,
                         stream_id: sid,
-                        stream_dest_mac: stream_dest_mac(sid),
+                        stream_dest_mac: block_dest(&maap, sid),
                         stream_vlan_id: DEFAULT_DOMAIN.vid,
                         connection_count: 1,
                     },
@@ -4938,7 +4968,7 @@ fn talker_loop(
                     let ours = out_streams
                         .iter()
                         .find(|o| u64at(16) == Some(o.stream_id.0))
-                        .map(|o| (o.stream_id.0, stream_dest_mac(o.stream_id)));
+                        .map(|o| (o.stream_id.0, block_dest(&maap, o.stream_id)));
                     log.log(
                         Level::Info,
                         "aem",
@@ -5425,7 +5455,7 @@ fn talker_loop(
                             listener_ready = true;
                             entity.set_stream_info(avb_avdecc::entity::StreamInfo {
                                 connected: true,
-                                dest_mac: stream_dest_mac(first.stream_id),
+                                dest_mac: block_dest(&maap, first.stream_id),
                                 vlan_id: DEFAULT_DOMAIN.vid,
                                 // MUST be the value we actually declare in the
                                 // Talker Advertise. Reporting 0 here while
@@ -5465,7 +5495,7 @@ fn talker_loop(
                             listener_ready = false;
                             entity.set_stream_info(avb_avdecc::entity::StreamInfo {
                                 connected: false,
-                                dest_mac: stream_dest_mac(first.stream_id),
+                                dest_mac: block_dest(&maap, first.stream_id),
                                 vlan_id: DEFAULT_DOMAIN.vid,
                                 msrp_accumulated_latency_ns:
                                     avb_srp::attr::TALKER_INITIAL_ACCUMULATED_LATENCY_NS,
@@ -5545,10 +5575,32 @@ fn talker_loop(
             let now_ns = ns_since(start);
             next_ta_check_ns = now_ns.saturating_add(100_000_000);
             let maap_ok = maap.acquired();
+            if maap_ok {
+                if let Some(pdu_len) = crf_ta_pending.take() {
+                    let advertise = avb_srp::attr::TalkerAdvertise {
+                        dest_mac: block_dest(&maap, crf_stream_id),
+                        ..talker_tspec(crf_stream_id, pdu_len)
+                    };
+                    let dest = advertise.dest_mac;
+                    srp.declare_new(now_mach(), Attribute::Talker(Talker::Advertise(advertise)));
+                    log.log(
+                        Level::Info,
+                        "msrp",
+                        &format!(
+                            "Talker Advertise redeclared: media clock {crf_uid} dest {dest} \
+                             (MAAP moved the block)"
+                        ),
+                    );
+                }
+            }
             for (i, o) in out_streams.iter_mut().enumerate() {
                 let want = ta_wanted(maap_ok, o.last_probe_ns, o.listener_attr, now_ns);
                 if want && !o.ta_declared {
-                    let advertise = talker_tspec(o.stream_id, o.talker.pdu_len());
+                    // The address MAAP holds now, which moves on a conflict.
+                    let advertise = avb_srp::attr::TalkerAdvertise {
+                        dest_mac: block_dest(&maap, o.stream_id),
+                        ..talker_tspec(o.stream_id, o.talker.pdu_len())
+                    };
                     srp.declare_new(now_mach(), Attribute::Talker(Talker::Advertise(advertise)));
                     log.log(
                         Level::Info,
@@ -5556,10 +5608,7 @@ fn talker_loop(
                         &format!(
                             "Talker Advertise declared: stream {} 0x{:016x} dest {} max_frame {}B \
                              (a listener asked for it)",
-                            o.uid,
-                            o.stream_id.0,
-                            stream_dest_mac(o.stream_id),
-                            advertise.max_frame_size
+                            o.uid, o.stream_id.0, advertise.dest_mac, advertise.max_frame_size
                         ),
                     );
                 } else if !want && o.ta_declared {
@@ -5572,9 +5621,13 @@ fn talker_loop(
                         Level::Info,
                         "msrp",
                         &format!(
-                            "Talker Advertise withdrawn: stream {} (no PROBE_TX for 15 s and no \
-                             listener attribute)",
-                            o.uid
+                            "Talker Advertise withdrawn: stream {} ({})",
+                            o.uid,
+                            if maap_ok {
+                                "no PROBE_TX for 15 s and no listener attribute"
+                            } else {
+                                "MAAP does not hold the address block"
+                            }
                         ),
                     );
                 }
@@ -6649,7 +6702,7 @@ fn talker_loop(
                         match t.packetize(&[ts], &mut crf_scratch) {
                             Ok(n) => {
                                 let hdr = EthHeader {
-                                    dst: stream_dest_mac(crf_stream_id),
+                                    dst: block_dest(&maap, crf_stream_id),
                                     src: our_mac,
                                     vlan: Some(VlanTag {
                                         pcp: DEFAULT_DOMAIN.priority,
@@ -6897,7 +6950,7 @@ fn talker_loop(
                 // multicast to a bridge: 8000 frames/s of it per stream, which
                 // the MOTU switch answered by stopping gPTP Sync on our port
                 // and tearing down every reservation within a second.
-                Some(o) if o.ready => (o.first_ch, stream_dest_mac(o.stream_id)),
+                Some(o) if o.ready => (o.first_ch, block_dest(&maap, o.stream_id)),
                 Some(_) => continue,
                 None => break,
             };
@@ -7455,9 +7508,10 @@ fn talker_loop(
 ///
 /// The block is derived deterministically from our own MAC by
 /// [`avb_core::maap_stream_dest`], and MAAP probes and defends exactly that
-/// block (`Maap::new` in `talker_loop`). KNOWN GAP (Milan v1.3 §4.3.5.1): if
-/// MAAP has to MOVE the block after a conflict, the streams still use this
-/// address; nothing re-derives it from `maap.block()` yet.
+/// block (`Maap::new` in `talker_loop`). This is the INITIAL block's address,
+/// used before the loop starts; inside the loop every stream address comes
+/// from [`block_dest`], so it follows the block when MAAP moves it after a
+/// conflict (Milan v1.3 §4.3.5.1).
 ///
 /// This previously used `91:E0:F0:01:xx:xx`, one octet above the pool, to keep
 /// clear of the dext's AVDECC fallback classifier (which claims all of
@@ -7476,6 +7530,13 @@ fn talker_loop(
 fn stream_dest_mac(stream_id: avb_core::StreamId) -> avb_core::MacAddr {
     const MAAP_BLOCK_LEN: u16 = 64;
     avb_core::maap_stream_dest(stream_id.mac(), stream_id.unique_id(), MAAP_BLOCK_LEN)
+}
+
+/// A stream's destination in the block MAAP holds NOW: the block's base plus
+/// the stream's unique id. Equal to [`stream_dest_mac`] until a conflict moves
+/// the block.
+fn block_dest(maap: &avb_avtp::maap::Maap, stream_id: avb_core::StreamId) -> avb_core::MacAddr {
+    avb_core::maap_block_addr(maap.block().0, stream_id.unique_id())
 }
 
 /// Upper bound on 24-packet audio-ring batches drained in one loop pass:
@@ -9929,6 +9990,39 @@ mod talker_tests {
         for uid in [0u16, 1, 7] {
             let sid = StreamId::from_parts(mac, uid);
             assert_eq!(talker_tspec(sid, 234).dest_mac, stream_dest_mac(sid));
+        }
+    }
+
+    /// Before a conflict, `block_dest` is `stream_dest_mac`; after MAAP moves
+    /// the block, every stream address moves with it and stays in the pool.
+    #[test]
+    fn stream_addresses_follow_a_relocated_maap_block() {
+        use avb_avtp::maap::{msg, Maap, MaapPdu};
+        let mac = MacAddr([0x64, 0x4b, 0xf0, 0x12, 0x73, 0xb8]);
+        let base = stream_dest_mac(StreamId::from_parts(mac, 0));
+        let mut m = Maap::new(base, 64, 0);
+        for uid in [0u16, 5, 16] {
+            let sid = StreamId::from_parts(mac, uid);
+            assert_eq!(block_dest(&m, sid), stream_dest_mac(sid));
+        }
+        let rival = MaapPdu {
+            message_type: msg::ANNOUNCE,
+            requested_start: base,
+            requested_count: 64,
+            conflict_start: MacAddr([0; 6]),
+            conflict_count: 0,
+        };
+        m.on_rx(&rival, 1, |a| avb_core::maap_block_base(mac, a, 64));
+        assert_ne!(m.block().0, base);
+        for uid in [0u16, 5, 16] {
+            let sid = StreamId::from_parts(mac, uid);
+            let d = block_dest(&m, sid);
+            assert_ne!(d, stream_dest_mac(sid));
+            assert!(avb_core::is_maap_dynamic(d));
+            assert!(
+                !rival.overlaps(d, 1),
+                "uid {uid} -> {d} still in the rival's block"
+            );
         }
     }
 }
