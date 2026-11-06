@@ -98,6 +98,14 @@ struct AVBBcmDriver_IVars {
     struct mach_timebase_info tb;
 
     IODispatchQueue * queue;     // default queue (timer + user client calls)
+    // SendFrame/SendFrames run on their own queue so a talker's batch never
+    // waits behind the 1 ms harvest (measured: harvest up to 2.2 ms, while
+    // SendFrames itself takes <= 27 us). txLock serialises everything the two
+    // queues share: the TX ring and doorbell, the TX-timestamp latch state,
+    // the EAV high word, datapath init/shutdown, and every config-window
+    // access (so no doorbell can land inside or just before one).
+    IODispatchQueue * txQueue;
+    IOLock * txLock;
     IOTimerDispatchSource * timer;
     OSAction * timerAction;
     bool timerRunning;
@@ -299,11 +307,35 @@ static uint32_t cfgRd32Raw(IV * v, uint32_t off)
 
 static void guardDoorbell(IV * v);
 
+// Holds txLock for its scope. IOLock is not recursive: a function that takes
+// it must never be called with it held (the *Locked variants assume it).
+struct TxGuard {
+    IV * v;
+    bool held;
+    explicit TxGuard(IV * iv, bool take = true) : v(iv), held(take)
+    {
+        if (held) {
+            IOLockLock(v->txLock);
+        }
+    }
+    ~TxGuard()
+    {
+        if (held) {
+            IOLockUnlock(v->txLock);
+        }
+    }
+    TxGuard(const TxGuard &) = delete;
+    TxGuard & operator=(const TxGuard &) = delete;
+};
+
 // Internal memory (RX/TX-CPU scratch at 0x30000/0x34000) through the register
 // indirect window. Matches ThunderGate: write the big-endian-assembled word
 // as-is, byte-swap on read (their htonl), restore the base to 0 after.
+// Each access holds txLock (~110 us), never longer: a SendFrames waits at most
+// one window word, where it used to wait out a whole multi-word refresh.
 static void regWinWrite(IV * v, uint32_t winAddr, uint32_t word)
 {
+    TxGuard g(v);
     guardDoorbell(v);
     cfgWr32(v, bcm::kRegWinBase, winAddr);
     cfgWr32(v, bcm::kRegWinData, word);
@@ -318,6 +350,7 @@ static uint32_t regWinRead(IV * v, uint32_t winAddr)
     // it correctly). No byte swap here -- ThunderGate's htonl compensated for
     // its own Python/userclient layer, which DriverKit config access does not
     // impose.
+    TxGuard g(v);
     guardDoorbell(v);
     cfgWr32(v, bcm::kRegWinBase, winAddr);
     const uint32_t raw = cfgRd32Raw(v, bcm::kRegWinData);
@@ -400,8 +433,10 @@ static uint32_t eavSample(IV * v)
 // directly (as Apple's receivePackets does on parts where it works); instead we
 // use eavHi, re-aligned to the TX latch epoch. If the current low word is at or
 // behind the frame's, the frame predates the latest wrap -> borrow one.
+// Takes txLock: eavHi/eavLastLo are also re-aligned by checkTx on the TX queue.
 static uint64_t reconstructRxTs(IV * v, uint32_t frameLsb)
 {
+    TxGuard g(v);
     const uint32_t eavLsb = eavSample(v);
     return reconstructEavTs(v->eavHi, eavLsb, frameLsb);
 }
@@ -1341,7 +1376,10 @@ static bool drainReturnRing(IV * v, RingTick * tick, const volatile RxBd * ret, 
     // before this; an event frame that still meets a pending TX is delivered
     // unstamped and counted (kAvbCtrStampSkipped). It is NOT picked up later:
     // the frame has left the ring by then.
-    const bool stampReady = !v->tsPending && v->rxcpuStamp;
+    // tsPending is set on the TX queue; this read is a snapshot, and any
+    // window access later in the drain still takes txLock and the doorbell
+    // guard, so a timestamped send that lands meanwhile is kept clear of it.
+    const bool stampReady = !__atomic_load_n(&v->tsPending, __ATOMIC_ACQUIRE) && v->rxcpuStamp;
     bool stampRefreshed = false;
     while (cons != hwProd && ok(v)) {
         RxBd bd;
@@ -1422,8 +1460,11 @@ static void harvestRx(IV * v)
     // Keep the software EAV high word tracking wraps even when no gPTP frame is
     // stamped this cycle (a BAR read, safe alongside TX). Skip while a TX
     // timestamp is pending so nothing competes with the latch window.
-    if (!v->tsPending) {
-        (void)eavSample(v);
+    {
+        TxGuard g(v);
+        if (!v->tsPending) {
+            (void)eavSample(v);
+        }
     }
 
     RingTick tick = ringTickBegin(v);
@@ -1460,7 +1501,16 @@ static void harvestRx(IV * v)
     }
 }
 
+static void checkTxLocked(IV * v);
+
 static void checkTx(IV * v)
+{
+    TxGuard g(v);
+    checkTxLocked(v);
+}
+
+// Caller holds txLock.
+static void checkTxLocked(IV * v)
 {
     uint8_t sb[0x14];
     readStatusBlock(v, sb);
@@ -1600,7 +1650,7 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
     if (len < 14 || len > AVB_FRAME_MAX_LEN) {
         return kIOReturnBadArgument;
     }
-    checkTx(v);
+    checkTxLocked(v);
     if (wantTs && v->tsPending) {
         return kIOReturnBusy;
     }
@@ -1669,7 +1719,7 @@ static kern_return_t sendFrames(IV * v, const uint8_t * in, uint32_t inLen, uint
         v->ctr.c[kAvbCtrTxBatchRejected]++;
         return kIOReturnBadArgument;
     }
-    checkTx(v);
+    checkTxLocked(v);
     auto * ring = reinterpret_cast<TxBd *>(v->txRing.va);
     uint32_t accepted = 0;
     bool refused = false;
@@ -1900,10 +1950,21 @@ AVBBcmDriver::CopyRingMemory(AVBBcmUserClient * client, uint64_t type, uint64_t 
 
 // The owning connection went away: stop the producer, take the datapath down
 // and release the rings, in the I210's §3.3 order.
+IODispatchQueue *
+AVBBcmDriver::CopyTxQueue()
+{
+    IODispatchQueue * q = ivars != nullptr ? ivars->txQueue : nullptr;
+    if (q != nullptr) {
+        q->retain();
+    }
+    return q;
+}
+
 void
 AVBBcmDriver::ClientGone(AVBBcmUserClient * client)
 {
     IV * v = ivars;
+    TxGuard g(v);
     if (client == nullptr || client != v->owner) {
         return;
     }
@@ -1930,7 +1991,8 @@ AVBBcmDriver::init()
     }
     ivars->sw = IONewZero(AvbRxEntry, kSwRingSize);
     ivars->batch = IONewZero(AvbRxBatch, 1);
-    return ivars->sw != nullptr && ivars->batch != nullptr;
+    ivars->txLock = IOLockAlloc();
+    return ivars->sw != nullptr && ivars->batch != nullptr && ivars->txLock != nullptr;
 }
 
 void
@@ -1941,7 +2003,9 @@ AVBBcmDriver::free()
         OSSafeReleaseNULL(ivars->timerAction);
         OSSafeReleaseNULL(ivars->timer);
         OSSafeReleaseNULL(ivars->queue);
+        OSSafeReleaseNULL(ivars->txQueue);
         releaseRings(ivars);
+        IOLockFreeZero(ivars->txLock);
         IOSafeDeleteNULL(ivars->sw, AvbRxEntry, kSwRingSize);
         IOSafeDeleteNULL(ivars->batch, AvbRxBatch, 1);
     }
@@ -1999,6 +2063,9 @@ IMPL(AVBBcmDriver, Start)
 
     ret = CopyDispatchQueue(kIOServiceDefaultQueueName, &v->queue);
     if (ret == kIOReturnSuccess) {
+        ret = IODispatchQueue::Create("AVBBcmTx", 0, 0, &v->txQueue);
+    }
+    if (ret == kIOReturnSuccess) {
         ret = IOTimerDispatchSource::Create(v->queue, &v->timer);
     }
     if (ret == kIOReturnSuccess) {
@@ -2037,6 +2104,7 @@ IMPL(AVBBcmDriver, Stop)
     }
     v->timerRunning = false;
     if (v->opened) {
+        TxGuard g(v);
         shutdownDatapath(v);
         setCommandBits(v, 0, bcm::kCmdBusMaster);
         v->pci->Close(this, 0);
@@ -2132,6 +2200,14 @@ kern_return_t
 AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOUserClientMethodArguments * a)
 {
     IV * v = ivars;
+    // Locking: every selector runs under txLock for its whole body, except
+    // those whose helpers take it themselves (config-window access, and the
+    // TX-timestamp poll). SendFrame/SendFrames arrive on txQueue; everything
+    // else on the default queue, where the 1 ms harvest takes the lock only
+    // in short pieces.
+    const bool selfLocking = selector == kAvbSelLoadCoreImage || selector == kAvbSelReadCoreMem ||
+                             selector == kAvbSelGetTxTimestamp;
+    TxGuard g(v, !selfLocking);
     if (isOwnerOnly(selector) && v->owner != nullptr && client != v->owner) {
         return kIOReturnExclusiveAccess;
     }
@@ -2286,8 +2362,9 @@ AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOU
     }
 
     case kAvbSelGetTxTimestamp: {
+        TxGuard tg(v);  // self-locking selector: check and read in one hold
         if (ok(v) && v->stage == kAvbStageDatapath) {
-            checkTx(v);
+            checkTxLocked(v);
         }
         const uint64_t seq = a->scalarInput[0];
         if (seq == 0 || seq != v->tsSeq) {

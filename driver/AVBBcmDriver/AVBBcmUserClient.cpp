@@ -2,8 +2,10 @@
 
 // AVBBcmUserClient.cpp - validates argument counts with an
 // IOUserClientMethodDispatch table, then forwards every call to
-// AVBBcmDriver::HandleUserMethod on the driver's default queue. That keeps all
-// hardware access serialized with the driver's 2 ms poll timer without locks.
+// AVBBcmDriver::HandleUserMethod. SendFrame/SendFrames go to the driver's TX
+// queue so a talker batch never waits behind the 1 ms RX harvest; every other
+// selector runs on the driver's default queue with the timer. The driver's
+// txLock serialises the state the two queues share.
 
 #include <os/log.h>
 
@@ -22,6 +24,7 @@
 struct AVBBcmUserClient_IVars {
     AVBBcmDriver * driver;
     IODispatchQueue * driverQueue;
+    IODispatchQueue * txQueue;
     bool ringsUsed;
 };
 
@@ -145,6 +148,7 @@ AVBBcmUserClient::free()
 {
     if (ivars != nullptr) {
         OSSafeReleaseNULL(ivars->driverQueue);
+        OSSafeReleaseNULL(ivars->txQueue);
         OSSafeReleaseNULL(ivars->driver);
     }
     IOSafeDeleteNULL(ivars, AVBBcmUserClient_IVars, 1);
@@ -169,6 +173,11 @@ IMPL(AVBBcmUserClient, Start)
     if (ret != kIOReturnSuccess || ivars->driverQueue == nullptr) {
         LOG("CopyDispatchQueue failed 0x%x", ret);
         return ret != kIOReturnSuccess ? ret : kIOReturnError;
+    }
+    ivars->txQueue = driver->CopyTxQueue();
+    if (ivars->txQueue == nullptr) {
+        LOG("driver has no TX queue");
+        return kIOReturnError;
     }
     LOG("opened");
     return kIOReturnSuccess;
@@ -262,6 +271,8 @@ AVBBcmUserClient::Forward(IOUserClientMethodArguments * arguments)
         return kIOReturnNotReady;
     }
     ForwardCtx ctx{ivars->driver, this, arguments->selector, arguments, kIOReturnError};
-    runSync(ivars->driverQueue, &ctx, runOnDriverQueue);
+    const bool tx = arguments->selector == kAvbSelSendFrame || arguments->selector == kAvbSelSendFrames;
+    IODispatchQueue * q = tx && ivars->txQueue != nullptr ? ivars->txQueue : ivars->driverQueue;
+    runSync(q, &ctx, runOnDriverQueue);
     return ctx.ret;
 }

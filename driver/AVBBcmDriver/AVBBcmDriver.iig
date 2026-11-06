@@ -49,6 +49,10 @@ public:
     void
     ClientGone(AVBBcmUserClient * client) LOCALONLY;
 
+    // The queue SendFrame/SendFrames run on (retained for the caller).
+    IODispatchQueue *
+    CopyTxQueue() LOCALONLY;
+
     // 1 ms poll timer: harvests the RX return ring and the pending TX timestamp.
     virtual void
     TimerFired(OSAction * action, uint64_t time) TYPE(IOTimerDispatchSource::TimerOccurred);
