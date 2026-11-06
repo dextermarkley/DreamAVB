@@ -13,6 +13,29 @@ gap blocks this connection.
 
 Read this file first, then `AGENTS.md` (rules) and the docs it points to.
 
+## Resume point (2026-11-06, branch `fix/driver-deactivation`)
+
+Full duplex audio works over the Apple Thunderbolt Ethernet adapter (BCM57762
+dext + our RX-CPU timestamping firmware); the user confirmed audio both ways.
+The 16R failures seen earlier were a Reaper input-monitoring feedback loop,
+not the stack. The review fixes from `.agents/tmp/review-{rust,dext,milan}.md`
+are committed: sink binding policy (`sinkpolicy.rs`), `tu`, per-stream
+Talker Advertise on demand, live GET_STREAM_INFO flags, dext RX-stamp and
+owner fixes, companion multi-NIC fixes, GET/SET_MAX_TRANSIT_TIME,
+GET_STREAM_INPUT_INFO_EX, and MAAP relocation. `docs/milan-conformance.md`
+has the current Milan status at its top.
+
+Not yet done:
+- Dext 309.4.48 (the RX-stamp and owner fixes, counters 37–40) is built into
+  `build/AVBInstaller.app` but NOT activated; 308.23.40 is live. Activate with
+  `avb-installer activate --dext bcm57762`, then the adapter needs a replug
+  (ask the user).
+- After that, a 10-minute duplex hardware test with Reaper closed: watch the
+  `stamp_hit`/`stamp_miss`/`stamp_skipped` counters (`avb-probe --nic bcm
+  counters`), missed intervals, and that the 16R keeps Sync and AVDECC.
+- Refactors left from the review: split `talker_loop`; share the I210/BCM
+  ring code.
+
 ## Authoritative resume point (2026-10-14)
 
 Phase 1a is complete on real hardware. Phase 1b is active on branch

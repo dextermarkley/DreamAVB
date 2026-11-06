@@ -1,5 +1,43 @@
 # Milan conformance: our talker against the normative spec
 
+> **Status update, 2026-11-06 (Milan v1.3 numbering):** the review in
+> `.agents/tmp/review-milan.md` found this page stale; the items below replace
+> the older tables where they disagree.
+>
+> - **Talker Advertise (§4.3.3.1)** is declared per stream only while MAAP
+>   holds the block AND a PROBE_TX arrived in the last 15 s or a Listener
+>   attribute is registered (`ta_wanted`). It is withdrawn otherwise.
+> - **`tu` (§4.3.5.2, Annex B.1.1)** is set while the gPTP clock is unusable
+>   and for 250 ms after a grandmaster change or the clock's return
+>   (`TuState`), on AAF and CRF alike.
+> - **MAAP (§4.3.5.1)**: the stream destinations follow the block. After a
+>   conflict the block moves (wrapping inside the pool), every Talker
+>   Advertise is withdrawn while MAAP re-probes and redeclared on the new
+>   address, and GET_STREAM_INFO reports the new address.
+> - **GET_STREAM_INFO (§5.4.2.10)** flags come from live state: Table 5.9 for
+>   outputs, Table 5.8 for inputs. Unsolicited notifications go out for every
+>   output whose state changed, not only output 0.
+> - **GET/SET_MAX_TRANSIT_TIME (§5.4.2.30-31)** are implemented on every
+>   STREAM_OUTPUT. SET is refused while the output streams and from a
+>   non-lock-holder; values persist in `max_transit.txt` (§5.3.7.6). Each
+>   stream's AVTP timestamp uses its own offset; the default is the
+>   configured headroom (2 ms unless the user changes it, which §5.3.7.6
+>   allows when the entity is not locked).
+> - **MVU GET_STREAM_INPUT_INFO_EX (§5.4.4.8)** is implemented, with pbsta and
+>   acmpsta from the sink state machine (Table 5.5, §5.5.3.6.18/23) and the
+>   Table 5.21 unsolicited notification.
+> - **Sink binding**: the daemon binds a 16R sink only when GET_STREAM_INFO
+>   shows CONNECTED clear. It no longer treats `stream_id == 0` as empty, since
+>   Table 5.8 fills stream_id only once the sink settles.
+> - **TSpec MaxFrameSize**: Table 4.4 gives 24·N + 24 (216 for N = 8). We
+>   declare 217, and so does the Milan-certified 16R for its own 8-channel
+>   streams (`16r-working.pcap`, `apple-avdecc.pcap`, read with
+>   `.agents/tmp/msrp_ta.py`). Kept at 217 to match the device we
+>   interoperate with; CRF declares 29 against the table's 28 by the same
+>   convention, not yet confirmed on the wire.
+> - Still open: CBS (§4.3.4), MVU BIND/UNBIND_STREAM, SET/GET_SYSTEM_UNIQUE_ID
+>   and SET/GET_MEDIA_CLOCK_REFERENCE_INFO (Table 5.15).
+
 > **Status update, 2026-10-13:** this document began before the grandmaster,
 > merged entity, MAAP, CRF and unsolicited-notification work landed. The older
 > “open gaps” narrative below is retained for history, but it is not a resume
@@ -57,8 +95,8 @@ Listeners"* (`talker_response` is a pure fn), `GET_TX_CONNECTION_COMMAND`
 *"is not implemented"* (no arm for it), and `PROBE_TX_COMMAND` *"has no impact
 on the internal state of the Talker"* (same pure fn). It also requires Talker
 Advertise *"as soon as possible"*, relying *"only on SRP (not ACMP)"* to learn
-whether listeners are interested — worth re-checking against our gating of the
-declaration on the servo.
+whether listeners are interested. Our per-stream gating (`ta_wanted`) is the
+§4.3.3.1 condition 2 requirement, not a servo gate.
 
 ## Gaps originally found here, now closed
 
@@ -72,7 +110,8 @@ declaration on the servo.
 - CRF is implemented behind `--crf`; the 16R binds its Return CRF sink and
   counts the expected 500 PDUs/s.
 
-MVU BIND/UNBIND and GET_STREAM_INPUT_INFO_EX remain certification work, not a
+MVU BIND/UNBIND remain certification work (GET_STREAM_INPUT_INFO_EX is now
+implemented), not a
 candidate explanation for the current routing UI: Apple's plain 1722.1 endpoint
 is listed without them, and the 16R advertises no controller capability.
 
@@ -84,30 +123,25 @@ is listed without them, and the 16R advertises no controller capability.
 | 5.7.2.1 | SR Class A uses Priority 3 and VLAN ID 2 after startup/link-up | `DEFAULT_DOMAIN`, observed on the wire as `vlan=2` |
 | 5.7.2.1 | MSRP Domain messages not gated on gPTP state | declared independently of the servo |
 | 6.2 | Talker joins the VLAN via MVRP before sending stream frames | MVRP VID declared first |
-| 6.3.2 | TSPEC `MaxFrameSize` = `24*N + 24 + 1` (AAF PCM32 48 kHz) | 217 for N=8 — fixed, was 234 |
+| 4.3.3 (v1.3 Table 4.4) | TSPEC `MaxFrameSize` (AAF PCM32 48 kHz); table: `24*N + 24` | 217 for N=8, the 16R's own on-wire value (table gives 216); was 234 |
 | 6.3.2 | TSPEC `MaxIntervalFrames` = 1 | 1 |
 | 6.5.1 | Stream destination MAC inside the MAAP dynamic pool | `91:E0:F0:00:xx:xx`, fixed in `65f5676` |
 | 6.5.1 | MAAP implemented, addresses **allocated** by it | `avb-avtp/src/maap.rs`, layout transcribed from the 16R's own announce |
-| 6.3.1 (1) | Destination address allocated and conflict-free before declaring a Talker attribute | arming gated on `Maap::acquired()` |
-| 7.2.1 | Presentation time offset at most 2 ms | 2 ms exactly — fixed, was 2.125 ms |
+| 4.3.3.1 (1) | Destination address allocated and conflict-free before declaring a Talker attribute | TX and each Talker Advertise gated on `Maap::acquired()` |
+| 4.3.3.1 (2) | Talker attribute only while a listener asked (PROBE_TX in 15 s or a Listener attribute) | `ta_wanted` per stream |
+| 5.3.7.6 | Presentation time offset 2 ms by default, changeable by SET_MAX_TRANSIT_TIME | default = headroom (2 ms); per-output SET, persisted |
 | 7.2.2 | Stream format matches the listener's `STREAM_INPUT` descriptor | byte-identical to the 16R's own PDU on the wire |
 
 ## Violations still open
 
-**§6.3.1 condition 2 — Talker attributes are declared unconditionally.**
-We declare regardless of whether a `PROBE_TX_COMMAND` arrived in the last 15
-seconds or a matching Listener attribute is registered. This wastes network
-resources rather than being invalid, so it is lower priority than the rest.
+(Baseline numbering. §6.3.1 condition 2 and §6.5.2 `tu` are closed; see the
+2026-11-06 status update at the top.)
 
 **§6.4 — no credit-based shaper.** "A Talker PAAD shall implement the CBS" and
 "shall shape each individual stream, as well as the overall SR class". We pace
 in software on a 125 µs tick, and the dext has a token-bucket rate limiter,
 which is not a CBS. Probably harmless on a direct cable with one talker;
 real on a switched network.
-
-**§6.5.2 — `tu` bit is hardcoded 0.** Should track the servo per
-[AVTP 4.4.4.7]. Defensible today only because we refuse to stream unless the
-servo is LOCKED, so the bit is never *wrong* — but it is not derived.
 
 ## PreSonus-specific, outside the spec
 
