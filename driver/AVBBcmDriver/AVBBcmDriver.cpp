@@ -677,6 +677,79 @@ static bool miWrite(IV * v, uint32_t reg, uint16_t val)
     return miWait(v, &f);
 }
 
+// Clause-45 access through the clause-22 MMD registers 13/14 (IEEE 802.3
+// Annex 22D; tg3 behaviour reference). Register 13 is left in data mode for
+// `devad`, as the hardware had it.
+constexpr uint32_t kMiiMmdCtrl = 13;
+constexpr uint32_t kMiiMmdAddr = 14;
+
+static bool phyCl45Select(IV * v, uint32_t devad, uint32_t reg)
+{
+    return miWrite(v, kMiiMmdCtrl, static_cast<uint16_t>(devad)) &&
+           miWrite(v, kMiiMmdAddr, static_cast<uint16_t>(reg)) &&
+           miWrite(v, kMiiMmdCtrl, static_cast<uint16_t>(0x4000 | devad));
+}
+
+static bool phyCl45Read(IV * v, uint32_t devad, uint32_t reg, uint16_t * val)
+{
+    return phyCl45Select(v, devad, reg) && miRead(v, kMiiMmdAddr, val);
+}
+
+static bool phyCl45Write(IV * v, uint32_t devad, uint32_t reg, uint16_t val)
+{
+    return phyCl45Select(v, devad, reg) && miWrite(v, kMiiMmdAddr, val);
+}
+
+// Energy-Efficient Ethernet off, the I210 link's state (EEE not negotiated).
+//
+// Measured on this link (avb-probe eee, 2026-11-06): both PHYs advertised EEE
+// (7.60 = 7.61 = 0x0006), the PHY resolved it ACTIVE at 1000BASE-T (7.803E =
+// 0x0004), the 16R was sending LPI to us (3.1 = 0x0a06) and our MAC had LPI
+// enabled with a 63 us TX idle timer (CPMU 0x36B0 = 0x00100388, 0x36B4 =
+// 0x003f003f). Our talker sends its eight streams as one burst every 125 us,
+// leaving ~110 us of silence, so the link would enter and leave LPI about
+// 8000 times a second while audio flows and never while it does not: the
+// 16R's control plane died only in our audio-transmitting Broadcom runs and
+// never on the I210, where EEE is not negotiated. 802.1BA-style AVB
+// networks run without EEE; Apple's own driver left LPI_ENABLE clear.
+//
+// Writes, each read first and logged: PHY 7.60 (EEE advertisement) -> 0,
+// which takes effect at the autoneg restart setupLink then performs; and
+// CPMU EEE_MODE 0x36B0 with LPI_ENABLE (0x80) and LPI_IN_TX (0x100) cleared
+// (tg3 bit layout; tg3 clears LPI_ENABLE whenever EEE is not active).
+// Returns whether the advertisement changed (autoneg must be restarted).
+static bool eeeAdvertOff(IV * v)
+{
+    uint16_t adv = 0;
+    if (!phyCl45Read(v, 7, 60, &adv)) {
+        LOG("eee: 7.60 read failed; advertisement left as is");
+        return false;
+    }
+    if (adv == 0) {
+        LOG("eee: 7.60 already 0 (EEE not advertised)");
+        return false;
+    }
+    const bool wrote = phyCl45Write(v, 7, 60, 0);
+    uint16_t back = 0xffff;
+    (void)phyCl45Read(v, 7, 60, &back);
+    LOG("eee: 7.60 EEE advertisement 0x%04x -> 0 (write %d, reads back 0x%04x)", adv, wrote, back);
+    return wrote;
+}
+
+static void eeeMacLpiOff(IV * v)
+{
+    constexpr uint32_t kCpmuEeeMode = 0x36b0;
+    constexpr uint32_t kLpiEnable = 0x80;
+    constexpr uint32_t kLpiInTx = 0x100;
+    const uint32_t mode = rd(v, kCpmuEeeMode);
+    if ((mode & (kLpiEnable | kLpiInTx)) == 0) {
+        LOG("eee: CPMU 0x36B0 0x%08x, LPI already off", mode);
+        return;
+    }
+    wrFlush(v, kCpmuEeeMode, mode & ~(kLpiEnable | kLpiInTx));
+    LOG("eee: CPMU 0x36B0 0x%08x -> 0x%08x (LPI_ENABLE, LPI_IN_TX cleared)", mode, rd(v, kCpmuEeeMode));
+}
+
 // Autonegotiate if needed (no PHY reset), wait for link, set MAC port mode.
 static void setupLink(IV * v)
 {
@@ -686,6 +759,15 @@ static void setupLink(IV * v)
     if (!miRead(v, bcm::kMiiBmcr, &bmcr)) {
         LOG("datapath: BMCR read failed");
         return;
+    }
+    if (eeeAdvertOff(v)) {
+        // Renegotiate so the 16R sees no EEE ability and LPI stays off.
+        LOG("eee: restarting autoneg (BMCR 0x%04x)", bmcr);
+        if (!miWrite(v, bcm::kMiiBmcr, static_cast<uint16_t>(bmcr | bcm::kBmcrAnEnable | bcm::kBmcrAnRestart))) {
+            return;
+        }
+        IOSleep(100);  // let the PHY drop the old link before the wait below
+        bmcr |= bcm::kBmcrAnEnable;
     }
     if ((bmcr & bcm::kBmcrAnEnable) == 0) {
         LOG("datapath: autoneg was off (BMCR 0x%04x); enabling", bmcr);
@@ -719,6 +801,7 @@ static void setupLink(IV * v)
     }
     wrFlush(v, bcm::kMacMode, macModeForLink(rd(v, bcm::kMacMode), speed));
     IODelay(40);
+    eeeMacLpiOff(v);
 }
 
 // ---------------------------------------------------------------------------

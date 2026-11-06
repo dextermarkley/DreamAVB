@@ -883,3 +883,36 @@ rate, grow the BCM dext's mapped stream ring.
 External dependency for VALIDATION: the 16R must actually stream to us (an ACMP
 connection / mixer routing) before the audio RX path can be exercised end to
 end. The gPTP foundation needs no such setup and is done.
+
+### 2026-11-06 — EEE was active on the 16R link; disabled (dext 309.23.9)
+
+The 16R's control plane (ADP, AECP, Sync) died 30–545 s into every Broadcom
+duplex run that transmitted audio, and never on the I210 with the same daemon
+(10-min control run healthy). TX timing was ruled out: the I210 sent the rougher
+stream. Reading the link's EEE state (`avb-probe --nic bcm eee`, new selector
+`ReadPhyMmd`, clause-45 via clause-22 regs 13/14):
+
+| Register | Value | Meaning |
+|---|---|---|
+| PHY 7.60 | `0x0006` | we advertise EEE (100TX, 1000T) |
+| PHY 7.61 | `0x0006` | the 16R advertises EEE (100TX, 1000T) |
+| PHY 7.803E | `0x0004` | EEE ACTIVE at 1000BASE-T |
+| PHY 3.1 | `0x0a06` | the 16R is sending LPI to us |
+| CPMU 0x36B0 | `0x00100388` | MAC EEE + LPI enabled (Apple left LPI_ENABLE clear: `0x00100308`) |
+| CPMU 0x36B4 | `0x003f003f` | TX link-idle timer 63 us (tg3 programs ~2 ms) |
+
+The I210's EEER (`0x00070000`) shows EEE not negotiated on that link. With a
+63 us idle timer and our 8-stream burst every 125 us (~110 us silent), the link
+would enter and leave LPI ~8000 times/s only while audio flows.
+
+New writes, each read first and logged by the dext (tg3 is the behaviour
+reference for the register layout; the clause-45 access is IEEE 802.3 Annex 22D):
+
+- PHY 7.60 EEE advertisement -> `0`, then an autoneg restart (BMCR), so the 16R
+  sees no EEE ability. Done in `setupLink` before the link wait.
+- CPMU EEE_MODE 0x36B0: clear LPI_ENABLE (`0x80`) and LPI_IN_TX (`0x100`) after
+  link-up.
+- PHY regs 13/14 (MMD access) are written by every clause-45 access; the
+  `ReadPhyMmd` selector restores 13.
+
+Result: pending a 10-minute duplex run after a 16R power cycle.
