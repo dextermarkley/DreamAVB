@@ -23,16 +23,100 @@ use tauri::{
     Manager,
 };
 
+/// A NIC DreamAVB has a driver for. Everything per-device the app needs —
+/// how to recognise it, which dext drives it, what to pass the installer, the
+/// daemon and the probe — lives here, so a second NIC is one table entry
+/// rather than an "I210" literal in every function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NicKind {
+    /// Intel I210, 8086:1533 subsystem 1ab6:0214.
+    I210,
+    /// Broadcom BCM57762 in Apple's Thunderbolt Ethernet adapter, 14e4:1682
+    /// subsystem 106b:00f6 (the dext's IOPCIPrimary/SecondaryMatch).
+    Bcm57762,
+}
+
+impl NicKind {
+    pub const ALL: [NicKind; 2] = [NicKind::I210, NicKind::Bcm57762];
+
+    /// Stable id: the dropdown value and the `avb-installer --dext` argument.
+    pub fn id(self) -> &'static str {
+        match self {
+            NicKind::I210 => "i210",
+            NicKind::Bcm57762 => "bcm57762",
+        }
+    }
+
+    /// `avb-daemon --nic` / `avb-probe --nic` value.
+    fn tool_arg(self) -> &'static str {
+        match self {
+            NicKind::I210 => "i210",
+            NicKind::Bcm57762 => "bcm",
+        }
+    }
+
+    pub fn display(self) -> &'static str {
+        match self {
+            NicKind::I210 => "Intel I210 (Thunderbolt)",
+            NicKind::Bcm57762 => "Broadcom BCM57762 (Apple Thunderbolt Ethernet)",
+        }
+    }
+
+    fn short(self) -> &'static str {
+        match self {
+            NicKind::I210 => "I210",
+            NicKind::Bcm57762 => "Broadcom BCM57762",
+        }
+    }
+
+    fn bundle_id(self) -> &'static str {
+        match self {
+            NicKind::I210 => "com.avbaudio.installer.i210",
+            NicKind::Bcm57762 => "com.avbaudio.installer.bcm57762",
+        }
+    }
+
+    /// The dext's IOUserClass, as `ioreg` names the attached service.
+    fn service(self) -> &'static str {
+        match self {
+            NicKind::I210 => "AVBI210Driver",
+            NicKind::Bcm57762 => "AVBBcmDriver",
+        }
+    }
+
+    fn pci_id(self) -> &'static str {
+        match self {
+            NicKind::I210 => "8086:1533 / 1ab6:0214",
+            NicKind::Bcm57762 => "14e4:1682 / 106b:00f6",
+        }
+    }
+
+    /// (vendor, device, subsystem vendor) the port must carry.
+    fn pci_match(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            NicKind::I210 => ("8086", "1533", "1ab6"),
+            NicKind::Bcm57762 => ("14e4", "1682", "106b"),
+        }
+    }
+}
+
 /// A detected network interface the user might hand to DreamAVB.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Nic {
-    /// Interface name, e.g. "en7".
+    /// Dropdown value and `enable_driver` argument: the NicKind id for a
+    /// supported NIC (stable while our dext owns it and the enX interface is
+    /// gone), the BSD name otherwise.
+    pub id: String,
+    /// Interface name, e.g. "en7". Empty while our dext owns the device.
     pub bsd_name: String,
     /// Human label, e.g. "Intel I210 (Thunderbolt)".
     pub display: String,
     /// PCI id string, e.g. "8086:1533 / 1ab6:0214".
     pub pci_id: String,
-    /// True if the DreamAVB driver supports this NIC today (only the I210).
+    /// Which DreamAVB driver handles it, if any.
+    pub kind: Option<NicKind>,
+    /// True if a DreamAVB driver supports this NIC (`kind.is_some()`).
     pub supported: bool,
 }
 
@@ -153,7 +237,8 @@ fn installer_app() -> Option<PathBuf> {
 /// an OSSystemExtensionRequest from the app bundle that CONTAINS the dext. So
 /// spawning the helper binary as a child of this app always failed (review H9);
 /// `open -W -a <app> --args <action>` launches it as itself.
-fn run_installer(action: &str) -> Result<(), String> {
+fn run_installer(args: &[&str]) -> Result<(), String> {
+    let action = args.join(" ");
     let app = installer_app().ok_or_else(|| {
         "AVBInstaller.app not found — install it to /Applications, then try again".to_string()
     })?;
@@ -162,7 +247,7 @@ fn run_installer(action: &str) -> Result<(), String> {
         .arg("-a")
         .arg(&app)
         .arg("--args")
-        .arg(action)
+        .args(args)
         .output()
         .map_err(|e| format!("could not launch AVBInstaller.app: {e}"))?;
     if !out.status.success() {
@@ -183,9 +268,16 @@ fn run_installer(action: &str) -> Result<(), String> {
 /// listed UNSUPPORTED and, per project policy, never driven.
 #[tauri::command]
 fn list_nics() -> Vec<Nic> {
+    let owned: Vec<NicKind> = NicKind::ALL.into_iter().filter(|&k| dext_owns(k)).collect();
+    nics_from(ethernet_ports(), &owned)
+}
+
+/// Build the NIC list from the system_profiler ports and the kinds our dexts
+/// currently own. Pure, so the matching is testable.
+fn nics_from(ports: Vec<EthPort>, owned: &[NicKind]) -> Vec<Nic> {
     let mut nics = Vec::new();
-    for p in ethernet_ports() {
-        let supported = p.is_i210();
+    for p in ports {
+        let kind = p.kind();
         let pci_id = match (&p.vendor, &p.device) {
             (Some(v), Some(d)) => {
                 let base = format!("{}:{}", strip0x(v), strip0x(d));
@@ -198,31 +290,36 @@ fn list_nics() -> Vec<Nic> {
             }
             _ => "—".into(),
         };
+        let bsd = p.bsd.clone().unwrap_or_default();
         nics.push(Nic {
-            bsd_name: p.bsd.clone().unwrap_or_default(),
-            display: if supported {
-                "Intel I210 (Thunderbolt)".into()
-            } else {
-                p.name.clone()
-            },
+            id: kind.map_or_else(|| bsd.clone(), |k| k.id().to_string()),
+            bsd_name: bsd,
+            display: kind.map_or_else(|| p.name.clone(), |k| k.display().to_string()),
             pci_id,
-            supported,
+            kind,
+            supported: kind.is_some(),
         });
     }
-    // Our dext owning the I210 removes its enX interface, so system_profiler
-    // may not list it. Surface it from ioreg so the UI still shows the device.
-    if !nics.iter().any(|n| n.supported) && dext_owns_i210() {
-        nics.insert(
-            0,
-            Nic {
-                bsd_name: String::new(),
-                display: "Intel I210 (Thunderbolt)".into(),
-                pci_id: "8086:1533 / 1ab6:0214".into(),
-                supported: true,
-            },
-        );
+    // Our dext owning a NIC removes its enX interface, so system_profiler
+    // does not list it. Surface it from ioreg so the UI still shows it.
+    for (pos, &k) in owned.iter().enumerate() {
+        if !nics.iter().any(|n| n.kind == Some(k)) {
+            nics.insert(pos.min(nics.len()), owned_nic(k));
+        }
     }
     nics
+}
+
+/// The entry for a NIC our dext owns (no enX interface left).
+fn owned_nic(k: NicKind) -> Nic {
+    Nic {
+        id: k.id().to_string(),
+        bsd_name: String::new(),
+        display: k.display().to_string(),
+        pci_id: k.pci_id().to_string(),
+        kind: Some(k),
+        supported: true,
+    }
 }
 
 fn strip0x(s: &str) -> &str {
@@ -241,16 +338,20 @@ struct EthPort {
 }
 
 impl EthPort {
-    /// The Intel I210 DreamAVB drives: 8086:1533, subsystem 1ab6:0214.
-    fn is_i210(&self) -> bool {
+    /// Which DreamAVB-driven NIC this port is, matched on PCI identity
+    /// (vendor + device, and the subsystem vendor when reported).
+    fn kind(&self) -> Option<NicKind> {
         let eq = |o: &Option<String>, want: &str| {
             o.as_deref()
                 .map(|v| strip0x(v).eq_ignore_ascii_case(want))
                 .unwrap_or(false)
         };
-        eq(&self.vendor, "8086")
-            && eq(&self.device, "1533")
-            && (self.sub_vendor.is_none() || eq(&self.sub_vendor, "1ab6"))
+        NicKind::ALL.into_iter().find(|k| {
+            let (v, d, sv) = k.pci_match();
+            eq(&self.vendor, v)
+                && eq(&self.device, d)
+                && (self.sub_vendor.is_none() || eq(&self.sub_vendor, sv))
+        })
     }
 }
 
@@ -287,9 +388,9 @@ fn ethernet_ports() -> Vec<EthPort> {
         .collect()
 }
 
-/// True if OUR dext is the registered driver for the I210 (so the device has
+/// True if OUR dext is the registered driver for this NIC (so the device has
 /// no enX interface). Narrow `ioreg` query, not a whole-registry dump.
-fn dext_owns_i210() -> bool {
+fn dext_owns(kind: NicKind) -> bool {
     // `-rn <name>` only. Combining `-c IOUserService` with `-n AVBI210Driver`
     // returns NOTHING even when the dext is attached and driving the device
     // (verified against a live I210 whose dext answered avb-probe): ioreg does
@@ -297,71 +398,112 @@ fn dext_owns_i210() -> bool {
     // class filter silently discarded the name match and this reported that the
     // default driver owned the NIC while ours actually did.
     Command::new("/usr/sbin/ioreg")
-        .args(["-rn", "AVBI210Driver"])
+        .args(["-rn", kind.service()])
         .output()
         .ok()
         .map(|o| {
             let s = String::from_utf8_lossy(&o.stdout);
             // Require the bundle id too, so a stray name match elsewhere in the
             // registry cannot be mistaken for our attached service.
-            s.contains("AVBI210Driver") && s.contains("com.avbaudio.installer.i210")
+            s.contains(kind.service()) && s.contains(kind.bundle_id())
         })
         .unwrap_or(false)
 }
 
-/// Enable DreamAVB on a NIC: activate the system extension so our dext claims
-/// the device. Only the I210 is supported, so the selected NIC is validated
-/// rather than silently ignored.
+/// Enable DreamAVB on a NIC: activate that NIC's system extension so our dext
+/// claims the device. `nic_id` is a dropdown value (`Nic::id`); an
+/// unsupported or absent NIC is refused rather than silently ignored.
 ///
 /// `async` so Tauri runs it off the main thread (review M3): it launches
 /// AVBInstaller.app and waits for it.
 #[tauri::command]
-async fn enable_driver(bsd_name: String) -> Result<Status, String> {
-    let supported = list_nics()
+async fn enable_driver(nic_id: String) -> Result<Status, String> {
+    let kind = list_nics()
         .into_iter()
-        .any(|n| n.supported && n.bsd_name == bsd_name);
-    if !supported {
-        return Err(format!(
-            "{bsd_name} is not a DreamAVB-supported interface (only the Intel I210 is)"
-        ));
-    }
-    DEACTIVATION_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-    run_installer("activate")?;
+        .find(|n| n.supported && n.id == nic_id)
+        .and_then(|n| n.kind)
+        .ok_or_else(|| {
+            format!(
+                "{nic_id} is not a DreamAVB-supported interface \
+                 (supported: Intel I210, Broadcom BCM57762)"
+            )
+        })?;
+    set_release_requested(None);
+    // Remember the choice first: with two adapters attached it is what makes
+    // the status (and the daemon's --nic) follow this one.
+    let (mut cfg, _warnings) = Config::load();
+    cfg.active_nic = Some(kind.id());
+    cfg.save()
+        .map_err(|e| format!("could not save settings: {e}"))?;
+    run_installer(&["activate", "--dext", kind.id()])?;
     Ok(current_status())
 }
 
-/// Disable DreamAVB and hand the I210 back to the OS default driver.
+/// Disable DreamAVB and hand the NIC back to the OS default driver.
 ///
 /// The managed daemon owns DriverKit user clients, so it must leave first.
 /// A completed system-extension request is not itself evidence that the kernel
 /// detached an always-matched dext; wait for the observed handoff and surface
 /// the required physical/reboot follow-up when macOS defers it.
+///
+/// Releases the NIC DreamAVB is active on; with none active, every dext that
+/// is installed at all, so "off" never leaves one behind.
 #[tauri::command]
 async fn disable_driver() -> Result<Status, String> {
     let _ = stop_audio().await?;
-    run_installer("deactivate")?;
-    DEACTIVATION_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
-    wait_for_driver_release()
+    let listing = sysext_listing();
+    let kinds: Vec<NicKind> = match current_status().nic.and_then(|n| n.kind) {
+        Some(k) => vec![k],
+        None => NicKind::ALL
+            .into_iter()
+            .filter(|&k| classify_sysext(&listing, k) != DextSysextState::Absent)
+            .collect(),
+    };
+    for &k in &kinds {
+        run_installer(&["deactivate", "--dext", k.id()])?;
+    }
+    if let Some(&k) = kinds.first() {
+        set_release_requested(Some(k));
+    }
+    wait_for_driver_release(&kinds)
 }
 
 const DRIVER_RELEASE_WAIT: Duration = Duration::from_secs(6);
 const DRIVER_RELEASE_POLL: Duration = Duration::from_millis(100);
-static DEACTIVATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// The NIC whose release was requested: 0 none, else `NicKind::ALL` index + 1.
+static DEACTIVATION_REQUESTED: AtomicU32 = AtomicU32::new(0);
 
-fn wait_for_driver_release() -> Result<Status, String> {
+fn set_release_requested(kind: Option<NicKind>) {
+    let v = kind
+        .and_then(|k| NicKind::ALL.iter().position(|&x| x == k))
+        .map_or(0, |i| i as u32 + 1);
+    DEACTIVATION_REQUESTED.store(v, Ordering::SeqCst);
+}
+
+fn release_requested() -> Option<NicKind> {
+    let v = DEACTIVATION_REQUESTED.load(Ordering::SeqCst) as usize;
+    v.checked_sub(1).and_then(|i| NicKind::ALL.get(i).copied())
+}
+
+/// Wait until none of `kinds` is still attached or enabled.
+fn wait_for_driver_release(kinds: &[NicKind]) -> Result<Status, String> {
     let deadline = Instant::now() + DRIVER_RELEASE_WAIT;
     loop {
-        let status = current_status();
-        if status.state == DriverState::DefaultDriver {
-            return Ok(status);
-        }
+        let listing = sysext_listing();
+        let held = kinds
+            .iter()
+            .copied()
+            .find(|&k| dext_owns(k) || classify_sysext(&listing, k) == DextSysextState::Enabled);
+        let Some(k) = held else {
+            return Ok(current_status());
+        };
         if Instant::now() >= deadline {
-            return Err(
-                "DreamAVB stopped managed audio, but macOS has not released the matched I210 \
-                 DriverKit extension. Unplug and replug the Thunderbolt I210 adapter or reboot; \
-                 the UI will show Hands off once the kernel detaches the dext."
-                    .into(),
-            );
+            return Err(format!(
+                "DreamAVB stopped managed audio, but macOS has not released the matched {} \
+                 DriverKit extension. Unplug and replug the Thunderbolt adapter or reboot; \
+                 the UI will show Hands off once the kernel detaches the dext.",
+                k.short()
+            ));
         }
         std::thread::sleep(DRIVER_RELEASE_POLL);
     }
@@ -386,15 +528,14 @@ enum DextSysextState {
     Enabled,
 }
 
-/// Read the I210 dext's state from `systemextensionsctl list`.
-fn dext_sysext_state() -> DextSysextState {
-    let out = Command::new("/usr/bin/systemextensionsctl")
+/// `systemextensionsctl list` output, empty when it cannot be read (which
+/// classifies as Absent: never claim ownership without positive evidence).
+fn sysext_listing() -> String {
+    Command::new("/usr/bin/systemextensionsctl")
         .arg("list")
-        .output();
-    match out {
-        Ok(o) => classify_sysext(&String::from_utf8_lossy(&o.stdout)),
-        Err(_) => DextSysextState::Absent,
-    }
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 /// Classify the dext's records in `systemextensionsctl list` output.
@@ -404,13 +545,10 @@ fn dext_sysext_state() -> DextSysextState {
 /// wins. Otherwise preserve a terminating record as a release-in-progress
 /// state rather than collapsing it to Absent while the kernel may still own the
 /// PCI device. Pure, so it is unit-testable.
-fn classify_sysext(text: &str) -> DextSysextState {
+fn classify_sysext(text: &str, kind: NicKind) -> DextSysextState {
     let mut pending = false;
     let mut terminating = false;
-    for line in text
-        .lines()
-        .filter(|l| l.contains("com.avbaudio.installer.i210"))
-    {
+    for line in text.lines().filter(|l| l.contains(kind.bundle_id())) {
         let l = line.to_lowercase();
         if l.contains("[activated enabled]") {
             return DextSysextState::Enabled;
@@ -432,69 +570,125 @@ fn classify_sysext(text: &str) -> DextSysextState {
     }
 }
 
-fn current_status() -> Status {
-    // A successful deactivation is the observable handoff, not the request
-    // callback. While a requested or reported release still has an attached
-    // service, expose that fact instead of letting the next poll paint Active.
-    let state = dext_sysext_state();
-    let release_requested = DEACTIVATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
-        || state == DextSysextState::Deactivating;
-    if release_requested {
-        if dext_owns_i210() {
-            return status_for(DextSysextState::Deactivating, false, None);
-        }
-        DEACTIVATION_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    // Hands-off is the safe default: only a positive signal flips us to Active,
-    // so a read failure never falsely claims the driver owns the NIC.
-    let faulted = state == DextSysextState::Enabled && probe_fault();
-    let nic = if state == DextSysextState::Enabled {
-        list_nics().into_iter().find(|n| n.supported)
-    } else {
-        None
-    };
-    status_for(state, faulted, nic)
+/// One NIC kind's observed driver facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KindState {
+    kind: NicKind,
+    sysext: DextSysextState,
+    /// Our dext is attached to the device (ioreg).
+    owns: bool,
 }
 
-/// Pure mapping from (sysext state, fault, detected NIC) to the UI Status.
-/// Separated from the system reads so the policy — Absent is always hands-off
-/// — is unit-testable without depending on this machine's actual dext state.
-/// The NIC is passed in from real detection; it used to be a hardcoded "en7"
-/// (review M5), which is both machine-specific and wrong once our dext owns
-/// the device (the enX interface is gone).
-fn status_for(state: DextSysextState, faulted: bool, nic: Option<Nic>) -> Status {
-    match state {
-        DextSysextState::Enabled => {
-            if faulted {
-                Status {
-                    state: DriverState::Fault,
-                    nic,
-                    summary: "DreamAVB driver reported a fault".into(),
-                }
-            } else {
-                Status {
-                    state: DriverState::Active,
-                    nic,
-                    summary: "DreamAVB active on the I210".into(),
-                }
-            }
+fn current_status() -> Status {
+    let listing = sysext_listing();
+    let kinds: Vec<KindState> = NicKind::ALL
+        .into_iter()
+        .map(|kind| KindState {
+            kind,
+            sysext: classify_sysext(&listing, kind),
+            owns: dext_owns(kind),
+        })
+        .collect();
+    // A requested release that has completed is no longer in progress.
+    if let Some(k) = release_requested() {
+        if !kinds.iter().any(|s| s.kind == k && s.owns) {
+            set_release_requested(None);
         }
-        DextSysextState::Activating => Status {
+    }
+    decide_status(&kinds, release_requested(), preferred_nic(), probe_fault)
+}
+
+/// The NIC the user last enabled, from the shared config.
+fn preferred_nic() -> Option<NicKind> {
+    let id = Config::load().0.active_nic?;
+    NicKind::ALL.into_iter().find(|k| k.id() == id)
+}
+
+/// Pure mapping from every NIC kind's (sysext state, attached) to the UI
+/// Status, so the policy is testable without this machine's real dext state.
+///
+/// - Hands-off is the default: only a dext that is enabled AND attached to its
+///   device is Active, so a read failure never claims ownership.
+/// - A release in progress (requested, or a terminating record) while the dext
+///   is still attached is Releasing, not Active.
+/// - An enabled dext with no device attached is Pending, naming the adapter:
+///   the extension is approved but there is nothing to stream through yet.
+/// - With two NICs enabled and attached at once, `preferred` (the one the user
+///   last turned on) wins; otherwise the first in `NicKind::ALL`.
+fn decide_status(
+    kinds: &[KindState],
+    release: Option<NicKind>,
+    preferred: Option<NicKind>,
+    faulted: impl Fn(NicKind) -> bool,
+) -> Status {
+    let releasing = |k: NicKind| Status {
+        state: DriverState::Releasing,
+        nic: None,
+        summary: format!(
+            "Releasing {} — waiting for macOS to detach the DriverKit extension",
+            k.short()
+        ),
+    };
+    for s in kinds {
+        if s.owns && (release == Some(s.kind) || s.sysext == DextSysextState::Deactivating) {
+            return releasing(s.kind);
+        }
+    }
+    let usable = |s: &&KindState| s.owns && s.sysext == DextSysextState::Enabled;
+    let active = kinds
+        .iter()
+        .filter(usable)
+        .find(|s| Some(s.kind) == preferred)
+        .or_else(|| kinds.iter().find(usable));
+    if let Some(s) = active {
+        let nic = Some(owned_nic(s.kind));
+        return if faulted(s.kind) {
+            Status {
+                state: DriverState::Fault,
+                nic,
+                summary: format!(
+                    "DreamAVB driver for the {} reported a fault",
+                    s.kind.short()
+                ),
+            }
+        } else {
+            Status {
+                state: DriverState::Active,
+                nic,
+                summary: format!("DreamAVB active on the {}", s.kind.short()),
+            }
+        };
+    }
+    if kinds
+        .iter()
+        .any(|s| s.sysext == DextSysextState::Activating)
+    {
+        return Status {
             state: DriverState::Pending,
             nic: None,
             summary: "Activating — waiting for approval".into(),
-        },
-        DextSysextState::Deactivating => Status {
-            state: DriverState::Releasing,
+        };
+    }
+    if let Some(s) = kinds
+        .iter()
+        .find(|s| s.sysext == DextSysextState::Deactivating)
+    {
+        return releasing(s.kind);
+    }
+    if let Some(s) = kinds.iter().find(|s| s.sysext == DextSysextState::Enabled) {
+        return Status {
+            state: DriverState::Pending,
             nic: None,
-            summary: "Releasing I210 — waiting for macOS to detach the DriverKit extension".into(),
-        },
-        DextSysextState::Absent => Status {
-            state: DriverState::DefaultDriver,
-            nic: None,
-            summary: "Default driver in control".into(),
-        },
+            summary: format!(
+                "{} driver enabled — waiting for the adapter (plug it in, or replug it)",
+                s.kind.short()
+            ),
+        };
+    }
+    Status {
+        state: DriverState::DefaultDriver,
+        nic: None,
+        summary: "Default driver in control".into(),
     }
 }
 
@@ -523,8 +717,13 @@ fn parse_fault_code(stdout: &str) -> Option<u32> {
 
 /// True if `avb-probe info` reports a dext fault (non-zero exit, or a
 /// non-zero fault code in its output). Read-only.
-fn probe_fault() -> bool {
-    match Command::new(helper_path("avb-probe")).arg("info").output() {
+fn probe_fault(kind: NicKind) -> bool {
+    match Command::new(helper_path("avb-probe"))
+        .arg("--nic")
+        .arg(kind.tool_arg())
+        .arg("info")
+        .output()
+    {
         Ok(o) => {
             if !o.status.success() {
                 return true;
@@ -1303,8 +1502,8 @@ async fn set_launch_at_login(enabled: bool) -> Result<LaunchAtLoginInfo, String>
 pub struct AutoSelectInfo {
     /// The user's persisted preference.
     pub enabled: bool,
-    /// When enabled and unambiguous, the BSD name to select (may be empty when
-    /// our dext owns the device and no enX interface remains). `None` when
+    /// When enabled and unambiguous, the `Nic::id` to select (the field name
+    /// predates ids; the UI matches it against option values). `None` when
     /// disabled or when no selection was made.
     pub selected_bsd: Option<String>,
     /// Human reason, shown when nothing was selected (none / ambiguous), or
@@ -1326,21 +1525,23 @@ fn auto_select_info(cfg: Config, nics: &[Nic]) -> AutoSelectInfo {
             reason: String::new(),
         };
     }
+    // By dropdown id, not BSD name: a NIC our dext owns has no enX interface,
+    // so two owned NICs would otherwise both be "".
     let supported: Vec<String> = nics
         .iter()
         .filter(|n| n.supported)
-        .map(|n| n.bsd_name.clone())
+        .map(|n| n.id.clone())
         .collect();
     match auto_select_nic(&supported) {
-        AutoSelectOutcome::Selected { bsd_name } => AutoSelectInfo {
+        AutoSelectOutcome::Selected { bsd_name: id } => AutoSelectInfo {
             enabled: true,
-            selected_bsd: Some(bsd_name),
+            selected_bsd: Some(id),
             reason: String::new(),
         },
         AutoSelectOutcome::NoneSupported => AutoSelectInfo {
             enabled: true,
             selected_bsd: None,
-            reason: "no supported NIC to select (only the Intel I210 is supported)".to_string(),
+            reason: "no supported NIC to select (Intel I210 or Broadcom BCM57762)".to_string(),
         },
         AutoSelectOutcome::Ambiguous { count } => AutoSelectInfo {
             enabled: true,
@@ -1487,13 +1688,15 @@ async fn start_audio() -> Result<AudioStatus, String> {
     // default driver fails in a way that reads like a daemon bug, so say the
     // real thing instead.
     let st = current_status();
-    if st.state != DriverState::Active {
-        return Err(
-            "turn DreamAVB on for the network interface first — the audio daemon needs the \
-             driver to own the device"
-                .to_string(),
-        );
-    }
+    let kind =
+        match (&st.state, st.nic.as_ref().and_then(|n| n.kind)) {
+            (DriverState::Active, Some(k)) => k,
+            _ => return Err(
+                "turn DreamAVB on for the network interface first — the audio daemon needs the \
+                 driver to own the device"
+                    .to_string(),
+            ),
+        };
 
     let bin = helper_path("avb-daemon");
     let log = audio_log_path().ok_or_else(|| "HOME is not set".to_string())?;
@@ -1512,7 +1715,11 @@ async fn start_audio() -> Result<AudioStatus, String> {
         .map_err(|e| format!("could not open {}: {e}", log.display()))?;
 
     // No --seconds: run until we stop it.
+    // --nic names the dext the driver is active on: the daemon's own default
+    // is the I210, so without it a Broadcom session started on nothing.
     let child = Command::new(&bin)
+        .arg("--nic")
+        .arg(kind.tool_arg())
         .arg("duplex")
         .arg("--log-level")
         .arg("info")
@@ -1666,9 +1873,11 @@ fn supervisor_loop() {
 /// Spawn a replacement daemon. Shares `start_audio`'s preconditions: the
 /// driver must still own the NIC, or there is nothing to stream through.
 fn respawn_daemon() -> Result<(), String> {
-    if current_status().state != DriverState::Active {
-        return Err("the driver no longer owns the interface".into());
-    }
+    let st = current_status();
+    let kind = match (&st.state, st.nic.as_ref().and_then(|n| n.kind)) {
+        (DriverState::Active, Some(k)) => k,
+        _ => return Err("the driver no longer owns the interface".into()),
+    };
     let bin = helper_path("avb-daemon");
     let log = audio_log_path().ok_or_else(|| "HOME is not set".to_string())?;
     if let Some(dir) = log.parent() {
@@ -1682,7 +1891,11 @@ fn respawn_daemon() -> Result<(), String> {
     let err = out
         .try_clone()
         .map_err(|e| format!("could not open {}: {e}", log.display()))?;
+    // --nic names the dext the driver is active on: the daemon's own default
+    // is the I210, so without it a Broadcom session started on nothing.
     let child = Command::new(&bin)
+        .arg("--nic")
+        .arg(kind.tool_arg())
         .arg("duplex")
         .arg("--log-level")
         .arg("info")
@@ -2211,42 +2424,167 @@ mod tests {
         assert!(SUPERVISOR_MAX_FAILURES > 0, "zero would never even try");
     }
 
-    fn nic_i210() -> Nic {
-        Nic {
-            bsd_name: "en7".into(),
-            display: "Intel I210 (Thunderbolt)".into(),
-            pci_id: "8086:1533 / 1ab6:0214".into(),
-            supported: true,
-        }
+    fn ks(kind: NicKind, sysext: DextSysextState, owns: bool) -> KindState {
+        KindState { kind, sysext, owns }
+    }
+
+    fn both(i210: (DextSysextState, bool), bcm: (DextSysextState, bool)) -> Vec<KindState> {
+        vec![
+            ks(NicKind::I210, i210.0, i210.1),
+            ks(NicKind::Bcm57762, bcm.0, bcm.1),
+        ]
     }
 
     #[test]
     fn absent_dext_maps_to_hands_off() {
-        // The safety-critical invariant: when the dext is Absent (not
-        // activated), the state is DefaultDriver — the OS default driver owns
-        // the NIC. Tested on the pure classifier so it does not depend on this
-        // machine's actual dext state.
+        use DextSysextState::*;
+        let ok = |_| false;
+        // The safety-critical invariant: with no dext installed the OS
+        // default driver owns the NIC. Pure, so independent of this machine.
         assert_eq!(
-            status_for(DextSysextState::Absent, false, None).state,
+            decide_status(&both((Absent, false), (Absent, false)), None, None, ok).state,
             DriverState::DefaultDriver
         );
-        // Activating -> Pending, enabled+ok -> Active, enabled+fault -> Fault.
         assert_eq!(
-            status_for(DextSysextState::Activating, false, None).state,
+            decide_status(&both((Activating, false), (Absent, false)), None, None, ok).state,
             DriverState::Pending
         );
         assert_eq!(
-            status_for(DextSysextState::Deactivating, false, None).state,
+            decide_status(
+                &both((Deactivating, false), (Absent, false)),
+                None,
+                None,
+                ok
+            )
+            .state,
             DriverState::Releasing
         );
+        let a = decide_status(&both((Enabled, true), (Absent, false)), None, None, ok);
+        assert_eq!(a.state, DriverState::Active);
+        assert_eq!(a.nic.and_then(|n| n.kind), Some(NicKind::I210));
         assert_eq!(
-            status_for(DextSysextState::Enabled, false, Some(nic_i210())).state,
-            DriverState::Active
-        );
-        assert_eq!(
-            status_for(DextSysextState::Enabled, true, Some(nic_i210())).state,
+            decide_status(&both((Enabled, true), (Absent, false)), None, None, |_| {
+                true
+            })
+            .state,
             DriverState::Fault
         );
+    }
+
+    /// The Broadcom is a first-class NIC: an enabled, attached BCM dext is
+    /// Active on the BCM, even with the I210 dext enabled and no I210 plugged
+    /// in (this machine's real state when the user reported the BCM was not
+    /// selectable).
+    #[test]
+    fn active_on_whichever_dext_is_attached() {
+        use DextSysextState::*;
+        let s = decide_status(&both((Enabled, false), (Enabled, true)), None, None, |_| {
+            false
+        });
+        assert_eq!(s.state, DriverState::Active);
+        assert_eq!(s.nic.and_then(|n| n.kind), Some(NicKind::Bcm57762));
+        assert!(s.summary.contains("Broadcom"), "{}", s.summary);
+        // The fault probe is asked about the attached NIC, not the I210.
+        let s = decide_status(&both((Enabled, false), (Enabled, true)), None, None, |k| {
+            k == NicKind::Bcm57762
+        });
+        assert_eq!(s.state, DriverState::Fault);
+    }
+
+    /// Both adapters attached (this machine's real state: an I210 and the
+    /// Broadcom, both dexts enabled): the one the user turned on wins.
+    #[test]
+    fn two_attached_nics_follow_the_users_choice() {
+        use DextSysextState::*;
+        let k = both((Enabled, true), (Enabled, true));
+        let pick = |p| {
+            decide_status(&k, None, p, |_| false)
+                .nic
+                .and_then(|n| n.kind)
+        };
+        assert_eq!(pick(Some(NicKind::Bcm57762)), Some(NicKind::Bcm57762));
+        assert_eq!(pick(Some(NicKind::I210)), Some(NicKind::I210));
+        // No recorded choice: deterministic, first in NicKind::ALL.
+        assert_eq!(pick(None), Some(NicKind::I210));
+        // A preference for a NIC that is not attached does not hide the one
+        // that is.
+        let k = both((Enabled, true), (Absent, false));
+        assert_eq!(
+            decide_status(&k, None, Some(NicKind::Bcm57762), |_| false)
+                .nic
+                .and_then(|n| n.kind),
+            Some(NicKind::I210)
+        );
+    }
+
+    /// Enabled but attached to nothing is not Active: there is no device to
+    /// stream through, and start_audio must not launch a daemon at it.
+    #[test]
+    fn enabled_without_a_device_is_pending_not_active() {
+        use DextSysextState::*;
+        let s = decide_status(&both((Enabled, false), (Absent, false)), None, None, |_| {
+            false
+        });
+        assert_eq!(s.state, DriverState::Pending);
+        assert!(s.nic.is_none());
+        assert!(s.summary.contains("I210"), "{}", s.summary);
+    }
+
+    /// A requested release of an attached dext reads Releasing, and only for
+    /// that NIC: the other one's state does not mask it.
+    #[test]
+    fn requested_release_while_attached_is_releasing() {
+        use DextSysextState::*;
+        let s = decide_status(
+            &both((Enabled, false), (Enabled, true)),
+            Some(NicKind::Bcm57762),
+            None,
+            |_| false,
+        );
+        assert_eq!(s.state, DriverState::Releasing);
+        assert!(s.summary.contains("Broadcom"), "{}", s.summary);
+    }
+
+    #[test]
+    fn nic_kind_ids_round_trip_and_name_the_real_dexts() {
+        // Ids are distinct, so the dropdown value names exactly one NIC.
+        assert_ne!(NicKind::I210.id(), NicKind::Bcm57762.id());
+        // The installer's --dext values, the daemon/probe's --nic values and
+        // the bundle ids are other programs' contracts, so pin them literally.
+        assert_eq!(NicKind::I210.id(), "i210");
+        assert_eq!(NicKind::Bcm57762.id(), "bcm57762");
+        assert_eq!(NicKind::I210.tool_arg(), "i210");
+        assert_eq!(NicKind::Bcm57762.tool_arg(), "bcm");
+        assert_eq!(
+            NicKind::Bcm57762.bundle_id(),
+            "com.avbaudio.installer.bcm57762"
+        );
+        assert_eq!(NicKind::Bcm57762.service(), "AVBBcmDriver");
+    }
+
+    /// A NIC our dext owns has no enX interface, so it is surfaced from ioreg
+    /// with its kind id; both can be listed at once with distinct ids.
+    #[test]
+    fn owned_nics_are_listed_with_distinct_ids() {
+        let nics = nics_from(Vec::new(), &[NicKind::I210, NicKind::Bcm57762]);
+        let ids: Vec<&str> = nics.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["i210", "bcm57762"]);
+        assert!(nics.iter().all(|n| n.supported && n.bsd_name.is_empty()));
+
+        // Not owned but present in system_profiler: matched by PCI identity.
+        let port = EthPort {
+            name: "Thunderbolt Ethernet".into(),
+            bsd: Some("en8".into()),
+            vendor: Some("0x14e4".into()),
+            device: Some("0x1682".into()),
+            sub_vendor: Some("0x106b".into()),
+            sub_device: Some("0x00f6".into()),
+        };
+        let nics = nics_from(vec![port], &[]);
+        assert_eq!(nics.len(), 1);
+        assert_eq!(nics[0].id, "bcm57762");
+        assert_eq!(nics[0].bsd_name, "en8");
+        assert_eq!(nics[0].kind, Some(NicKind::Bcm57762));
     }
 
     /// Verbatim `avb-probe info` output from the live I210 on 2026-10-12,
@@ -2302,7 +2640,10 @@ mac            64:4b:f0:12:73:b8   timebase 125/3
 *   *   8NG8NMGYVF  com.avbaudio.installer.i210 (282.7.31/282.7.31) [terminated waiting to uninstall on reboot]
     *   8NG8NMGYVF  com.avbaudio.installer.i210 (283.0.31/283.0.31) [activated waiting for user]
 ";
-        assert_eq!(classify_sysext(listing), DextSysextState::Activating);
+        assert_eq!(
+            classify_sysext(listing, NicKind::I210),
+            DextSysextState::Activating
+        );
 
         // An old record that is still 'activated enabled' but terminated is
         // likewise ignored.
@@ -2310,18 +2651,27 @@ mac            64:4b:f0:12:73:b8   timebase 125/3
 *   *   8NG8NMGYVF  com.avbaudio.installer.i210 (282.7.31/282.7.31) [terminated waiting to uninstall on reboot]
     *   8NG8NMGYVF  com.avbaudio.installer.i210 (283.0.31/283.0.31) [activated waiting for user]
 ";
-        assert_eq!(classify_sysext(stale_enabled), DextSysextState::Activating);
+        assert_eq!(
+            classify_sysext(stale_enabled, NicKind::I210),
+            DextSysextState::Activating
+        );
 
         // A genuinely enabled live record wins.
         let live = "*   *   8NG8NMGYVF  com.avbaudio.installer.i210 (283.0.31/283.0.31) [activated enabled]";
-        assert_eq!(classify_sysext(live), DextSysextState::Enabled);
+        assert_eq!(
+            classify_sysext(live, NicKind::I210),
+            DextSysextState::Enabled
+        );
 
         // Nothing for our bundle id at all -> hands off.
         assert_eq!(
-            classify_sysext("*   *   TEAM  com.example.other (1/1) [activated enabled]"),
+            classify_sysext(
+                "*   *   TEAM  com.example.other (1/1) [activated enabled]",
+                NicKind::I210
+            ),
             DextSysextState::Absent
         );
-        assert_eq!(classify_sysext(""), DextSysextState::Absent);
+        assert_eq!(classify_sysext("", NicKind::I210), DextSysextState::Absent);
     }
 
     #[test]
@@ -2330,16 +2680,55 @@ mac            64:4b:f0:12:73:b8   timebase 125/3
 *   *   8NG8NMGYVF  com.avbaudio.installer.i210 (284.21.58/284.21.58) \
 AVBI210Driver [terminated waiting to uninstall on reboot]";
         assert_eq!(
-            classify_sysext(terminating),
+            classify_sysext(terminating, NicKind::I210),
             DextSysextState::Deactivating,
             "a terminating record has not yet returned the I210 to the OS"
         );
     }
 
-    /// The I210 is matched on PCI identity, and nothing else ever is (the
-    /// Broadcom in particular is never driven).
+    /// Live, against this machine's real system_profiler / ioreg /
+    /// systemextensionsctl. Ignored by default; run with `--ignored` to see
+    /// exactly what the dropdown and status line would show.
     #[test]
-    fn only_the_i210_matches_by_pci_identity() {
+    #[ignore]
+    fn live_nic_detection() {
+        for n in list_nics() {
+            println!(
+                "nic id={} bsd={:?} supported={} kind={:?} display={}",
+                n.id, n.bsd_name, n.supported, n.kind, n.display
+            );
+        }
+        let st = current_status();
+        println!("status state={:?} summary={}", st.state, st.summary);
+    }
+
+    /// Each dext's records classify only that dext: this machine's real
+    /// listing (I210 enabled with no device, BCM enabled and attached) must not
+    /// read the BCM's upgrade record as the I210's or vice versa.
+    #[test]
+    fn sysext_records_are_classified_per_bundle_id() {
+        let listing = "\
+*\t*\t8NG8NMGYVF\tcom.avbaudio.installer.i210 (307.17.3/307.17.3)\tAVBI210Driver\t[activated enabled]
+\t\t8NG8NMGYVF\tcom.avbaudio.installer.bcm57762 (308.21.57/308.21.57)\tAVBBcmDriver\t[terminating for upgrade via delegate]
+*\t*\t8NG8NMGYVF\tcom.avbaudio.installer.bcm57762 (308.22.11/308.22.11)\tAVBBcmDriver\t[activated enabled]";
+        assert_eq!(
+            classify_sysext(listing, NicKind::I210),
+            DextSysextState::Enabled
+        );
+        assert_eq!(
+            classify_sysext(listing, NicKind::Bcm57762),
+            DextSysextState::Enabled
+        );
+        let only_bcm = "*\t*\t8NG8NMGYVF\tcom.avbaudio.installer.bcm57762 (1/1)\tAVBBcmDriver\t[activated enabled]";
+        assert_eq!(
+            classify_sysext(only_bcm, NicKind::I210),
+            DextSysextState::Absent
+        );
+    }
+
+    /// Each supported NIC is matched on its PCI identity, and nothing else is.
+    #[test]
+    fn supported_nics_match_by_pci_identity() {
         let i210 = EthPort {
             name: "Intel I210".into(),
             bsd: Some("en7".into()),
@@ -2348,7 +2737,7 @@ AVBI210Driver [terminated waiting to uninstall on reboot]";
             sub_vendor: Some("0x1ab6".into()),
             sub_device: Some("0x0214".into()),
         };
-        assert!(i210.is_i210());
+        assert_eq!(i210.kind(), Some(NicKind::I210));
 
         // The Broadcom BCM57762 in Apple's Thunderbolt adapter.
         let bcm = EthPort {
@@ -2359,22 +2748,33 @@ AVBI210Driver [terminated waiting to uninstall on reboot]";
             sub_vendor: Some("0x106b".into()),
             sub_device: Some("0x00f6".into()),
         };
-        assert!(!bcm.is_i210());
+        assert_eq!(bcm.kind(), Some(NicKind::Bcm57762));
+        // A Broadcom with another subsystem vendor is not the Apple adapter.
+        assert_eq!(
+            EthPort {
+                sub_vendor: Some("0x14e4".into()),
+                ..bcm.clone()
+            }
+            .kind(),
+            None
+        );
 
         // A USB NIC with no PCI ids at all.
-        assert!(!EthPort {
+        assert!(EthPort {
             name: "USB LAN".into(),
             ..Default::default()
         }
-        .is_i210());
+        .kind()
+        .is_none());
 
         // Right vendor, wrong device.
-        assert!(!EthPort {
+        assert!(EthPort {
             vendor: Some("0x8086".into()),
             device: Some("0x157b".into()),
             ..Default::default()
         }
-        .is_i210());
+        .kind()
+        .is_none());
     }
 
     #[test]
@@ -2553,15 +2953,19 @@ AVBI210Driver [terminated waiting to uninstall on reboot]";
 
     // --- launch at login ---------------------------------------------------
 
-    fn nic(bsd: &str, supported: bool) -> Nic {
+    /// A NIC whose dropdown id is `id`. Supported ones carry a kind (which one
+    /// does not matter to auto-select, which selects by id).
+    fn nic(id: &str, supported: bool) -> Nic {
         Nic {
-            bsd_name: bsd.into(),
+            id: id.into(),
+            bsd_name: id.into(),
             display: if supported {
                 "Intel I210".into()
             } else {
                 "Other".into()
             },
             pci_id: "—".into(),
+            kind: supported.then_some(NicKind::I210),
             supported,
         }
     }

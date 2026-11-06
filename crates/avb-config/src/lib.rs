@@ -271,7 +271,16 @@ pub struct Config {
     /// output latency. Default [`DEFAULT_PRESENTATION_OFFSET_US`]; values
     /// outside [`PRESENTATION_OFFSET_US_RANGE`] are refused with a warning.
     pub presentation_offset_us: u32,
+    /// The NIC the user last turned DreamAVB on for, as one of [`NIC_IDS`]
+    /// (`None` = never chosen). With two supported adapters attached at once,
+    /// this is what decides which one the app reports and streams through.
+    /// Always one of `NIC_IDS` itself, so `Config` stays `Copy`.
+    pub active_nic: Option<&'static str>,
 }
+
+/// Valid [`Config::active_nic`] values: the companion's NIC ids, which are
+/// also `avb-installer --dext` arguments.
+pub const NIC_IDS: [&str; 2] = ["i210", "bcm57762"];
 
 impl Default for Config {
     fn default() -> Self {
@@ -280,6 +289,7 @@ impl Default for Config {
             launch_at_login: false,
             auto_select_nic: false,
             presentation_offset_us: DEFAULT_PRESENTATION_OFFSET_US,
+            active_nic: None,
         }
     }
 }
@@ -422,6 +432,16 @@ impl Config {
                         cfg.presentation_offset_us
                     )),
                 },
+                "active_nic" => match value.trim() {
+                    "" => cfg.active_nic = None,
+                    v if NIC_IDS.contains(&v) => {
+                        cfg.active_nic = NIC_IDS.iter().copied().find(|&id| id == v);
+                    }
+                    v => warnings.push(format!(
+                        "line {}: unknown active_nic {v:?}; expected one of {NIC_IDS:?}",
+                        i + 1
+                    )),
+                },
                 other => warnings.push(format!("line {}: unknown key {other:?}", i + 1)),
             }
         }
@@ -435,11 +455,13 @@ impl Config {
              clock_source={}\n\
              launch_at_login={}\n\
              auto_select_nic={}\n\
-             presentation_offset_us={}\n",
+             presentation_offset_us={}\n\
+             active_nic={}\n",
             self.clock_source,
             self.launch_at_login,
             self.auto_select_nic,
-            self.presentation_offset_us
+            self.presentation_offset_us,
+            self.active_nic.unwrap_or("")
         )
     }
 
@@ -580,6 +602,24 @@ mod tests {
             .iter()
             .any(|w| w.contains("unknown auto_select_nic")));
         assert!(warnings.iter().any(|w| w.contains("unknown key")));
+    }
+
+    /// The chosen NIC survives the file, an empty value means none, and an
+    /// unknown id is refused with a warning rather than stored.
+    #[test]
+    fn active_nic_round_trips_and_rejects_unknown_ids() {
+        for id in NIC_IDS.iter().copied().map(Some).chain([None]) {
+            let c = Config {
+                active_nic: id,
+                ..Config::default()
+            };
+            let (back, warnings) = Config::parse(&c.to_text());
+            assert_eq!(back, c, "{id:?}");
+            assert!(warnings.is_empty(), "{id:?}: {warnings:?}");
+        }
+        let (cfg, warnings) = Config::parse("active_nic=en7\n");
+        assert_eq!(cfg.active_nic, None);
+        assert!(warnings.iter().any(|w| w.contains("unknown active_nic")));
     }
 
     /// Both new settings default OFF, as required.

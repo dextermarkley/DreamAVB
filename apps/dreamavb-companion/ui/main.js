@@ -6,7 +6,7 @@ const el = (id) => document.getElementById(id);
 let currentNics = [];
 let busy = false;
 // Driver state the NIC list was last built for. Our dext claiming or
-// releasing the I210 removes or restores its enX interface, so the list
+// releasing a NIC removes or restores its enX interface, so the list
 // genuinely differs between states and must be rebuilt when one changes.
 let nicListState = null;
 
@@ -18,8 +18,10 @@ async function loadNics() {
   sel.innerHTML = "";
   for (const n of nics) {
     const o = document.createElement("option");
-    o.value = n.bsd_name;
-    // With our dext owning the I210 there is no enX interface, so the ioreg
+    // `id` is stable across our dext claiming the NIC (the BSD name vanishes
+    // then), and distinct for each supported NIC.
+    o.value = n.id;
+    // With our dext owning a NIC there is no enX interface, so the ioreg
     // fallback supplies no BSD name — don't render a dangling separator.
     o.textContent = n.bsd_name ? `${n.display} · ${n.bsd_name}` : n.display;
     o.disabled = !n.supported;
@@ -27,7 +29,12 @@ async function loadNics() {
   }
   // Rebuilding the <select> drops the selection; restore it when the same
   // NIC is still on offer, so a poll can't move the user's choice.
-  if (prev && nics.some((n) => n.bsd_name === prev)) sel.value = prev;
+  if (prev && nics.some((n) => n.id === prev)) sel.value = prev;
+  // Otherwise never leave a disabled (unsupported) option selected.
+  else if (sel.selectedOptions[0]?.disabled) {
+    const first = nics.find((n) => n.supported);
+    if (first) sel.value = first.id;
+  }
 }
 
 /// Re-query the NIC list only when it could actually have changed: we have
@@ -71,7 +78,7 @@ function paintStatus(st) {
       dot.classList.add("pending");
       main.textContent = "Releasing…";
       sub.textContent =
-        st.summary || "Waiting for macOS to release the I210";
+        st.summary || "Waiting for macOS to release the NIC";
       power.checked = true;
       break;
     case "fault":
@@ -210,7 +217,7 @@ el("power").addEventListener("change", async (ev) => {
     if (want) {
       const nic = el("nic").value;
       paintStatus({ state: "pending", summary: "Activating…" });
-      await invoke("enable_driver", { bsdName: nic });
+      await invoke("enable_driver", { nicId: nic });
     } else {
       await invoke("disable_driver");
     }
