@@ -118,6 +118,10 @@ enum Cmd {
     /// Dump a range of NIC SRAM (default the send/return-ring RCB region
     /// 0x100-0x300) via the memory window. For capturing Apple's realtime-queue
     /// ring control blocks.
+    /// BCM only: dump the internal PHY's clause-22 registers 0..=31 over MDIO
+    /// and decode autonegotiation, pause and link-partner abilities.
+    /// Read-only.
+    Phy,
     SramDump {
         #[arg(long, default_value_t = 0x100)]
         start: u32,
@@ -899,6 +903,92 @@ fn cmd_win_timing(dev: &Device, json: Option<&Path>, n: u32) -> Result<()> {
     )
 }
 
+/// Decode the clause-22 registers that say how the link negotiated (IEEE
+/// 802.3 clause 22 / 28 / 40 register map). Pure.
+fn decode_phy(r: &[u16; 32]) -> Vec<String> {
+    let b = |v: u16, bit: u16| v & (1 << bit) != 0;
+    let [bmcr, bmsr, id1, id2, anar, anlpar, aner, ..] = *r;
+    let (ctrl1000, stat1000, estat) = (r[9], r[10], r[15]);
+    let pause = |v: u16| match (b(v, 10), b(v, 11)) {
+        (false, false) => "none",
+        (true, false) => "symmetric",
+        (false, true) => "asymmetric (TX only)",
+        (true, true) => "symmetric + asymmetric",
+    };
+    vec![
+        format!("PHY id                 0x{id1:04x}{id2:04x}"),
+        format!(
+            "BMCR 0x{bmcr:04x}            autoneg {} (restart {}), loopback {}, power-down {}",
+            b(bmcr, 12),
+            b(bmcr, 9),
+            b(bmcr, 14),
+            b(bmcr, 11)
+        ),
+        format!(
+            "BMSR 0x{bmsr:04x}            link {} (latched), autoneg complete {}, ext status {}",
+            b(bmsr, 2),
+            b(bmsr, 5),
+            b(bmsr, 8)
+        ),
+        format!(
+            "we advertise 0x{anar:04x}    10H {} 10F {} 100H {} 100F {}  pause {}",
+            b(anar, 5),
+            b(anar, 6),
+            b(anar, 7),
+            b(anar, 8),
+            pause(anar)
+        ),
+        format!(
+            "partner offers 0x{anlpar:04x}  10H {} 10F {} 100H {} 100F {}  pause {}",
+            b(anlpar, 5),
+            b(anlpar, 6),
+            b(anlpar, 7),
+            b(anlpar, 8),
+            pause(anlpar)
+        ),
+        format!(
+            "ANER 0x{aner:04x}            partner autoneg-able {}, next page able: us {} partner {}",
+            b(aner, 0),
+            b(aner, 2),
+            b(aner, 3)
+        ),
+        format!(
+            "1000BASE-T ctrl 0x{ctrl1000:04x}  we advertise 1000H {} 1000F {}, master/slave manual {}",
+            b(ctrl1000, 8),
+            b(ctrl1000, 9),
+            b(ctrl1000, 12)
+        ),
+        format!(
+            "1000BASE-T stat 0x{stat1000:04x}  partner 1000H {} 1000F {}, we are {}, idle errors {}",
+            b(stat1000, 10),
+            b(stat1000, 11),
+            if b(stat1000, 14) { "MASTER" } else { "SLAVE" },
+            stat1000 & 0xff
+        ),
+        format!("ext status 0x{estat:04x}       1000T-F {} 1000T-H {}", b(estat, 13), b(estat, 12)),
+    ]
+}
+
+fn cmd_phy(dev: &Device, json: Option<&Path>) -> Result<()> {
+    let mut r = [0u16; 32];
+    for (i, slot) in r.iter_mut().enumerate() {
+        *slot = dev.read_phy(i as u8)?;
+    }
+    for (row, chunk) in r.chunks(8).enumerate() {
+        let words: Vec<String> = chunk.iter().map(|w| format!("{w:04x}")).collect();
+        println!(
+            "  reg {:2}..{:2}: {}",
+            row * 8,
+            row * 8 + 7,
+            words.join(" ")
+        );
+    }
+    for line in decode_phy(&r) {
+        println!("{line}");
+    }
+    emit(json, "phy", &serde_json::json!({ "regs": r.to_vec() }))
+}
+
 fn cmd_peek(dev: &Device, json: Option<&Path>, offsets: &[String]) -> Result<()> {
     let mut rec = serde_json::Map::new();
     for s in offsets {
@@ -1622,6 +1712,7 @@ fn main() -> Result<()> {
         Cmd::StampWatch { seconds } => cmd_stamp_watch(&dev, json, seconds),
         Cmd::RxTstampPoll { seconds } => cmd_rx_tstamp_poll(&dev, json, seconds),
         Cmd::SramDump { start, end } => cmd_sram_dump(&dev, json, start, end),
+        Cmd::Phy => cmd_phy(&dev, json),
         Cmd::Peek { ref offsets } => cmd_peek(&dev, json, offsets),
         Cmd::WinTiming { n } => cmd_win_timing(&dev, json, n),
         Cmd::AecpPing { target, seconds } => cmd_aecp_ping(&dev, &target, seconds),

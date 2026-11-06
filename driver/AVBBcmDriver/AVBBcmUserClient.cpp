@@ -130,6 +130,9 @@ const IOUserClientMethodDispatch kDispatchSendFrames =
 const IOUserClientMethodDispatch kDispatchReadSram =
     /* 18 ReadSram: scalarIn nic_sram_addr, scalarOut word */
     {dispatchToDriver, 0, 1, 0, 1, 0};
+const IOUserClientMethodDispatch kDispatchReadPhy =
+    /* 19 ReadPhy: scalarIn clause-22 register, scalarOut value */
+    {dispatchToDriver, 0, 1, 0, 1, 0};
 
 }  // namespace
 
@@ -240,6 +243,9 @@ AVBBcmUserClient::ExternalMethod(uint64_t selector,
     }
     if (selector == kAvbSelReadSram) {
         return super::ExternalMethod(selector, arguments, &kDispatchReadSram, this, nullptr);
+    }
+    if (selector == kAvbSelReadPhy) {
+        return super::ExternalMethod(selector, arguments, &kDispatchReadPhy, this, nullptr);
     }
     if (selector == kAvbSelGetCounters) {
         return super::ExternalMethod(selector, arguments, &kDispatchGetCounters, this, nullptr);

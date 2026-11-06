@@ -2472,6 +2472,25 @@ AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOU
         return ret;
     }
 
+    case kAvbSelReadPhy: {
+        // One clause-22 MDIO read of the internal PHY. Read-only: the only
+        // register written is MAC_MI_COM, the MAC's MDIO command register,
+        // exactly as setupLink's existing BMCR/BMSR/AUX_STAT reads do.
+        if (!ok(v)) {
+            return kIOReturnNotReady;
+        }
+        const uint64_t reg = a->scalarInput[0];
+        if (reg > 31) {
+            return kIOReturnBadArgument;
+        }
+        uint16_t val = 0;
+        if (!miRead(v, static_cast<uint32_t>(reg), &val)) {
+            return kIOReturnIOError;
+        }
+        a->scalarOutput[0] = val;
+        return kIOReturnSuccess;
+    }
+
     case kAvbSelReadSram: {
         if (!ok(v)) {
             return kIOReturnNotReady;

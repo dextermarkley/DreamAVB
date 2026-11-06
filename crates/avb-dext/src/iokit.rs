@@ -433,6 +433,21 @@ impl Device {
     }
 
     /// BCM: read one word of NIC SRAM by address (via the memory window).
+    /// BCM only: read clause-22 PHY register `reg` (0..=31) over MDIO.
+    /// Read-only; the dext refuses a register above 31.
+    pub fn read_phy(&self, reg: u8) -> Result<u16> {
+        let mut out = [0u64; 1];
+        self.call(
+            sel::READ_PHY,
+            &[u64::from(reg)],
+            &[],
+            &mut out,
+            None,
+            "ReadPhy",
+        )?;
+        Ok(out[0] as u16)
+    }
+
     pub fn read_sram(&self, nic_addr: u32) -> Result<u32> {
         let mut out = [0u64; 1];
         self.call(
