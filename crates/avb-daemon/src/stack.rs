@@ -4167,6 +4167,19 @@ fn talker_loop(
         o.talker.set_tu(true);
     }
     let no_audio_tx = std::env::var_os("AVB_DEBUG_NO_AUDIO_TX").is_some();
+    // Test hook (AVB_DEBUG_TX_STREAMS=<n>): transmit audio on only the first
+    // n output streams; every other stream is declared and bound as normal
+    // but sends nothing. Separates "any audio frame" from "this frame rate".
+    let tx_streams_max: Option<usize> = std::env::var("AVB_DEBUG_TX_STREAMS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    if let Some(n) = tx_streams_max {
+        log.log(
+            Level::Warn,
+            dir,
+            &format!("TEST HOOK: AVB_DEBUG_TX_STREAMS={n} — audio goes out on streams 0..{n} only"),
+        );
+    }
     if no_audio_tx {
         log.log(
             Level::Warn,
@@ -7028,6 +7041,7 @@ fn talker_loop(
                 // multicast to a bridge: 8000 frames/s of it per stream, which
                 // the MOTU switch answered by stopping gPTP Sync on our port
                 // and tearing down every reservation within a second.
+                Some(_) if tx_streams_max.is_some_and(|n| i >= n) => continue,
                 Some(o) if o.ready => (o.first_ch, block_dest(&maap, o.stream_id)),
                 Some(_) => continue,
                 None => break,
