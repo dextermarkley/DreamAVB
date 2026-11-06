@@ -3123,6 +3123,13 @@ fn talker_loop(
         /// ns_since(start) when the listener declaration for this stream
         /// last became Asking Failed, while it still is.
         asking_failed_since: Option<u64>,
+        /// We currently declare this stream's Talker Advertise.
+        ta_declared: bool,
+        /// ns_since(start) of the last PROBE_TX_COMMAND naming this stream.
+        last_probe_ns: Option<u64>,
+        /// Any matching Listener attribute is registered (Ready, Ready
+        /// Failed or Asking Failed).
+        listener_attr: bool,
     }
     let n_out = (usize::from(map_width) / channels.max(1))
         .min(tx_stream_limit)
@@ -3158,6 +3165,9 @@ fn talker_loop(
             talker,
             ready: false,
             asking_failed_since: None,
+            ta_declared: false,
+            last_probe_ns: None,
+            listener_attr: false,
         });
     }
     if out_streams.is_empty() {
@@ -3583,30 +3593,13 @@ fn talker_loop(
     // impossible zero-latency talker and made the 16R reject us as a live
     // source. `talker_tspec` derives the non-zero value from the class-A
     // packetizer cadence and pins it against captured reference endpoints.
-    // ONE Talker Advertise PER STREAM. A Milan listener accepts no stream it
-    // has not been advertised, so eight streams need eight declarations; one
-    // declaration would have the 16R bind one and ignore the other seven
-    // however many we transmitted. A brand-new talker attribute is declared
-    // with New!: both Apple and the 16R do this on cold bring-up, whereas the
-    // generic Join! path encoded JoinMt in our first on-wire declaration.
-    for o in &out_streams {
-        let advertise = talker_tspec(o.stream_id, o.talker.pdu_len());
-        let max_frame_size = advertise.max_frame_size;
-        srp.declare_new(now_mach(), Attribute::Talker(Talker::Advertise(advertise)));
-        log.log(
-            Level::Info,
-            "msrp",
-            &format!(
-                "Talker Advertise declared: stream {} 0x{:016x} dest {} vid {} max_frame {}B 1 frame/interval prio {}",
-                o.uid,
-                o.stream_id.0,
-                stream_dest_mac(o.stream_id),
-                DEFAULT_DOMAIN.vid,
-                max_frame_size,
-                DEFAULT_DOMAIN.priority
-            ),
-        );
-    }
+    // ONE Talker Advertise PER STREAM, declared ON DEMAND in the loop
+    // (`ta_wanted`): Milan v1.3 §4.3.3.1 makes a stream's destination valid,
+    // and so its Talker attribute declarable, only once MAAP holds the address
+    // AND a listener asked for it (a PROBE_TX in the last 15 s, or a matching
+    // Listener attribute). Declaring all 16 up front reserved ~265 Mb/s of
+    // class A for streams nobody listened to. A new talker attribute is
+    // declared with New!: both Apple and the 16R do this on cold bring-up.
     // The media clock needs its own reservation: it is a separate class A
     // stream with its own id and destination, and the 16R accepts no stream it
     // has not been advertised. `talker_tspec` derives max_frame_size from the
@@ -4135,6 +4128,7 @@ fn talker_loop(
     // Inbound peak |sample| per (stream_id, channel), sampled every 8th PDU,
     // so the run summary can say which 16R channels actually carried signal.
     let mut in_peak: std::collections::BTreeMap<(u64, u16), i64> = Default::default();
+    let mut next_ta_check_ns: u64 = 0;
     let mut tu_state = TuState::default();
     // Start uncertain: the first interval sets it from the real clock state.
     let mut tu_applied = true;
@@ -4595,6 +4589,19 @@ fn talker_loop(
                 let named = our_streams_by_uid
                     .get(&acmp.talker_unique_id)
                     .map(|&sid| (acmp.talker_unique_id, sid));
+                // A PROBE_TX (CONNECT_TX_COMMAND) naming one of our audio
+                // streams: a listener wants it, so its Talker Advertise may be
+                // declared for the next 15 s (Milan v1.3 §4.3.3.1 cond. 2).
+                if acmp.message_type == avb_avdecc::constants::acmp_msg::CONNECT_TX_COMMAND
+                    && acmp.talker_entity_id == our_id
+                {
+                    if let Some(o) = out_streams
+                        .iter_mut()
+                        .find(|o| o.uid == acmp.talker_unique_id)
+                    {
+                        o.last_probe_ns = Some(ns_since(start));
+                    }
+                }
                 let ts = match named {
                     Some((uid, sid)) => avb_avdecc::TalkerStream {
                         our_id,
@@ -5346,16 +5353,19 @@ fn talker_loop(
                             );
                         }
                         o.ready = now_ready;
+                        o.listener_attr = true;
                         if matches!(decl, ListenerDecl::AskingFailed) {
                             o.asking_failed_since.get_or_insert(ns_since(start));
                         } else {
                             o.asking_failed_since = None;
                         }
                     }
-                    // `StreamInfo` carries one stream, so the entity reports
-                    // the first. The per-stream truth is in `out_streams`.
+                    // `StreamInfo.connected` = ANY of our streams is in use
+                    // (it gates SET_STREAM_FORMAT with STREAM_IS_RUNNING).
+                    // Per-stream state goes through `set_output_srp`.
+                    let any_ready = out_streams.iter().any(|o| o.ready);
                     if let Some(first) = out_streams.first() {
-                        if first.ready && !listener_ready {
+                        if any_ready && !listener_ready {
                             listener_ready = true;
                             entity.set_stream_info(avb_avdecc::entity::StreamInfo {
                                 connected: true,
@@ -5380,6 +5390,7 @@ fn talker_loop(
                         .find(|o| o.stream_id.0 == stream_id.0)
                     {
                         o.asking_failed_since = None;
+                        o.listener_attr = false;
                         if o.ready {
                             o.ready = false;
                             log.log(
@@ -5392,8 +5403,9 @@ fn talker_loop(
                             );
                         }
                     }
+                    let any_ready = out_streams.iter().any(|o| o.ready);
                     if let Some(first) = out_streams.first() {
-                        if !first.ready && listener_ready {
+                        if !any_ready && listener_ready {
                             listener_ready = false;
                             entity.set_stream_info(avb_avdecc::entity::StreamInfo {
                                 connected: false,
@@ -5465,6 +5477,66 @@ fn talker_loop(
                                     ),
                                 );
                             }
+                        }
+                    }
+                }
+            }
+        }
+        // Talker Advertise per stream, on demand (Milan v1.3 §4.3.3.1), and
+        // each output's MSRP state for GET_STREAM_INFO (Table 5.9). Checked
+        // every 100 ms: the 15 s probe window needs no finer grain.
+        if ns_since(start) >= next_ta_check_ns {
+            let now_ns = ns_since(start);
+            next_ta_check_ns = now_ns.saturating_add(100_000_000);
+            let maap_ok = maap.acquired();
+            for (i, o) in out_streams.iter_mut().enumerate() {
+                let want = ta_wanted(maap_ok, o.last_probe_ns, o.listener_attr, now_ns);
+                if want && !o.ta_declared {
+                    let advertise = talker_tspec(o.stream_id, o.talker.pdu_len());
+                    srp.declare_new(now_mach(), Attribute::Talker(Talker::Advertise(advertise)));
+                    log.log(
+                        Level::Info,
+                        "msrp",
+                        &format!(
+                            "Talker Advertise declared: stream {} 0x{:016x} dest {} max_frame {}B \
+                             (a listener asked for it)",
+                            o.uid,
+                            o.stream_id.0,
+                            stream_dest_mac(o.stream_id),
+                            advertise.max_frame_size
+                        ),
+                    );
+                } else if !want && o.ta_declared {
+                    srp.withdraw(
+                        now_mach(),
+                        avb_srp::attr::App::Msrp,
+                        avb_srp::attr::AttrKey::Talker(o.stream_id),
+                    );
+                    log.log(
+                        Level::Info,
+                        "msrp",
+                        &format!(
+                            "Talker Advertise withdrawn: stream {} (no PROBE_TX for 15 s and no \
+                             listener attribute)",
+                            o.uid
+                        ),
+                    );
+                }
+                o.ta_declared = want;
+                let srp_state = avb_avdecc::entity::talker::OutputSrp {
+                    declared: o.ta_declared,
+                    listener_ready: o.ready,
+                    asking_failed: o.asking_failed_since.is_some(),
+                };
+                if entity.set_output_srp(i, srp_state) {
+                    if let Ok(idx) = u16::try_from(i) {
+                        for (dst, resp) in entity.unsolicited_desc(
+                            avb_avdecc::constants::aem_cmd::GET_STREAM_INFO,
+                            avb_avdecc::constants::desc::STREAM_OUTPUT,
+                            idx,
+                        ) {
+                            send_aem_response(dext, our_mac, dst, &resp);
+                            unsol_sent += 1;
                         }
                     }
                 }
@@ -7245,33 +7317,32 @@ fn talker_loop(
         Level::Info,
         dir,
         &format!(
-            "outbound streams: {} of {} accepted by the 16R{}",
+            "outbound streams: {} of {} offered are in use by a listener: {:?}",
             ready_count,
             out_streams.len(),
-            if ready_count == out_streams.len() {
-                String::new()
-            } else {
-                format!(
-                    "; NOT accepted: {:?}",
-                    out_streams
-                        .iter()
-                        .filter(|o| !o.ready)
-                        .map(|o| o.uid)
-                        .collect::<Vec<_>>()
-                )
-            }
+            out_streams
+                .iter()
+                .filter(|o| o.ready)
+                .map(|o| o.uid)
+                .collect::<Vec<_>>()
         ),
     );
-    if ready_count > 0 && ready_count < out_streams.len() {
+    // Offering more streams than are in use is normal now (every output is
+    // offered to every device, and each device picks). What is NOT normal is
+    // a stream a listener asked for (probed, or declared a Listener
+    // attribute) that never reached Ready.
+    let asked_not_ready: Vec<u16> = out_streams
+        .iter()
+        .filter(|o| !o.ready && (o.ta_declared || o.listener_attr))
+        .map(|o| o.uid)
+        .collect();
+    if !asked_not_ready.is_empty() {
         log.log(
             Level::Warn,
             dir,
             &format!(
-                "only {ready_count} of {} outbound streams were accepted, so {} of the device's \
-                 {} output channels reached the 16R and the rest went nowhere",
-                out_streams.len(),
-                ready_count * channels,
-                out_streams.len() * channels,
+                "stream(s) {asked_not_ready:?} were requested by a listener but never reached \
+                 Listener Ready"
             ),
         );
     }
@@ -9172,6 +9243,24 @@ fn get_rx_state_frame(
 /// release: a nonzero stream id carrying our MAC in its top 48 bits
 /// (1722-2016 §4.4.4.30), and not the stream we want on that sink. A binding
 /// to any other talker is never ours to undo.
+/// A PROBE_TX keeps a stream's Talker Advertise valid this long (Milan v1.3
+/// §4.3.3.1 condition 2).
+const PROBE_TX_VALID_NS: u64 = 15_000_000_000;
+
+/// Whether a stream's Talker Advertise may be declared (Milan v1.3
+/// §4.3.3.1): MAAP holds the address AND a listener asked for it, by a
+/// PROBE_TX in the last 15 s or by a registered Listener attribute. Pure.
+fn ta_wanted(
+    maap_acquired: bool,
+    last_probe_ns: Option<u64>,
+    listener_attr: bool,
+    now_ns: u64,
+) -> bool {
+    maap_acquired
+        && (listener_attr
+            || last_probe_ns.is_some_and(|t| now_ns.saturating_sub(t) < PROBE_TX_VALID_NS))
+}
+
 /// How long `tu` stays set after a grandmaster change or after the clock
 /// becomes good again (Milan v1.3 Annex B.1.1).
 const TU_HOLD_NS: u64 = 250_000_000;
@@ -9744,6 +9833,26 @@ mod tests {
     /// 1-64), whatever the INPUT channel map says; a second mixer in the same
     /// session starts after the first's sinks; and the offer wraps rather than
     /// naming a stream we do not have.
+    /// Milan v1.3 §4.3.3.1: no Talker Advertise before MAAP, and only while
+    /// a listener has asked (PROBE_TX within 15 s, or a Listener attribute).
+    #[test]
+    fn talker_advertise_only_when_maap_and_a_listener_asked() {
+        use super::{ta_wanted, PROBE_TX_VALID_NS};
+        let s = 1_000_000_000u64;
+        assert!(!ta_wanted(false, Some(0), true, s), "never before MAAP");
+        assert!(!ta_wanted(true, None, false, s), "nobody asked");
+        assert!(ta_wanted(true, Some(s), false, s));
+        assert!(ta_wanted(true, Some(s), false, s + PROBE_TX_VALID_NS - 1));
+        assert!(
+            !ta_wanted(true, Some(s), false, s + PROBE_TX_VALID_NS),
+            "probe expired"
+        );
+        assert!(
+            ta_wanted(true, None, true, s),
+            "a registered listener keeps it"
+        );
+    }
+
     /// Milan v1.3 §4.3.5.2 / Annex B.1.1: tu while the clock is unusable,
     /// and for 0.25 s after a GM change or after the clock returns.
     #[test]

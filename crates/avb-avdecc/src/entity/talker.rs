@@ -384,12 +384,75 @@ pub struct StreamInfo {
     pub msrp_accumulated_latency_ns: u32,
 }
 
-/// GET_STREAM_INFO flags for a STREAM_OUTPUT: the 16R's own talker word,
-/// identical on all eight of its outputs whether or not anyone listened.
-/// STREAM_FORMAT/ID/MSRP_ACC_LAT/DEST_MAC/VLAN_ID valid.
+/// GET_STREAM_INFO validity bits of a STREAM_OUTPUT declaring a Talker
+/// attribute: STREAM_FORMAT/ID/MSRP_ACC_LAT/DEST_MAC/VLAN_ID valid. This is
+/// also the 16R's own talker word, which it sends whatever the SRP state.
 pub const OUTPUT_FLAGS: u32 = 0xf200_0000;
-/// GET_STREAM_INFO flags for an unbound STREAM_INPUT: the 16R's own word.
-pub const INPUT_UNBOUND_FLAGS: u32 = crate::milan::stream_info_flags::CAPTURED_16R_UNBOUND;
+
+/// What MSRP says about one of our STREAM_OUTPUTs, pushed by the daemon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutputSrp {
+    /// We declare its Talker Advertise.
+    pub declared: bool,
+    /// A matching Listener Ready or Ready Failed is registered.
+    pub listener_ready: bool,
+    /// A matching Listener Asking Failed is registered.
+    pub asking_failed: bool,
+}
+
+/// GET_STREAM_INFO flags for a STREAM_OUTPUT (Milan v1.3 Table 5.9). Pure.
+pub fn output_flags(s: OutputSrp) -> u32 {
+    use crate::milan::stream_info_flags as f;
+    const FORMAT_VALID: u32 = f::STREAM_FORMAT_VALID;
+    // MSRP_ACC_LAT "shall always contain valid information".
+    let mut w = FORMAT_VALID | f::MSRP_ACC_LAT_VALID;
+    if s.declared {
+        w |= OUTPUT_FLAGS;
+        if s.listener_ready {
+            w |= f::CONNECTED;
+        } else if s.asking_failed {
+            w |= f::SRP_REGISTRATION_FAILED;
+        } else {
+            w |= f::NOT_REGISTERING_SRP;
+        }
+    }
+    w
+}
+
+/// What a sink's state machine says, for its GET_STREAM_INFO flags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InputState {
+    pub bound: bool,
+    pub started: bool,
+    pub settled: bool,
+    pub ta_registered: bool,
+    pub tf_registered: bool,
+}
+
+/// GET_STREAM_INFO flags for a STREAM_INPUT (Milan v1.3 Table 5.8). Pure.
+/// SAVED_STATE (recommended) stays clear: no binding is persisted yet.
+pub fn input_flags(s: InputState) -> u32 {
+    use crate::milan::stream_info_flags as f;
+    let mut w = f::STREAM_FORMAT_VALID;
+    if s.bound {
+        w |= f::CONNECTED | f::FAST_CONNECT;
+        if !s.started {
+            w |= f::STREAMING_WAIT;
+        }
+        if s.ta_registered || s.tf_registered {
+            w |= f::MSRP_ACC_LAT_VALID;
+        } else {
+            w |= f::NOT_REGISTERING_SRP;
+        }
+    }
+    if s.tf_registered {
+        w |= f::SRP_REGISTRATION_FAILED;
+    }
+    if s.bound && s.settled {
+        w |= f::STREAM_ID_VALID | f::STREAM_DEST_MAC_VALID | f::STREAM_VLAN_ID_VALID;
+    }
+    w
+}
 
 /// Fields of one 48-byte GET_STREAM_INFO response payload.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -454,6 +517,8 @@ pub struct TalkerEntity {
     stream: StreamInfo,
     /// Per-STREAM_OUTPUT destination MACs, for GET_STREAM_INFO.
     output_dest_macs: Vec<MacAddr>,
+    /// Per-STREAM_OUTPUT MSRP state, for GET_STREAM_INFO.
+    output_srp: Vec<OutputSrp>,
 }
 
 impl TalkerEntity {
@@ -472,6 +537,7 @@ impl TalkerEntity {
             control: ControlState::new(),
             stream: StreamInfo::default(),
             output_dest_macs: Vec::new(),
+            output_srp: Vec::new(),
         }
     }
 
@@ -1618,6 +1684,25 @@ impl TalkerEntity {
         self.output_dest_macs = macs;
     }
 
+    /// Per-STREAM_OUTPUT MSRP state for GET_STREAM_INFO (Table 5.9).
+    /// Returns whether it changed, so the caller can notify.
+    pub fn set_output_srp(&mut self, index: usize, s: OutputSrp) -> bool {
+        if self.output_srp.len() <= index {
+            self.output_srp.resize(
+                index + 1,
+                OutputSrp {
+                    declared: true,
+                    ..OutputSrp::default()
+                },
+            );
+        }
+        let changed = self.output_srp.get(index) != Some(&s);
+        if let Some(slot) = self.output_srp.get_mut(index) {
+            *slot = s;
+        }
+        changed
+    }
+
     /// GET_STREAM_INFO (IEEE 1722.1-2021 §7.4.16) for our STREAM_OUTPUTs and
     /// STREAM_INPUTs.
     ///
@@ -1638,10 +1723,11 @@ impl TalkerEntity {
     /// The 48-byte payload is: desc_type, desc_index, flags, stream_format,
     /// stream_id, msrp_accumulated_latency, stream_dest_mac,
     /// msrp_failure_code, reserved, msrp_failure_bridge_id, stream_vlan_id,
-    /// reserved. A talker reports the 16R's constant talker word
-    /// [`OUTPUT_FLAGS`]. A sink reports the unbound word, plus CONNECTED (bit
-    /// 26, anchored by the 16R's bound/unbound delta) while bound. It never
-    /// claims SAVED_STATE / FAST_CONNECT: we persist no binding.
+    /// reserved. The FLAGS word, however, follows Milan v1.3 Tables 5.8 and
+    /// 5.9 from live state rather than the 16R's constants: an output from
+    /// its MSRP state ([`output_flags`], pushed per stream with
+    /// [`TalkerEntity::set_output_srp`]), a sink from its state machine
+    /// ([`input_flags`]). SAVED_STATE stays clear: no binding is persisted.
     fn get_stream_info(&self, cmd: &AemPdu) -> (u8, Vec<u8>) {
         let (Some(ty), Some(index)) = (be_u16(&cmd.payload, 0), be_u16(&cmd.payload, 2)) else {
             return (aecp_status::BAD_ARGUMENTS, cmd.payload.clone());
@@ -1652,10 +1738,16 @@ impl TalkerEntity {
                 let Some(st) = self.model.streams.get(i) else {
                     return (aecp_status::NO_SUCH_DESCRIPTOR, cmd.payload.clone());
                 };
+                // Before the daemon reports any SRP state, describe the
+                // output as declared and idle (the startup case).
+                let srp = self.output_srp.get(i).copied().unwrap_or(OutputSrp {
+                    declared: true,
+                    ..OutputSrp::default()
+                });
                 encode_stream_info(&StreamInfoReply {
                     desc_type: ty,
                     index,
-                    flags: OUTPUT_FLAGS,
+                    flags: output_flags(srp),
                     format: st.format.0,
                     stream_id: st.stream_id.0,
                     msrp_acc_lat_ns: self.stream.msrp_accumulated_latency_ns,
@@ -1672,28 +1764,37 @@ impl TalkerEntity {
                     return (aecp_status::NO_SUCH_DESCRIPTOR, cmd.payload.clone());
                 };
                 let format = self.model.current_format.0;
-                match sm.bound_to() {
-                    None => encode_stream_info(&StreamInfoReply {
-                        desc_type: ty,
-                        index,
-                        flags: INPUT_UNBOUND_FLAGS,
-                        format,
-                        ..StreamInfoReply::default()
-                    }),
-                    Some(_) => {
-                        let eff = sm.effective();
-                        encode_stream_info(&StreamInfoReply {
-                            desc_type: ty,
-                            index,
-                            flags: INPUT_UNBOUND_FLAGS | crate::milan::stream_info_flags::CONNECTED,
-                            format,
-                            stream_id: eff.stream_id.0,
-                            msrp_acc_lat_ns: eff.accumulated_latency_ns,
-                            dest_mac: eff.dest_mac,
-                            vlan_id: eff.vlan_id,
-                        })
-                    }
-                }
+                let s = InputState {
+                    bound: sm.bound_to().is_some(),
+                    started: sm.started(),
+                    settled: sm.settled(),
+                    ta_registered: sm.ta_registered(),
+                    tf_registered: sm.talker_failed_registered(),
+                };
+                // Table 5.8: stream id / dest / vlan only once settled,
+                // accumulated latency only while a Talker attribute is
+                // registered; zero otherwise.
+                let eff = sm.effective();
+                let settled = s.bound && s.settled;
+                let registering = s.bound && (s.ta_registered || s.tf_registered);
+                encode_stream_info(&StreamInfoReply {
+                    desc_type: ty,
+                    index,
+                    flags: input_flags(s),
+                    format,
+                    stream_id: if settled { eff.stream_id.0 } else { 0 },
+                    msrp_acc_lat_ns: if registering {
+                        eff.accumulated_latency_ns
+                    } else {
+                        0
+                    },
+                    dest_mac: if settled {
+                        eff.dest_mac
+                    } else {
+                        MacAddr([0; 6])
+                    },
+                    vlan_id: if settled { eff.vlan_id } else { 0 },
+                })
             }
             _ => return (aecp_status::NO_SUCH_DESCRIPTOR, cmd.payload.clone()),
         };
@@ -3641,7 +3742,7 @@ mod tests {
         let in_unbound = encode_stream_info(&StreamInfoReply {
             desc_type: dt::STREAM_INPUT,
             index: 1,
-            flags: INPUT_UNBOUND_FLAGS,
+            flags: crate::milan::stream_info_flags::CAPTURED_16R_UNBOUND,
             format: 0x0205_0220_0200_6000,
             ..StreamInfoReply::default()
         });
@@ -3650,6 +3751,66 @@ mod tests {
             hex("00050001f200000002050220020060000000000000000000000000000000000000000000000000000000000000000000")
         );
         assert_eq!(OUTPUT_FLAGS, 0xf200_0000);
+    }
+
+    /// Milan v1.3 Table 5.9, row by row, against an independent literal.
+    #[test]
+    fn output_flags_follow_table_5_9() {
+        let s = |declared, listener_ready, asking_failed| OutputSrp {
+            declared,
+            listener_ready,
+            asking_failed,
+        };
+        // Not declared: format + acc-lat valid only.
+        assert_eq!(output_flags(s(false, false, false)), 0xa000_0000);
+        // Declared, nobody: NOT_REGISTERING_SRP.
+        assert_eq!(output_flags(s(true, false, false)), 0xf300_0000);
+        // Declared + Listener Ready: CONNECTED.
+        assert_eq!(output_flags(s(true, true, false)), 0xf600_0000);
+        // Declared + Asking Failed: SRP_REGISTRATION_FAILED.
+        assert_eq!(output_flags(s(true, false, true)), 0xf200_0040);
+        // FAST_CONNECT / SAVED_STATE / STREAMING_WAIT are always 0 on outputs.
+        for w in [
+            s(true, true, false),
+            s(true, false, true),
+            s(false, false, false),
+        ] {
+            assert_eq!(output_flags(w) & 0x0000_000e, 0);
+        }
+    }
+
+    /// Milan v1.3 Table 5.8, row by row.
+    #[test]
+    fn input_flags_follow_table_5_8() {
+        let unbound = InputState::default();
+        assert_eq!(input_flags(unbound), 0x8000_0000);
+        // Bound, started, probing, no talker attribute yet.
+        let probing = InputState {
+            bound: true,
+            started: true,
+            ..InputState::default()
+        };
+        assert_eq!(input_flags(probing), 0x8500_0002);
+        // Bound + stopped -> STREAMING_WAIT.
+        let stopped = InputState {
+            started: false,
+            ..probing
+        };
+        assert_eq!(input_flags(stopped) & 0x0000_0008, 0x8);
+        // Settled with a Talker Advertise registered: everything valid.
+        let streaming = InputState {
+            settled: true,
+            ta_registered: true,
+            ..probing
+        };
+        assert_eq!(input_flags(streaming), 0xf600_0002);
+        // Talker Failed registered: SRP_REGISTRATION_FAILED + acc-lat valid.
+        let failed = InputState {
+            ta_registered: false,
+            tf_registered: true,
+            ..streaming
+        };
+        assert_eq!(input_flags(failed), 0xf600_0042);
     }
 
     /// Through the AEM handler: each output reports its own id, format and
@@ -3685,7 +3846,11 @@ mod tests {
             assert_eq!(r.payload.len(), 48);
             let st = &e.model().streams[usize::from(i)];
             assert_eq!(r.payload[0..4], q(dt::STREAM_OUTPUT, i)[..]);
-            assert_eq!(r.payload[4..8], OUTPUT_FLAGS.to_be_bytes());
+            // No SRP state pushed: declared and idle.
+            assert_eq!(
+                r.payload[4..8],
+                (OUTPUT_FLAGS | crate::milan::stream_info_flags::NOT_REGISTERING_SRP).to_be_bytes()
+            );
             assert_eq!(r.payload[8..16], st.format.0.to_be_bytes());
             assert_eq!(r.payload[16..24], st.stream_id.0.to_be_bytes());
             assert_eq!(r.payload[24..28], 2_000_000u32.to_be_bytes());
@@ -3712,7 +3877,11 @@ mod tests {
             0,
         );
         assert_eq!(r.status, aecp_status::SUCCESS);
-        assert_eq!(r.payload[4..8], INPUT_UNBOUND_FLAGS.to_be_bytes());
+        // Table 5.8: an unbound sink sets only STREAM_FORMAT_VALID.
+        assert_eq!(
+            r.payload[4..8],
+            crate::milan::stream_info_flags::STREAM_FORMAT_VALID.to_be_bytes()
+        );
         assert!(
             r.payload[16..].iter().all(|&b| b == 0),
             "unbound: no stream fields"

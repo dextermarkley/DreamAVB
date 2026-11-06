@@ -273,6 +273,21 @@ impl ListenerSm {
         self.state
     }
 
+    /// Settled: a PROBE_TX_RESPONSE has been received (Milan v1.3 §5.3.8).
+    pub fn settled(&self) -> bool {
+        matches!(self.state, State::SettledNoRsv | State::SettledRsvOk)
+    }
+
+    /// A matching Talker Advertise is registered.
+    pub fn ta_registered(&self) -> bool {
+        self.ta_registered
+    }
+
+    /// A matching Talker Failed is registered.
+    pub fn talker_failed_registered(&self) -> bool {
+        self.talker_failed_registered
+    }
+
     pub fn declaration(&self) -> Declaration {
         self.declaration
     }

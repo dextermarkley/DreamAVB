@@ -148,6 +148,11 @@ pub mod stream_info_flags {
     pub const FAST_CONNECT: u32 = 1 << 1;
     /// Ditto -- the 16R re-binds these by itself after a power cycle.
     pub const SAVED_STATE: u32 = 1 << 2;
+    /// Milan v1.3 Tables 5.8 / 5.9 (field value column), cross-checked with
+    /// the bits above that the 16R capture anchors.
+    pub const STREAMING_WAIT: u32 = 0x0000_0008;
+    pub const SRP_REGISTRATION_FAILED: u32 = 0x0000_0040;
+    pub const NOT_REGISTERING_SRP: u32 = 0x0100_0000;
     pub const STREAM_VLAN_ID_VALID: u32 = 1 << 25;
     /// The sink is bound to a talker stream. Bit 26, proven by the delta.
     pub const CONNECTED: u32 = 1 << 26;
