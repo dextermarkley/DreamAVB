@@ -26,8 +26,8 @@ GET_STREAM_INPUT_INFO_EX, and MAAP relocation. `docs/milan-conformance.md`
 has the current Milan status at its top.
 
 Not yet done:
-- Dext 309.4.48 (the RX-stamp and owner fixes, counters 37–40) is built into
-  `build/AVBInstaller.app` but NOT activated; 308.23.40 is live. Activate with
+- BCM dext 309.5.17 (the RX-stamp and owner fixes, counters 37–40) is built
+  into `build/AVBInstaller.app` but NOT activated; 308.23.40 is live. Activate with
   `avb-installer activate --dext bcm57762`, then the adapter needs a replug
   (ask the user).
 - After that, a 10-minute duplex hardware test with Reaper closed: watch the
