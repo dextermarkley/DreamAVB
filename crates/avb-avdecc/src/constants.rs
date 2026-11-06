@@ -27,6 +27,10 @@ pub mod adp_msg {
     pub const ENTITY_DISCOVER: u8 = 0x02;
 }
 
+/// Largest max_transit_time a SET_MAX_TRANSIT_TIME may carry, ns (Milan v1.3
+/// §5.4.2.30: any value 0..=0x7FFFFFFF, else BAD_ARGUMENTS).
+pub const MAX_TRANSIT_TIME_MAX_NS: u64 = 0x7FFF_FFFF;
+
 /// AECP `message_type` values (IEEE 1722.1-2021 §9.2.1.1.5, Table 9.1).
 pub mod aecp_msg {
     pub const AEM_COMMAND: u8 = 0x00;
@@ -92,6 +96,11 @@ pub mod aem_cmd {
     /// transcribed from the on-box AudioVideoBridging.framework AVBConstants.h
     /// and independently observed in Apple's unsolicited response to the 16R.
     pub const GET_PTP_INSTANCE_GRANDMASTER_INFO: u16 = 0x0053;
+    /// IEEE 1722.1-2021 §7.4.77 / §7.4.78; Milan v1.3 §5.4.2.30-31 require
+    /// both on each STREAM_OUTPUT. Values from the on-box AVBConstants.h
+    /// (`AVB17221AEMCommandTypeSet/GetMaxTransitTime`).
+    pub const SET_MAX_TRANSIT_TIME: u16 = 0x004C;
+    pub const GET_MAX_TRANSIT_TIME: u16 = 0x004D;
 }
 
 /// AEM descriptor types (IEEE 1722.1-2021 §7.2, Table 7.1).

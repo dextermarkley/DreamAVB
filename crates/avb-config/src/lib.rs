@@ -400,6 +400,86 @@ pub fn remember_own_entity(id: u64) -> io::Result<Vec<u64>> {
     Ok(list)
 }
 
+/// Largest presentation time offset SET_MAX_TRANSIT_TIME accepts, ns
+/// (Milan v1.3 §5.4.2.30).
+pub const MAX_TRANSIT_TIME_MAX_NS: u64 = 0x7FFF_FFFF;
+
+/// `~/Library/Application Support/DreamAVB/max_transit.txt`: presentation
+/// time offsets a controller set with SET_MAX_TRANSIT_TIME. Milan v1.3
+/// §5.3.7.6 requires them saved in non-volatile memory and restored after a
+/// power cycle. Keyed by entity id (one per NIC) and STREAM_OUTPUT index.
+pub fn max_transit_path() -> Option<PathBuf> {
+    config_path().map(|p| p.with_file_name("max_transit.txt"))
+}
+
+/// Parse the file body: `0x<entity> <output index> <ns>` per line. Lines that
+/// do not parse, or carry a value above [`MAX_TRANSIT_TIME_MAX_NS`], are
+/// skipped; a later line for the same key wins. Pure.
+pub fn parse_max_transit(text: &str) -> std::collections::BTreeMap<(u64, u16), u64> {
+    let mut m = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(e), Some(i), Some(ns), None) = (it.next(), it.next(), it.next(), it.next())
+        else {
+            continue;
+        };
+        let e = e
+            .strip_prefix("0x")
+            .or_else(|| e.strip_prefix("0X"))
+            .unwrap_or(e);
+        if let (Ok(e), Ok(i), Ok(ns)) = (
+            u64::from_str_radix(e, 16),
+            i.parse::<u16>(),
+            ns.parse::<u64>(),
+        ) {
+            if ns <= MAX_TRANSIT_TIME_MAX_NS {
+                m.insert((e, i), ns);
+            }
+        }
+    }
+    m
+}
+
+/// The saved offsets for `entity`, by STREAM_OUTPUT index (empty when none).
+pub fn max_transit_times(entity: u64) -> std::collections::BTreeMap<u16, u64> {
+    max_transit_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| parse_max_transit(&t))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|((e, _), _)| *e == entity)
+        .map(|((_, i), ns)| (i, ns))
+        .collect()
+}
+
+/// Save `ns` as `entity`'s offset for STREAM_OUTPUT `index`, keeping every
+/// other entry. Written to a temp file and renamed, so a crash mid-write
+/// leaves the old file whole.
+pub fn save_max_transit_time(entity: u64, index: u16, ns: u64) -> io::Result<()> {
+    if ns > MAX_TRANSIT_TIME_MAX_NS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max transit time above 0x7FFFFFFF ns",
+        ));
+    }
+    let path = max_transit_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is unset"))?;
+    let mut all = std::fs::read_to_string(&path)
+        .map(|t| parse_max_transit(&t))
+        .unwrap_or_default();
+    all.insert((entity, index), ns);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let body: String = all
+        .iter()
+        .map(|((e, i), ns)| format!("0x{e:016x} {i} {ns}\n"))
+        .collect();
+    let tmp = path.with_extension("txt.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)
+}
+
 /// The config file's path: `~/Library/Application Support/DreamAVB/config.txt`.
 ///
 /// `None` when `HOME` is unset. Both the daemon and the app run as the user —
@@ -665,6 +745,21 @@ mod tests {
             .iter()
             .any(|w| w.contains("unknown auto_select_nic")));
         assert!(warnings.iter().any(|w| w.contains("unknown key")));
+    }
+
+    #[test]
+    fn max_transit_parse_skips_junk_and_out_of_range() {
+        let m = parse_max_transit(
+            "0x38c986fffe467e8b 0 2000000\n\
+             0x38c986fffe467e8b 3 5000000\n\
+             junk\n\
+             0x1 1 2147483648\n\
+             0x1 2 7 extra\n\
+             0x38c986fffe467e8b 0 1000000\n",
+        );
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(&(0x38c9_86ff_fe46_7e8b, 0)), Some(&1_000_000));
+        assert_eq!(m.get(&(0x38c9_86ff_fe46_7e8b, 3)), Some(&5_000_000));
     }
 
     #[test]

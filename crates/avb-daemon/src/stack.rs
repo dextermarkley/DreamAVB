@@ -3681,12 +3681,31 @@ fn talker_loop(
              interval(s) before dropping audio{}",
             presentation_offset_ns / 1_000,
             if presentation_offset_ns > PRESENTATION_FLOOR_NS {
-                " — above the 2 ms Milan maximum; a listener may not buffer that far ahead"
+                " — above the 2 ms Milan default; a listener need only buffer 2.126 ms \
+                 (Milan v1.3 §4.4.2.1)"
             } else {
                 ""
             }
         ),
     );
+    // GET/SET_MAX_TRANSIT_TIME (Milan v1.3 §5.4.2.30-31): the headroom is
+    // every output's default, and a controller's per-output SET, saved to
+    // disk (§5.3.7.6), overrides it. The talker loop stamps each stream with
+    // its own offset; pacing stays on the shared headroom.
+    entity.set_default_max_transit_ns(presentation_offset_ns);
+    let entity_key = u64::from_be_bytes(our_id.0);
+    let saved_transit = avb_config::max_transit_times(entity_key);
+    if !saved_transit.is_empty() {
+        entity.restore_max_transit(&saved_transit);
+        log.log(
+            Level::Info,
+            "aecp",
+            &format!(
+                "restored controller-set presentation time offsets (output index → ns): \
+                 {saved_transit:?}"
+            ),
+        );
+    }
 
     // Without this the loop is an ordinary timeshare thread: measured on this
     // machine it missed ~12 intervals a second (each one a dropped PDU and a
@@ -5170,6 +5189,50 @@ fn talker_loop(
                 let resp = entity.handle_aecp(&cmd, p.hdr.src, ns_since(start));
                 send_aem_response(dext, our_mac, p.hdr.src, &resp);
                 aecp_answered += 1;
+                if cmd.command_type == avb_avdecc::constants::aem_cmd::SET_MAX_TRANSIT_TIME
+                    && resp.status == avb_avdecc::constants::aecp_status::SUCCESS
+                {
+                    if let Some(idx) = resp
+                        .payload
+                        .get(2..4)
+                        .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                        .map(u16::from_be_bytes)
+                    {
+                        let ns = entity.max_transit_ns(idx);
+                        // §5.3.7.6: survives a power cycle.
+                        let saved = avb_config::save_max_transit_time(entity_key, idx, ns);
+                        log.log(
+                            if saved.is_ok() {
+                                Level::Info
+                            } else {
+                                Level::Warn
+                            },
+                            "aecp",
+                            &format!(
+                                "controller 0x{:016x} set output {idx} presentation time offset \
+                                 to {ns} ns{}",
+                                u64::from_be_bytes(cmd.controller_entity_id.0),
+                                match &saved {
+                                    Ok(()) => String::new(),
+                                    Err(e) => format!(" (NOT saved: {e})"),
+                                }
+                            ),
+                        );
+                        for (dst, unsol) in entity.unsolicited_desc(
+                            avb_avdecc::constants::aem_cmd::GET_MAX_TRANSIT_TIME,
+                            avb_avdecc::constants::desc::STREAM_OUTPUT,
+                            idx,
+                        ) {
+                            // The controller that sent the SET already has
+                            // the answer (IEEE 1722.1 §7.5.2).
+                            if unsol.controller_entity_id == cmd.controller_entity_id {
+                                continue;
+                            }
+                            send_aem_response(dext, our_mac, dst, &unsol);
+                            unsol_sent += 1;
+                        }
+                    }
+                }
                 {
                     // Label the command, naming the descriptor type for a
                     // READ_DESCRIPTOR so the tally shows the SHAPE of the
@@ -6870,10 +6933,16 @@ fn talker_loop(
                 }
             }
 
+            // This output's own presentation time offset (SET_MAX_TRANSIT_TIME).
+            let stream_ts = stream_avtp_ts(
+                avtp_ts,
+                presentation_offset_ns,
+                u16::try_from(i).map_or(presentation_offset_ns, |ix| entity.max_transit_ns(ix)),
+            );
             let packed = match out_streams.get_mut(i) {
                 Some(o) => o
                     .talker
-                    .packetize(&stream_scratch, avtp_ts, true, &mut pdu_scratch),
+                    .packetize(&stream_scratch, stream_ts, true, &mut pdu_scratch),
                 None => break,
             };
             match packed {
@@ -7432,6 +7501,17 @@ const MAX_CATCHUP_INTERVALS: u64 = avb_audioring::TALKER_PRESENTATION_OFFSET_NS 
 
 /// [`MAX_CATCHUP_INTERVALS`] for a configured presentation offset: three
 /// quarters of it, so a caught-up PDU keeps a quarter of the headroom.
+/// One output's AVTP timestamp: the shared grid's timestamp `base` (stamped
+/// at `shared_ns` past now) moved to that output's own presentation time
+/// offset `stream_ns`. AVTP timestamps are gPTP ns mod 2^32, so the shift
+/// wraps. Pure.
+fn stream_avtp_ts(base: u32, shared_ns: u64, stream_ns: u64) -> u32 {
+    // Both offsets are at most 0x7FFFFFFF ns, so truncating each to u32 is
+    // exact and the wrapping difference is the signed shift.
+    base.wrapping_add(stream_ns as u32)
+        .wrapping_sub(shared_ns as u32)
+}
+
 fn max_catchup_intervals(presentation_offset_ns: u64) -> u64 {
     (presentation_offset_ns * 3 / 4 / 125_000).max(1)
 }
@@ -9526,6 +9606,26 @@ mod talker_tests {
         assert_eq!(
             pacing_decision(Some(t + MAX_AHEAD_NS + 1), t, i, MAX_CATCHUP_INTERVALS),
             Pace::Reanchor
+        );
+    }
+
+    #[test]
+    fn stream_timestamp_moves_to_the_outputs_own_offset() {
+        // Same offset: unchanged.
+        assert_eq!(stream_avtp_ts(1_000, 2_000_000, 2_000_000), 1_000);
+        // Later and earlier offsets shift by the difference.
+        assert_eq!(stream_avtp_ts(1_000, 2_000_000, 3_000_000), 1_001_000);
+        assert_eq!(stream_avtp_ts(5_000_000, 2_000_000, 0), 3_000_000);
+        // Wraps mod 2^32 both ways.
+        assert_eq!(stream_avtp_ts(u32::MAX, 0, 2), 1);
+        assert_eq!(
+            stream_avtp_ts(1, 2_000_000, 0),
+            1u32.wrapping_sub(2_000_000)
+        );
+        assert_eq!(
+            stream_avtp_ts(0, 0, 0x7FFF_FFFF),
+            0x7FFF_FFFF,
+            "the Milan maximum fits"
         );
     }
 

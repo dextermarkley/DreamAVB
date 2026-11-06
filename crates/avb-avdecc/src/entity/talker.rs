@@ -519,7 +519,15 @@ pub struct TalkerEntity {
     output_dest_macs: Vec<MacAddr>,
     /// Per-STREAM_OUTPUT MSRP state, for GET_STREAM_INFO.
     output_srp: Vec<OutputSrp>,
+    /// Presentation time offset of a STREAM_OUTPUT with no SET_MAX_TRANSIT_TIME
+    /// override, ns (Milan v1.3 §5.3.7.6: 2 ms unless configured).
+    default_transit_ns: u64,
+    /// SET_MAX_TRANSIT_TIME overrides by STREAM_OUTPUT index.
+    transit_ns: std::collections::BTreeMap<u16, u64>,
 }
+
+/// Milan v1.3 §5.3.7.6 default presentation time offset.
+pub const DEFAULT_MAX_TRANSIT_NS: u64 = 2_000_000;
 
 impl TalkerEntity {
     pub fn new(model: TalkerModel) -> Self {
@@ -538,7 +546,83 @@ impl TalkerEntity {
             stream: StreamInfo::default(),
             output_dest_macs: Vec::new(),
             output_srp: Vec::new(),
+            default_transit_ns: DEFAULT_MAX_TRANSIT_NS,
+            transit_ns: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// The offset every STREAM_OUTPUT without an override uses (the daemon's
+    /// configured headroom).
+    pub fn set_default_max_transit_ns(&mut self, ns: u64) {
+        self.default_transit_ns = ns.min(crate::constants::MAX_TRANSIT_TIME_MAX_NS);
+    }
+
+    /// Restore saved SET_MAX_TRANSIT_TIME values (index → ns). Out-of-range
+    /// indices and values are dropped.
+    pub fn restore_max_transit(&mut self, saved: &std::collections::BTreeMap<u16, u64>) {
+        let n = self.model.stream_count();
+        self.transit_ns = saved
+            .iter()
+            .filter(|(&i, &ns)| i < n && ns <= crate::constants::MAX_TRANSIT_TIME_MAX_NS)
+            .map(|(&i, &ns)| (i, ns))
+            .collect();
+    }
+
+    /// STREAM_OUTPUT `index`'s presentation time offset, ns.
+    pub fn max_transit_ns(&self, index: u16) -> u64 {
+        self.transit_ns
+            .get(&index)
+            .copied()
+            .unwrap_or(self.default_transit_ns)
+    }
+
+    /// GET_MAX_TRANSIT_TIME / SET_MAX_TRANSIT_TIME (IEEE 1722.1-2021
+    /// §7.4.77-78, Milan v1.3 §5.4.2.30-31). Payload: descriptor_type,
+    /// descriptor_index, max_transit_time (u64 ns). Only STREAM_OUTPUTs have
+    /// one. A SET is refused while that output streams (STREAM_IS_RUNNING),
+    /// above 0x7FFFFFFF ns (BAD_ARGUMENTS) and from a controller other than
+    /// the lock holder (ENTITY_LOCKED; checked by the caller).
+    fn max_transit_cmd(&mut self, cmd: &AemPdu, set: bool) -> (u8, Vec<u8>) {
+        let echo = || cmd.payload.clone();
+        let (Some(ty), Some(index)) = (be_u16(&cmd.payload, 0), be_u16(&cmd.payload, 2)) else {
+            return (aecp_status::BAD_ARGUMENTS, echo());
+        };
+        if ty != dt::STREAM_OUTPUT {
+            return (aecp_status::NOT_SUPPORTED, echo());
+        }
+        if index >= self.model.stream_count() {
+            return (aecp_status::NO_SUCH_DESCRIPTOR, echo());
+        }
+        if set {
+            let Some(ns) = cmd
+                .payload
+                .get(4..12)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_be_bytes)
+            else {
+                return (aecp_status::BAD_ARGUMENTS, echo());
+            };
+            if ns > crate::constants::MAX_TRANSIT_TIME_MAX_NS {
+                return (aecp_status::BAD_ARGUMENTS, echo());
+            }
+            if self
+                .output_srp
+                .get(usize::from(index))
+                .is_some_and(|s| s.listener_ready)
+            {
+                return (aecp_status::STREAM_IS_RUNNING, self.transit_payload(index));
+            }
+            self.transit_ns.insert(index, ns);
+        }
+        (aecp_status::SUCCESS, self.transit_payload(index))
+    }
+
+    fn transit_payload(&self, index: u16) -> Vec<u8> {
+        let mut p = Vec::with_capacity(12);
+        p.extend_from_slice(&dt::STREAM_OUTPUT.to_be_bytes());
+        p.extend_from_slice(&index.to_be_bytes());
+        p.extend_from_slice(&self.max_transit_ns(index).to_be_bytes());
+        p
     }
 
     pub fn model(&self) -> &TalkerModel {
@@ -892,6 +976,14 @@ impl TalkerEntity {
                 self.get_ptp_instance_grandmaster_info(cmd)
             }
             aem_cmd::GET_AUDIO_MAP => self.get_audio_map(cmd),
+            aem_cmd::GET_MAX_TRANSIT_TIME => self.max_transit_cmd(cmd, false),
+            aem_cmd::SET_MAX_TRANSIT_TIME => {
+                if self.control.locked_by_other(ctrl) {
+                    (aecp_status::ENTITY_LOCKED, echo())
+                } else {
+                    self.max_transit_cmd(cmd, true)
+                }
+            }
             // A format or rate change while we are sourcing the stream is
             // refused, matching the listener's ADC-12 rule. Unlike the
             // listener we have exactly one format, so there is nothing to
@@ -1996,6 +2088,11 @@ impl TalkerEntity {
         match command_type {
             aem_cmd::GET_STREAM_INFO => Some(self.get_stream_info(&probe)),
             aem_cmd::GET_STREAM_FORMAT => Some(self.get_stream_format(&probe)),
+            aem_cmd::GET_MAX_TRANSIT_TIME if descriptor_type == dt::STREAM_OUTPUT => {
+                // GET never mutates; `max_transit_cmd` needs &mut only for SET.
+                (descriptor_index < self.model.stream_count())
+                    .then(|| (aecp_status::SUCCESS, self.transit_payload(descriptor_index)))
+            }
             aem_cmd::GET_PTP_INSTANCE_GRANDMASTER_INFO => {
                 Some(self.get_ptp_instance_grandmaster_info(&probe))
             }
@@ -2875,6 +2972,107 @@ mod tests {
         assert_eq!(
             e.handle_aecp(&ctl_cmd(holder, 0xFF), OUR_MAC, 0).status,
             aecp_status::SUCCESS
+        );
+    }
+
+    #[test]
+    fn max_transit_time_get_set_per_milan_5_4_2_30() {
+        let mut e = duplex_entity();
+        let id = e.entity_id();
+        let p = |ty: u16, ix: u16, ns: Option<u64>| {
+            let mut v = ty.to_be_bytes().to_vec();
+            v.extend_from_slice(&ix.to_be_bytes());
+            if let Some(ns) = ns {
+                v.extend_from_slice(&ns.to_be_bytes());
+            }
+            v
+        };
+        let get = |e: &mut TalkerEntity, ix: u16| {
+            e.handle_aecp(
+                &cmd(
+                    aem_cmd::GET_MAX_TRANSIT_TIME,
+                    p(dt::STREAM_OUTPUT, ix, None),
+                    id,
+                ),
+                OUR_MAC,
+                0,
+            )
+        };
+        // Default 2 ms (§5.3.7.6), reported as descriptor + u64 ns.
+        let r = get(&mut e, 0);
+        assert_eq!(r.status, aecp_status::SUCCESS);
+        assert_eq!(r.payload, p(dt::STREAM_OUTPUT, 0, Some(2_000_000)));
+        e.set_default_max_transit_ns(3_000_000);
+        assert_eq!(
+            get(&mut e, 0).payload,
+            p(dt::STREAM_OUTPUT, 0, Some(3_000_000))
+        );
+
+        let set = |e: &mut TalkerEntity, ty: u16, ix: u16, ns: u64| {
+            e.handle_aecp(
+                &cmd(aem_cmd::SET_MAX_TRANSIT_TIME, p(ty, ix, Some(ns)), id),
+                OUR_MAC,
+                0,
+            )
+        };
+        // Any value 0..=0x7FFFFFFF, echoed and then reported.
+        let r = set(&mut e, dt::STREAM_OUTPUT, 1, 0);
+        assert_eq!(r.status, aecp_status::SUCCESS);
+        assert_eq!(r.payload, p(dt::STREAM_OUTPUT, 1, Some(0)));
+        assert_eq!(e.max_transit_ns(1), 0);
+        assert_eq!(e.max_transit_ns(0), 3_000_000);
+        assert_eq!(
+            set(&mut e, dt::STREAM_OUTPUT, 1, 0x7FFF_FFFF).status,
+            aecp_status::SUCCESS
+        );
+        assert_eq!(
+            set(&mut e, dt::STREAM_OUTPUT, 1, 0x8000_0000).status,
+            aecp_status::BAD_ARGUMENTS
+        );
+        assert_eq!(e.max_transit_ns(1), 0x7FFF_FFFF);
+        // Only STREAM_OUTPUTs, and only ones that exist.
+        assert_eq!(
+            set(&mut e, dt::STREAM_INPUT, 0, 1).status,
+            aecp_status::NOT_SUPPORTED
+        );
+        let n = e.model().stream_count();
+        assert_eq!(get(&mut e, n).status, aecp_status::NO_SUCH_DESCRIPTOR);
+        // Refused while the output streams.
+        e.set_output_srp(
+            0,
+            OutputSrp {
+                declared: true,
+                listener_ready: true,
+                asking_failed: false,
+            },
+        );
+        let r = set(&mut e, dt::STREAM_OUTPUT, 0, 5);
+        assert_eq!(r.status, aecp_status::STREAM_IS_RUNNING);
+        assert_eq!(e.max_transit_ns(0), 3_000_000);
+        // Refused from a controller other than the lock holder.
+        let mut lk = cmd(aem_cmd::LOCK_ENTITY, vec![0; 16], id);
+        lk.controller_entity_id = Eui64([1; 8]);
+        assert_eq!(e.handle_aecp(&lk, OUR_MAC, 0).status, aecp_status::SUCCESS);
+        assert_eq!(
+            set(&mut e, dt::STREAM_OUTPUT, 1, 5).status,
+            aecp_status::ENTITY_LOCKED
+        );
+        // Restored values replace the overrides; bad entries are dropped.
+        let saved: std::collections::BTreeMap<u16, u64> =
+            [(0, 1_500_000), (n, 7), (3, 0x8000_0000)]
+                .into_iter()
+                .collect();
+        e.restore_max_transit(&saved);
+        assert_eq!(e.max_transit_ns(0), 1_500_000);
+        assert_eq!(e.max_transit_ns(1), 3_000_000);
+        assert_eq!(e.max_transit_ns(3), 3_000_000);
+        // The unsolicited path builds the same GET payload.
+        assert_eq!(
+            e.aem_payload_for(aem_cmd::GET_MAX_TRANSIT_TIME, dt::STREAM_OUTPUT, 0),
+            Some((
+                aecp_status::SUCCESS,
+                p(dt::STREAM_OUTPUT, 0, Some(1_500_000))
+            ))
         );
     }
 
