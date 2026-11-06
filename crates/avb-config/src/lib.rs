@@ -337,6 +337,69 @@ pub fn auto_select_nic(supported: &[String]) -> AutoSelectOutcome {
     }
 }
 
+/// How many of this Mac's entity ids are remembered (one per NIC used).
+pub const OWN_ENTITIES_MAX: usize = 8;
+
+/// `~/Library/Application Support/DreamAVB/own_entities.txt`: every AVDECC
+/// entity id this Mac has run as, one per NIC (the id derives from the NIC's
+/// MAC). The daemon uses it to recognise a device sink still bound to this
+/// Mac's OTHER NIC after a switch; a binding to any other talker is never
+/// ours to touch.
+pub fn own_entities_path() -> Option<PathBuf> {
+    config_path().map(|p| p.with_file_name("own_entities.txt"))
+}
+
+/// Parse the file body: one `0x`-prefixed hex id per line; junk is skipped.
+pub fn parse_own_entities(text: &str) -> Vec<u64> {
+    let mut v: Vec<u64> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        let t = t
+            .strip_prefix("0x")
+            .or_else(|| t.strip_prefix("0X"))
+            .unwrap_or(t);
+        if let Ok(id) = u64::from_str_radix(t, 16) {
+            if id != 0 && !v.contains(&id) {
+                v.push(id);
+            }
+        }
+    }
+    v
+}
+
+/// The remembered ids, newest last (empty when the file is absent).
+pub fn own_entities() -> Vec<u64> {
+    own_entities_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| parse_own_entities(&t))
+        .unwrap_or_default()
+}
+
+/// `known` with `id` appended (moved to the end if present), keeping the
+/// newest [`OWN_ENTITIES_MAX`]. Pure.
+pub fn with_own_entity(mut known: Vec<u64>, id: u64) -> Vec<u64> {
+    known.retain(|&k| k != id);
+    known.push(id);
+    let excess = known.len().saturating_sub(OWN_ENTITIES_MAX);
+    known.drain(..excess);
+    known
+}
+
+/// Record `id` as one of this Mac's entities. Returns the full list.
+pub fn remember_own_entity(id: u64) -> io::Result<Vec<u64>> {
+    let path = own_entities_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is unset"))?;
+    let list = with_own_entity(own_entities(), id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let body: String = list.iter().map(|id| format!("0x{id:016x}\n")).collect();
+    let tmp = path.with_extension("txt.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(list)
+}
+
 /// The config file's path: `~/Library/Application Support/DreamAVB/config.txt`.
 ///
 /// `None` when `HOME` is unset. Both the daemon and the app run as the user —
@@ -602,6 +665,23 @@ mod tests {
             .iter()
             .any(|w| w.contains("unknown auto_select_nic")));
         assert!(warnings.iter().any(|w| w.contains("unknown key")));
+    }
+
+    #[test]
+    fn own_entities_parse_dedupe_and_cap() {
+        let v = parse_own_entities(
+            "0x38c986fffe467e8b\njunk\n644bf0fffe1273b8\n0x38c986fffe467e8b\n0\n",
+        );
+        assert_eq!(v, vec![0x38c9_86ff_fe46_7e8b, 0x644b_f0ff_fe12_73b8]);
+        let v = with_own_entity(v, 0x38c9_86ff_fe46_7e8b);
+        assert_eq!(
+            v,
+            vec![0x644b_f0ff_fe12_73b8, 0x38c9_86ff_fe46_7e8b],
+            "moved to newest"
+        );
+        let many = (1..=20u64).fold(Vec::new(), with_own_entity);
+        assert_eq!(many.len(), OWN_ENTITIES_MAX);
+        assert_eq!(many.last(), Some(&20));
     }
 
     /// The chosen NIC survives the file, an empty value means none, and an

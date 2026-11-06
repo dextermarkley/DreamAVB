@@ -3981,6 +3981,28 @@ fn talker_loop(
     // until the device says it is connected, then stop asking and watch.
     let mut sink_connected: std::collections::BTreeMap<(u64, u16), bool> =
         std::collections::BTreeMap::new();
+    // Per bound audio sink: the talker its GET_RX_STATE says it is bound to,
+    // and whether we have asked. See `sinkpolicy`.
+    let mut sink_rx_state: std::collections::BTreeMap<(u64, u16), crate::sinkpolicy::RxState> =
+        std::collections::BTreeMap::new();
+    let mut rx_state_asked: std::collections::BTreeSet<(u64, u16)> =
+        std::collections::BTreeSet::new();
+    // Audio sinks this run bound itself. Only these may get the
+    // stuck-reservation rebind: any other binding is the device's routing.
+    let mut we_bound: std::collections::BTreeSet<(u64, u16)> = std::collections::BTreeSet::new();
+    // Every entity id this Mac has run as (one per NIC), including this one.
+    let own_entities: Vec<u64> = match avb_config::remember_own_entity(u64::from_be_bytes(our_id.0))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            log.log(
+                Level::Warn,
+                "acmp",
+                &format!("could not record our entity id in own_entities.txt: {e}"),
+            );
+            vec![u64::from_be_bytes(our_id.0)]
+        }
+    };
     // How many reconnects the watch triggered after an established binding
     // dropped. Nonzero means something really is unbinding us, which is worth
     // knowing separately from the initial connect.
@@ -4113,6 +4135,12 @@ fn talker_loop(
     // Inbound peak |sample| per (stream_id, channel), sampled every 8th PDU,
     // so the run summary can say which 16R channels actually carried signal.
     let mut in_peak: std::collections::BTreeMap<(u64, u16), i64> = Default::default();
+    let mut tu_state = TuState::default();
+    // Start uncertain: the first interval sets it from the real clock state.
+    let mut tu_applied = true;
+    for o in &mut out_streams {
+        o.talker.set_tu(true);
+    }
     let no_audio_tx = std::env::var_os("AVB_DEBUG_NO_AUDIO_TX").is_some();
     if no_audio_tx {
         log.log(
@@ -4415,6 +4443,50 @@ fn talker_loop(
                             acmp.talker_unique_id,
                             acmp.stream_id.0,
                             acmp.connection_count,
+                        ),
+                    );
+                    continue;
+                }
+                // A device's answer to our GET_RX_STATE on one of its AUDIO
+                // sinks: remember which talker it is bound to, for
+                // `sinkpolicy::decide`. Read-only here.
+                if acmp.controller_entity_id == our_id
+                    && acmp.message_type == avb_avdecc::constants::acmp_msg::GET_RX_STATE_RESPONSE
+                    && plans.iter().any(|p| {
+                        p.listener == acmp.listener_entity_id
+                            && p.sink_uid == acmp.listener_unique_id
+                    })
+                {
+                    let key = (
+                        u64::from_be_bytes(acmp.listener_entity_id.0),
+                        acmp.listener_unique_id,
+                    );
+                    if acmp.status == avb_avdecc::constants::acmp_status::SUCCESS {
+                        sink_rx_state.insert(
+                            key,
+                            crate::sinkpolicy::RxState {
+                                talker_entity: u64::from_be_bytes(acmp.talker_entity_id.0),
+                                talker_uid: acmp.talker_unique_id,
+                            },
+                        );
+                    }
+                    log.log_rate_limited(
+                        Level::Info,
+                        "acmp",
+                        &format!(
+                            "rx-state-audio-{:016x}-{}-{:016x}-{}",
+                            key.0,
+                            key.1,
+                            u64::from_be_bytes(acmp.talker_entity_id.0),
+                            acmp.talker_unique_id
+                        ),
+                        &format!(
+                            "device 0x{:016x} sink {}: bound to talker 0x{:016x}/uid {} (status {})",
+                            key.0,
+                            key.1,
+                            u64::from_be_bytes(acmp.talker_entity_id.0),
+                            acmp.talker_unique_id,
+                            acmp.status
                         ),
                     );
                     continue;
@@ -4880,34 +4952,42 @@ fn talker_loop(
                         let mut changed = false;
                         if let Some(sink) = didx {
                             let ix = (resp_ent, sink);
-                            // A binding counts only when the device reports
-                            // OUR stream id on that sink. The CONNECTED flag
-                            // alone is not evidence: sink 0 sets it while
-                            // reporting stream_id 0, so believing the flag
-                            // makes an empty sink look bound and stops the
-                            // retry that would have bound it.
                             let reported_sid = u64at(16).unwrap_or(0);
                             let audio_sink = plans.iter().any(|p| {
                                 u64::from_be_bytes(p.listener.0) == resp_ent && p.sink_uid == sink
                             });
-                            let sid_ok = if audio_sink {
-                                // An audio sink is bound when it carries ANY
-                                // stream: ours (whichever the device picked)
-                                // or another talker's. Only an empty one
-                                // (stream id 0) is ours to fill.
-                                reported_sid != 0
-                            } else {
-                                match expected_stream.get(&ix) {
-                                    Some(&want) => reported_sid == want,
-                                    // A sink we never bound: nothing to
-                                    // compare against, so the flag is all we
-                                    // have.
-                                    None => true,
-                                }
-                            };
                             let flag_conn = fl & sif::CONNECTED != 0;
+                            // AUDIO sink: bound exactly when CONNECTED is set
+                            // (Milan v1.3 Table 5.8). Never from stream_id:
+                            // that is non-zero only once the sink is settled,
+                            // so a sink bound to an offline talker reads
+                            // CONNECTED with stream_id 0, and treating that
+                            // as empty overwrote the device's own routing.
+                            // See `sinkpolicy`.
+                            //
+                            // MEDIA-CLOCK sink: the 16R's CRF sink sets
+                            // CONNECTED with stream_id 0 while bound to
+                            // nothing usable, so there a binding counts only
+                            // when it carries the stream we bound.
+                            let sid_ok = audio_sink
+                                || match expected_stream.get(&ix) {
+                                    Some(&want) => reported_sid == want,
+                                    None => true,
+                                };
                             let now_conn = flag_conn && sid_ok;
-                            if flag_conn && !sid_ok {
+                            // A bound audio sink: learn WHICH talker once, so a
+                            // binding to this Mac's other NIC can be moved.
+                            if audio_sink && flag_conn && rx_state_asked.insert(ix) {
+                                ctl_tx_queue.extend(get_rx_state_frame(
+                                    our_mac,
+                                    our_id,
+                                    avb_core::Eui64(resp_ent.to_be_bytes()),
+                                    sink,
+                                    connect_seq,
+                                ));
+                                connect_seq = connect_seq.wrapping_add(1);
+                            }
+                            if !audio_sink && flag_conn && !sid_ok {
                                 log.log(
                                     Level::Warn,
                                     "aem",
@@ -4930,11 +5010,7 @@ fn talker_loop(
                                 // retry below rebind the sink. Only our own
                                 // stream is ever released: a binding to any
                                 // other talker is someone else's routing.
-                                // Never on an audio sink: which of our
-                                // streams it carries is the device's choice.
-                                if let Some(&want) =
-                                    expected_stream.get(&ix).filter(|_| !audio_sink)
-                                {
+                                if let Some(&want) = expected_stream.get(&ix) {
                                     if stale_own_binding(reported_sid, want, our_stream_id.0)
                                         && stale_released.insert((ix, reported_sid))
                                     {
@@ -4971,7 +5047,9 @@ fn talker_loop(
                             // binding (seen on the 16R after a run that bound
                             // its sinks to other streams of ours). Redo the
                             // bind once: unbind, and the retry below rebinds.
-                            if now_conn && !rebound_once.contains(&ix) {
+                            // Only for a sink WE bound this run: a binding the
+                            // device or another controller made is theirs.
+                            if now_conn && we_bound.contains(&ix) && !rebound_once.contains(&ix) {
                                 // The stream the sink actually carries, so
                                 // the rebind restores the device's choice.
                                 let stuck = out_streams.iter().any(|o| {
@@ -5493,8 +5571,9 @@ fn talker_loop(
         // Our ACMP CONNECT_RX_COMMAND *is* the Milan bind: §5.5.2.2 renames
         // CONNECT_RX_COMMAND/RESPONSE to BIND_RX_COMMAND/RESPONSE, same PDU.
         //
-        // Gated on `--bind-sinks`, OFF by default, because a Milan Talker is
-        // not supposed to do this at all. §5.5.2.7: "Talkers rely only on SRP
+        // ON by default (`--no-bind-sinks` turns it off), and only for sinks
+        // the device reports UNBOUND (see `sinkpolicy`), because a Milan
+        // Talker is not supposed to do this at all. §5.5.2.7: "Talkers rely only on SRP
         // (not ACMP) to determine whether any Listeners are interested in
         // their Stream Outputs". §5.5.1.2: "This specification does not define
         // the concept of a binding from the perspective of a talker" -- it
@@ -5516,10 +5595,55 @@ fn talker_loop(
                 if sink_bind_done.contains(&key) {
                     continue;
                 }
-                // Skip only on positive evidence. An unasked sink (absent) and
-                // one reported unbound both still need binding, so a probe
-                // that never answers cannot leave a sink unbound forever.
-                if sink_connected.get(&key) == Some(&true) {
+                let audio_sink = plans.iter().any(|p| {
+                    u64::from_be_bytes(p.listener.0) == dev_entity && p.sink_uid == sink_uid
+                });
+                if audio_sink {
+                    // The device's routing decides; we only fill an UNBOUND
+                    // sink, and move one still bound to this Mac's other NIC.
+                    match crate::sinkpolicy::decide(
+                        sink_connected.get(&key).copied(),
+                        sink_rx_state.get(&key).copied(),
+                        u64::from_be_bytes(our_id.0),
+                        &own_entities,
+                    ) {
+                        crate::sinkpolicy::SinkAction::Wait
+                        | crate::sinkpolicy::SinkAction::AskRxState => continue,
+                        crate::sinkpolicy::SinkAction::Leave => {
+                            sink_bind_done.insert(key);
+                            continue;
+                        }
+                        crate::sinkpolicy::SinkAction::ReleaseThenBind(r) => {
+                            if stale_released.insert((key, r.talker_entity)) {
+                                log.log(
+                                    Level::Info,
+                                    "acmp",
+                                    &format!(
+                                        "device 0x{dev_entity:016x} sink {sink_uid} is bound to \
+                                         this Mac's other NIC (0x{:016x}/uid {}); releasing it \
+                                         so it can take our stream 0x{sid:016x}",
+                                        r.talker_entity, r.talker_uid
+                                    ),
+                                );
+                                send_unbind_foreign(
+                                    dext,
+                                    our_mac,
+                                    our_id,
+                                    avb_core::Eui64(r.talker_entity.to_be_bytes()),
+                                    r.talker_uid,
+                                    avb_core::Eui64(dev_entity.to_be_bytes()),
+                                    sink_uid,
+                                    connect_seq,
+                                );
+                                connect_seq = connect_seq.wrapping_add(1);
+                            }
+                            // Then bind below; after that it reads ours.
+                            sink_rx_state.remove(&key);
+                        }
+                        crate::sinkpolicy::SinkAction::Bind => {}
+                    }
+                    we_bound.insert(key);
+                } else if sink_connected.get(&key) == Some(&true) {
                     // Bound -- by us or by the device's own saved state. Done
                     // with it, permanently.
                     sink_bind_done.insert(key);
@@ -6384,8 +6508,9 @@ fn talker_loop(
                         // condition: without a completed Pdelay exchange the
                         // peer has no link delay for us, so it cannot correct
                         // what we send.
-                        let st = gptp.status();
-                        t.set_tu(!(st.as_capable && st.servo_state.is_usable_clock()));
+                        // Same rule as the audio streams (`TuState`),
+                        // including the 0.25 s hold after a GM change.
+                        t.set_tu(tu_applied);
                         match t.packetize(&[ts], &mut crf_scratch) {
                             Ok(n) => {
                                 let hdr = EthHeader {
@@ -6412,8 +6537,7 @@ fn talker_loop(
                                         &format!(
                                             "TX CRF  {hex} | stream 0x{:016x} ts {ts} \
                                              (gptp_now {gptp_now}, ts_index {crf_ts_index}) tu={}",
-                                            crf_stream_id.0,
-                                            !(st.as_capable && st.servo_state.is_usable_clock()),
+                                            crf_stream_id.0, tu_applied,
                                         ),
                                     );
                                 }
@@ -6494,6 +6618,21 @@ fn talker_loop(
         // now + 2 ms it was re-anchored, which moves the timestamp grid by a
         // fraction of an interval. Measured: 1 700-2 500 re-anchors a second,
         // and the 16R never raised MEDIA_LOCKED on any sink.
+        // AVTP `tu` for this interval, same rule as the CRF stream.
+        let tu_now = {
+            let st = gptp.status();
+            tu_state.update(
+                elapsed,
+                st.gm_identity.0,
+                st.as_capable && st.servo_state.is_usable_clock(),
+            )
+        };
+        if tu_now != tu_applied {
+            for o in &mut out_streams {
+                o.talker.set_tu(tu_now);
+            }
+            tu_applied = tu_now;
+        }
         let pace_target = gptp_now.wrapping_add(presentation_offset_ns);
         match pacing_decision(
             presentation_timeline.peek_next(pdu_interval_ns),
@@ -9033,6 +9172,32 @@ fn get_rx_state_frame(
 /// release: a nonzero stream id carrying our MAC in its top 48 bits
 /// (1722-2016 §4.4.4.30), and not the stream we want on that sink. A binding
 /// to any other talker is never ours to undo.
+/// How long `tu` stays set after a grandmaster change or after the clock
+/// becomes good again (Milan v1.3 Annex B.1.1).
+const TU_HOLD_NS: u64 = 250_000_000;
+
+/// The AVTP `tu` decision for every stream we transmit (AAF and CRF alike):
+/// set while the clock is not usable (holdover, acquiring, no asCapable) and
+/// for [`TU_HOLD_NS`] after the GM changes or the clock returns. Pure.
+#[derive(Clone, Copy, Debug, Default)]
+struct TuState {
+    last_gm: Option<[u8; 8]>,
+    was_good: bool,
+    hold_until_ns: u64,
+}
+
+impl TuState {
+    fn update(&mut self, now_ns: u64, gm: [u8; 8], clock_good: bool) -> bool {
+        let gm_changed = self.last_gm.is_some_and(|g| g != gm);
+        if gm_changed || (clock_good && !self.was_good) {
+            self.hold_until_ns = now_ns.saturating_add(TU_HOLD_NS);
+        }
+        self.last_gm = Some(gm);
+        self.was_good = clock_good;
+        !clock_good || now_ns < self.hold_until_ns
+    }
+}
+
 /// Which of our `n_streams` output streams an EMPTY sink is offered by
 /// default: sink `k` of a device whose sinks start at plan index `base`.
 /// Wraps rather than running off the end, so a device beyond the offered
@@ -9043,6 +9208,63 @@ fn default_output_stream(base: usize, k: usize, n_streams: usize) -> usize {
 
 fn stale_own_binding(reported_sid: u64, wanted_sid: u64, any_own_sid: u64) -> bool {
     reported_sid != 0 && reported_sid != wanted_sid && reported_sid >> 16 == any_own_sid >> 16
+}
+
+/// UNBIND_RX (DISCONNECT_RX_COMMAND) for a binding to ANOTHER talker entity:
+/// ACMP matches the binding by talker entity + unique id, so naming our own
+/// entity (as [`disconnect_rx_pdu`] does) would not release a binding to this
+/// Mac's other NIC. Pure; unit-tested.
+fn unbind_foreign_pdu(
+    our_id: avb_core::Eui64,
+    talker_id: avb_core::Eui64,
+    talker_uid: u16,
+    listener_id: avb_core::Eui64,
+    listener_uid: u16,
+    sequence_id: u16,
+) -> avb_avdecc::acmp::Acmpdu {
+    avb_avdecc::acmp::Acmpdu {
+        message_type: avb_avdecc::constants::acmp_msg::DISCONNECT_RX_COMMAND,
+        status: avb_avdecc::constants::acmp_status::SUCCESS,
+        stream_id: avb_core::StreamId(0),
+        controller_entity_id: our_id,
+        talker_entity_id: talker_id,
+        listener_entity_id: listener_id,
+        talker_unique_id: talker_uid,
+        listener_unique_id: listener_uid,
+        sequence_id,
+        ..Default::default()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_unbind_foreign(
+    dext: &mut RealDext,
+    our_mac: avb_core::MacAddr,
+    our_id: avb_core::Eui64,
+    talker_id: avb_core::Eui64,
+    talker_uid: u16,
+    listener_id: avb_core::Eui64,
+    listener_uid: u16,
+    sequence_id: u16,
+) {
+    use crate::dextio::DextPort;
+    let pdu = unbind_foreign_pdu(
+        our_id,
+        talker_id,
+        talker_uid,
+        listener_id,
+        listener_uid,
+        sequence_id,
+    );
+    let hdr = avb_core::eth::EthHeader {
+        dst: avb_core::AVDECC_MULTICAST,
+        src: our_mac,
+        vlan: None,
+        ethertype: avb_avtp::common::ETHERTYPE_AVTP,
+    };
+    if let Ok(f) = avb_core::TxFrame::build(&hdr, &pdu.encode(), false, 0) {
+        let _ = dext.send(f.bytes(), false, 0);
+    }
 }
 
 /// Build the DISCONNECT_RX_COMMAND PDU (pure; unit-tested).
@@ -9498,12 +9720,54 @@ mod talker_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_output_stream, peak_sample_due, tx_probe_frame};
+    use super::{default_output_stream, peak_sample_due, tx_probe_frame, unbind_foreign_pdu};
+
+    /// The release of a binding to this Mac's other NIC must name THAT
+    /// talker, or the listener does not match the binding and keeps it.
+    #[test]
+    fn unbind_foreign_names_the_bound_talker_not_us() {
+        let us = avb_core::Eui64([0x38, 0xc9, 0x86, 0xff, 0xfe, 0x46, 0x7e, 0x8b]);
+        let old = avb_core::Eui64([0x64, 0x4b, 0xf0, 0xff, 0xfe, 0x12, 0x73, 0xb8]);
+        let r16 = avb_core::Eui64([0x00, 0x0a, 0x92, 0xff, 0xfe, 0x03, 0x3b, 0xa9]);
+        let p = unbind_foreign_pdu(us, old, 3, r16, 4, 9);
+        assert_eq!(
+            p.message_type,
+            avb_avdecc::constants::acmp_msg::DISCONNECT_RX_COMMAND
+        );
+        assert_eq!(p.controller_entity_id, us);
+        assert_eq!(p.talker_entity_id, old);
+        assert_eq!((p.talker_unique_id, p.listener_unique_id), (3, 4));
+        assert_eq!(p.listener_entity_id, r16);
+    }
 
     /// A lone mixer's empty sinks default to our first streams (outputs
     /// 1-64), whatever the INPUT channel map says; a second mixer in the same
     /// session starts after the first's sinks; and the offer wraps rather than
     /// naming a stream we do not have.
+    /// Milan v1.3 §4.3.5.2 / Annex B.1.1: tu while the clock is unusable,
+    /// and for 0.25 s after a GM change or after the clock returns.
+    #[test]
+    fn tu_is_set_in_holdover_and_held_after_gm_change() {
+        use super::{TuState, TU_HOLD_NS};
+        let gm_a = [1u8; 8];
+        let gm_b = [2u8; 8];
+        let mut s = TuState::default();
+        assert!(s.update(0, gm_a, false), "not locked yet");
+        assert!(s.update(1_000, gm_a, true), "just locked: held");
+        assert!(
+            !s.update(TU_HOLD_NS + 1_000, gm_a, true),
+            "steady lock clears tu"
+        );
+        assert!(s.update(2 * TU_HOLD_NS, gm_a, false), "holdover sets tu");
+        let t = 3 * TU_HOLD_NS;
+        assert!(s.update(t, gm_a, true), "returning lock holds tu");
+        assert!(!s.update(t + TU_HOLD_NS + 1, gm_a, true));
+        let t = 10 * TU_HOLD_NS;
+        assert!(s.update(t, gm_b, true), "GM change holds tu while locked");
+        assert!(s.update(t + TU_HOLD_NS - 1, gm_b, true));
+        assert!(!s.update(t + TU_HOLD_NS, gm_b, true));
+    }
+
     #[test]
     fn empty_sinks_default_to_the_first_free_outputs() {
         let lone: Vec<usize> = (0..8).map(|k| default_output_stream(0, k, 16)).collect();

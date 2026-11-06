@@ -29,6 +29,7 @@ mod pcap;
 mod pipeline_tests;
 mod realdext;
 mod report;
+mod sinkpolicy;
 mod stack;
 mod txsched;
 mod validate;
