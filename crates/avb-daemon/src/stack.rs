@@ -4108,6 +4108,10 @@ fn talker_loop(
     /// How often the clock-role line is logged.
     const ROLE_LOG_PERIOD_NS: u64 = 10_000_000_000;
     let mut last_role_log_ns: u64 = 0;
+    // Frames from devices since the last role log: whether a peer's AVDECC
+    // is still alive when its gPTP or streams fail.
+    let mut peer_adp_rx: u64 = 0;
+    let mut peer_aem_resp_rx: u64 = 0;
     // CLOCK_DOMAIN LOCKED/UNLOCKED are EVENT counts, not a state: they count
     // transitions of the media clock acquiring and losing a disciplined
     // basis. `Decision.basis` is Some exactly when the sample clock is
@@ -4310,6 +4314,7 @@ fn talker_loop(
                 && p.hdr.src != our_mac
             {
                 if let Some(adp_in) = avb_avdecc::adp::Adpdu::decode(p.payload) {
+                    peer_adp_rx = peer_adp_rx.saturating_add(1);
                     let for_us = adp_in.entity_id == avb_core::Eui64::from_u64(0)
                         || adp_in.entity_id == our_id;
                     if adp_in.is_discover() && for_us {
@@ -4803,7 +4808,13 @@ fn talker_loop(
                         continue;
                     }
                 }
-                let Some(cmd) = avb_avdecc::aecp::AemPdu::decode(p.payload) else {
+                let Some(cmd) = avb_avdecc::aecp::AemPdu::decode(p.payload).inspect(|c| {
+                    if c.message_type == avb_avdecc::constants::aecp_msg::AEM_RESPONSE
+                        && c.target_entity_id != our_id
+                    {
+                        peer_aem_resp_rx = peer_aem_resp_rx.saturating_add(1);
+                    }
+                }) else {
                     continue;
                 };
                 // The 16R's answer to our GET_COUNTERS. Dump the raw
@@ -6345,6 +6356,22 @@ fn talker_loop(
         // the clock from the device we stream to.
         if ns_since(start).saturating_sub(last_role_log_ns) >= ROLE_LOG_PERIOD_NS {
             last_role_log_ns = ns_since(start);
+            log.log(
+                if peer_adp_rx == 0 {
+                    Level::Warn
+                } else {
+                    Level::Info
+                },
+                "peer",
+                &format!(
+                    "from devices in the last {} s: {peer_adp_rx} ADP, {peer_aem_resp_rx} AEM \
+                     response(s) at t={:.1}s",
+                    ROLE_LOG_PERIOD_NS / 1_000_000_000,
+                    ns_since(start) as f64 / 1e9
+                ),
+            );
+            peer_adp_rx = 0;
+            peer_aem_resp_rx = 0;
             // Each device's own view of its link to the switch.
             for &(dev, mac) in &devs {
                 let mut pl = Vec::with_capacity(4);

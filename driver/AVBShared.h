@@ -345,6 +345,7 @@ enum AvbCounterIndex : uint32_t {
     kAvbCtrStampMiss = 38,          // event frame with no matching stamp-ring entry
     kAvbCtrStampSkipped = 39,       // event frame delivered unstamped: TX latch pending or epoch unseeded
     kAvbCtrStopBlockTimeouts = 40,  // shutdown found a block that would not stop (logged, not a fault)
+    kAvbCtrDoorbellGuardWaits = 41, // BCM: config-window access delayed to clear a recent TX doorbell
     kAvbCtrCount = 64,
 };
 struct AvbCounters { uint64_t c[kAvbCtrCount]; };   // 512 B
@@ -412,6 +413,7 @@ static_assert((AVB_RX_CTL_SLOTS & (AVB_RX_CTL_SLOTS - 1)) == 0 &&
 static_assert(kAvbCtrRxOversize < kAvbCtrCount, "counter space");
 static_assert(kAvbCtrTxBatchRejected < kAvbCtrCount, "batch counter space");
 static_assert(kAvbCtrStopBlockTimeouts < kAvbCtrCount, "stamp counter space");
+static_assert(kAvbCtrDoorbellGuardWaits < kAvbCtrCount, "guard counter space");
 static_assert(kAvbCtrRxClassBase + AVB_RX_CLASS_COUNT == kAvbCtrRxDropOther, "class counters 1..7");
 // (uint32_t cast: C++20 deprecates arithmetic between two enumeration types.)
 static_assert(uint32_t(kAvbCtrRxClassBase) + kAvbRxGptp - 1 == 1 &&

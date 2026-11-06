@@ -116,6 +116,7 @@ struct AVBBcmDriver_IVars {
     uint32_t txProd;             // TX producer
     uint32_t txCons;             // last TX consumer seen in the status block
     uint64_t txSeq;              // frames sent since datapath up
+    uint64_t lastDoorbellMach;   // mach time of the last TX producer-mailbox write
 
     // One outstanding timestamped TX (tg3 behaviour).
     bool tsPending;
@@ -296,11 +297,14 @@ static uint32_t cfgRd32Raw(IV * v, uint32_t off)
     return x;
 }
 
+static void guardDoorbell(IV * v);
+
 // Internal memory (RX/TX-CPU scratch at 0x30000/0x34000) through the register
 // indirect window. Matches ThunderGate: write the big-endian-assembled word
 // as-is, byte-swap on read (their htonl), restore the base to 0 after.
 static void regWinWrite(IV * v, uint32_t winAddr, uint32_t word)
 {
+    guardDoorbell(v);
     cfgWr32(v, bcm::kRegWinBase, winAddr);
     cfgWr32(v, bcm::kRegWinData, word);
     cfgWr32(v, bcm::kRegWinBase, 0);
@@ -314,6 +318,7 @@ static uint32_t regWinRead(IV * v, uint32_t winAddr)
     // it correctly). No byte swap here -- ThunderGate's htonl compensated for
     // its own Python/userclient layer, which DriverKit config access does not
     // impose.
+    guardDoorbell(v);
     cfgWr32(v, bcm::kRegWinBase, winAddr);
     const uint32_t raw = cfgRd32Raw(v, bcm::kRegWinData);
     cfgWr32(v, bcm::kRegWinBase, 0);
@@ -323,6 +328,32 @@ static uint32_t regWinRead(IV * v, uint32_t winAddr)
 static uint64_t nsToMach(IV * v, uint64_t ns)
 {
     return v->tb.numer == 0 ? ns : ns * v->tb.denom / v->tb.numer;
+}
+
+// A config-space indirect access in the ~13 us after a TX doorbell corrupts
+// the MAC's TX_TSTAMP latch (measured on this part, see drainReturnRing). The
+// old guard covered only a doorbell for a TIMESTAMPED frame; at 8 audio
+// streams an untimestamped doorbell rings every 125 us, so ~10% of stamp-ring
+// reads landed in the window. Whatever else such an access disturbs is
+// undocumented, so keep every register-window access clear of every
+// doorbell. Waits at most kDoorbellGuardNs, and counts each wait.
+constexpr uint64_t kDoorbellGuardNs = 20000;
+
+static void guardDoorbell(IV * v)
+{
+    if (v->lastDoorbellMach == 0) {
+        return;
+    }
+    const uint64_t guard = nsToMach(v, kDoorbellGuardNs);
+    const uint64_t now = mach_absolute_time();
+    const uint64_t since = now - v->lastDoorbellMach;
+    if (now < v->lastDoorbellMach || since >= guard) {
+        return;
+    }
+    v->ctr.c[kAvbCtrDoorbellGuardWaits]++;
+    const uint64_t sinceNs = v->tb.denom == 0 ? since : since * v->tb.numer / v->tb.denom;
+    const uint64_t leftNs = sinceNs < kDoorbellGuardNs ? kDoorbellGuardNs - sinceNs : 0;
+    IODelay(static_cast<uint32_t>(leftNs / 1000 + 1));
 }
 
 // 64-bit timestamp register pair: LSB first (latches MSB / releases interlock).
@@ -1519,6 +1550,7 @@ static kern_return_t initDatapath(IV * v, uint64_t initFlags)
     v->stage = kAvbStageDatapath;  // so a failure below runs the shutdown path
     v->swHead = v->swTail = v->swDropped = 0;
     v->txSeq = 0;
+    v->lastDoorbellMach = 0;
     v->tsPending = false;
     v->tsSeq = 0;
     v->rxcpuStamp = (initFlags & AVB_INIT_FLAG_RXCPU_STAMP) != 0;
@@ -1590,6 +1622,7 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
 
     const uint64_t mach = mach_absolute_time();
     wrFlush(v, bcm::kMboxTxHostProd0, v->txProd);
+    v->lastDoorbellMach = mach_absolute_time();
 
     const uint64_t seq = ++v->txSeq;
     v->ctr.c[kAvbCtrTxFrames]++;
@@ -1659,6 +1692,7 @@ static kern_return_t sendFrames(IV * v, const uint8_t * in, uint32_t inLen, uint
     OSSynchronizeIO();
     const uint64_t mach = mach_absolute_time();
     wrFlush(v, bcm::kMboxTxHostProd0, v->txProd);
+    v->lastDoorbellMach = mach_absolute_time();
 
     v->txSeq += accepted;
     v->ctr.c[kAvbCtrTxFrames] += accepted;
