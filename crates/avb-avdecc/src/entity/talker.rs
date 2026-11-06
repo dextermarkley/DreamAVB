@@ -384,6 +384,44 @@ pub struct StreamInfo {
     pub msrp_accumulated_latency_ns: u32,
 }
 
+/// GET_STREAM_INFO flags for a STREAM_OUTPUT: the 16R's own talker word,
+/// identical on all eight of its outputs whether or not anyone listened.
+/// STREAM_FORMAT/ID/MSRP_ACC_LAT/DEST_MAC/VLAN_ID valid.
+pub const OUTPUT_FLAGS: u32 = 0xf200_0000;
+/// GET_STREAM_INFO flags for an unbound STREAM_INPUT: the 16R's own word.
+pub const INPUT_UNBOUND_FLAGS: u32 = crate::milan::stream_info_flags::CAPTURED_16R_UNBOUND;
+
+/// Fields of one 48-byte GET_STREAM_INFO response payload.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StreamInfoReply {
+    desc_type: u16,
+    index: u16,
+    flags: u32,
+    format: u64,
+    stream_id: u64,
+    msrp_acc_lat_ns: u32,
+    dest_mac: MacAddr,
+    vlan_id: u16,
+}
+
+/// Encode in the 16R's captured layout (see `TalkerEntity::get_stream_info`).
+fn encode_stream_info(r: &StreamInfoReply) -> Vec<u8> {
+    let mut p = Vec::with_capacity(48);
+    p.extend_from_slice(&r.desc_type.to_be_bytes());
+    p.extend_from_slice(&r.index.to_be_bytes());
+    p.extend_from_slice(&r.flags.to_be_bytes());
+    p.extend_from_slice(&r.format.to_be_bytes());
+    p.extend_from_slice(&r.stream_id.to_be_bytes());
+    p.extend_from_slice(&r.msrp_acc_lat_ns.to_be_bytes());
+    p.extend_from_slice(&r.dest_mac.0);
+    p.push(0); // msrp_failure_code
+    p.push(0); // reserved
+    p.extend_from_slice(&0u64.to_be_bytes()); // msrp_failure_bridge_id
+    p.extend_from_slice(&r.vlan_id.to_be_bytes());
+    p.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    p
+}
+
 /// Descriptor index of our Milan IDENTIFY control.
 ///
 /// `descriptor_counts` advertises exactly one CONTROL, so the only valid index
@@ -414,6 +452,8 @@ pub struct TalkerEntity {
     available_index: u32,
     control: ControlState,
     stream: StreamInfo,
+    /// Per-STREAM_OUTPUT destination MACs, for GET_STREAM_INFO.
+    output_dest_macs: Vec<MacAddr>,
 }
 
 impl TalkerEntity {
@@ -431,6 +471,7 @@ impl TalkerEntity {
             available_index: 0,
             control: ControlState::new(),
             stream: StreamInfo::default(),
+            output_dest_macs: Vec::new(),
         }
     }
 
@@ -1571,34 +1612,92 @@ impl TalkerEntity {
         }
     }
 
-    /// GET_STREAM_INFO is deliberately NOT implemented, and this is a
-    /// considered refusal rather than an oversight.
+    /// Per-output destination MACs (descriptor-index order), reported by
+    /// GET_STREAM_INFO. The daemon owns the MAAP allocation, so it pushes them.
+    pub fn set_output_dest_macs(&mut self, macs: Vec<MacAddr>) {
+        self.output_dest_macs = macs;
+    }
+
+    /// GET_STREAM_INFO (IEEE 1722.1-2021 §7.4.16) for our STREAM_OUTPUTs and
+    /// STREAM_INPUTs.
     ///
-    /// The response carries a 32-bit `flags` word whose bit positions come
-    /// from 1722.1-2021 Table 7.206. The field SEMANTICS are confirmed by the
-    /// IEEE 1722.1 working group's own clarification document (Illouz,
-    /// "AVDECC clarifications Part 2 - AEM commands", rev 4, §6.2), which
-    /// names STREAM_FORMAT_VALID, STREAM_ID_VALID, MSRP_ACC_LAT_VALID,
-    /// STREAM_DEST_MAC_VALID, STREAM_VLAN_ID_VALID, MSRP_FAILURE_VALID,
-    /// CONNECTED and FAST_CONNECT and says when each is set. It does NOT give
-    /// their numeric bit positions, and we have no other authoritative source
-    /// for them.
+    /// This used to answer NOT_IMPLEMENTED because the flags word would have
+    /// been a guess. It is no longer one: the layout and every bit we set are
+    /// copied from the PreSonus 16R's OWN responses captured on the wire
+    /// (`16r-working.pcap`, `apple-avdecc.pcap`), so the reply has the shape a
+    /// device that interoperates with the 16R actually sends:
     ///
-    /// Every descriptor we DO encode is anchored: the same field layouts
-    /// decoded 21 real descriptors off the 16R in the hw-avdecc milestone, so
-    /// encoding with them is verified against hardware. A GET_STREAM_INFO
-    /// response is the opposite case -- we would be originating a flags word we
-    /// have never parsed from the 16R, so a wrong bit would assert something
-    /// false about our stream (claiming CONNECTED, or marking the stream id
-    /// invalid) with nothing to catch it. Pinning the guess in a unit test
-    /// would only restate the guess; that is precisely the tautology that let
-    /// a wrong WriteMix FourCC ship.
+    /// ```text
+    /// 16R STREAM_OUTPUT 1:  0006 0001 f2000000 0205022002006000
+    ///   000a92033ba90001 001e8480 91e0f000ce12 00 00 0000000000000000 0002 0000
+    /// 16R STREAM_INPUT, unbound: 0005 0001 f2000000 <format>, rest zero
+    /// 16R STREAM_INPUT, bound:   0005 0008 f6000006 <format> 38c986467e8b0007
+    ///   00000000 91e0f000e933 ...
+    /// ```
     ///
-    /// NOT_IMPLEMENTED is a legal answer (ADC-10: respond, never go silent),
-    /// and enumeration does not need this command. Implement it once the bit
-    /// positions can be read from the standard.
+    /// The 48-byte payload is: desc_type, desc_index, flags, stream_format,
+    /// stream_id, msrp_accumulated_latency, stream_dest_mac,
+    /// msrp_failure_code, reserved, msrp_failure_bridge_id, stream_vlan_id,
+    /// reserved. A talker reports the 16R's constant talker word
+    /// [`OUTPUT_FLAGS`]. A sink reports the unbound word, plus CONNECTED (bit
+    /// 26, anchored by the 16R's bound/unbound delta) while bound. It never
+    /// claims SAVED_STATE / FAST_CONNECT: we persist no binding.
     fn get_stream_info(&self, cmd: &AemPdu) -> (u8, Vec<u8>) {
-        (aecp_status::NOT_IMPLEMENTED, cmd.payload.clone())
+        let (Some(ty), Some(index)) = (be_u16(&cmd.payload, 0), be_u16(&cmd.payload, 2)) else {
+            return (aecp_status::BAD_ARGUMENTS, cmd.payload.clone());
+        };
+        let i = usize::from(index);
+        let p = match ty {
+            dt::STREAM_OUTPUT => {
+                let Some(st) = self.model.streams.get(i) else {
+                    return (aecp_status::NO_SUCH_DESCRIPTOR, cmd.payload.clone());
+                };
+                encode_stream_info(&StreamInfoReply {
+                    desc_type: ty,
+                    index,
+                    flags: OUTPUT_FLAGS,
+                    format: st.format.0,
+                    stream_id: st.stream_id.0,
+                    msrp_acc_lat_ns: self.stream.msrp_accumulated_latency_ns,
+                    dest_mac: self
+                        .output_dest_macs
+                        .get(i)
+                        .copied()
+                        .unwrap_or(MacAddr([0; 6])),
+                    vlan_id: self.stream.vlan_id,
+                })
+            }
+            dt::STREAM_INPUT => {
+                let Some(sm) = self.sink_sms.get(i) else {
+                    return (aecp_status::NO_SUCH_DESCRIPTOR, cmd.payload.clone());
+                };
+                let format = self.model.current_format.0;
+                match sm.bound_to() {
+                    None => encode_stream_info(&StreamInfoReply {
+                        desc_type: ty,
+                        index,
+                        flags: INPUT_UNBOUND_FLAGS,
+                        format,
+                        ..StreamInfoReply::default()
+                    }),
+                    Some(_) => {
+                        let eff = sm.effective();
+                        encode_stream_info(&StreamInfoReply {
+                            desc_type: ty,
+                            index,
+                            flags: INPUT_UNBOUND_FLAGS | crate::milan::stream_info_flags::CONNECTED,
+                            format,
+                            stream_id: eff.stream_id.0,
+                            msrp_acc_lat_ns: eff.accumulated_latency_ns,
+                            dest_mac: eff.dest_mac,
+                            vlan_id: eff.vlan_id,
+                        })
+                    }
+                }
+            }
+            _ => return (aecp_status::NO_SUCH_DESCRIPTOR, cmd.payload.clone()),
+        };
+        (aecp_status::SUCCESS, p)
     }
 
     /// GET_PTP_INSTANCE_GRANDMASTER_INFO (IEEE 1722.1-2021, command 0x0053).
@@ -3511,26 +3610,124 @@ mod tests {
         assert_eq!(r.status, aecp_status::NO_SUCH_DESCRIPTOR);
     }
 
-    /// GET_STREAM_INFO must answer NOT_IMPLEMENTED rather than originate a
-    /// flags word whose bit positions we cannot verify. See the doc comment on
-    /// `get_stream_info` for why this is deliberate.
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The encoder must reproduce the 16R's OWN GET_STREAM_INFO replies byte
+    /// for byte, from its field values. These are payloads captured off the
+    /// wire (`16r-working.pcap`: its STREAM_OUTPUT 1; `apple-avdecc.pcap`: its
+    /// unbound STREAM_INPUT 1). A wrong field offset or a missing reserved
+    /// byte fails here; nothing in the expected bytes came from our code.
     #[test]
-    fn get_stream_info_is_refused_not_guessed() {
-        let mut e = entity();
+    fn stream_info_encoding_matches_the_16r_capture() {
+        let out1 = encode_stream_info(&StreamInfoReply {
+            desc_type: dt::STREAM_OUTPUT,
+            index: 1,
+            flags: 0xf200_0000,
+            format: 0x0205_0220_0200_6000,
+            stream_id: 0x000a_9203_3ba9_0001,
+            msrp_acc_lat_ns: 2_000_000,
+            dest_mac: MacAddr([0x91, 0xe0, 0xf0, 0x00, 0xce, 0x12]),
+            vlan_id: 2,
+        });
+        assert_eq!(
+            out1,
+            hex("00060001f20000000205022002006000000a92033ba90001001e848091e0f000ce120000000000000000000000020000")
+        );
+        let in_unbound = encode_stream_info(&StreamInfoReply {
+            desc_type: dt::STREAM_INPUT,
+            index: 1,
+            flags: INPUT_UNBOUND_FLAGS,
+            format: 0x0205_0220_0200_6000,
+            ..StreamInfoReply::default()
+        });
+        assert_eq!(
+            in_unbound,
+            hex("00050001f200000002050220020060000000000000000000000000000000000000000000000000000000000000000000")
+        );
+        assert_eq!(OUTPUT_FLAGS, 0xf200_0000);
+    }
+
+    /// Through the AEM handler: each output reports its own id, format and
+    /// pushed destination; an out-of-range output and an unknown type are
+    /// NO_SUCH_DESCRIPTOR; an unbound sink reports the 16R's unbound word.
+    #[test]
+    fn get_stream_info_answers_outputs_and_sinks() {
+        let mut e = duplex_entity();
         let id = e.entity_id();
+        let n = e.model().stream_count();
+        let dests: Vec<MacAddr> = (0..n)
+            .map(|i| MacAddr([0x91, 0xe0, 0xf0, 0x00, 0x10, i as u8]))
+            .collect();
+        e.set_output_dest_macs(dests.clone());
         e.set_stream_info(StreamInfo {
             connected: true,
-            dest_mac: MacAddr([0x91, 0xe0, 0xf0, 0x01, 0x00, 0x01]),
+            dest_mac: dests[0],
             vlan_id: 2,
-            msrp_accumulated_latency_ns: 0,
+            msrp_accumulated_latency_ns: 2_000_000,
         });
-        let mut p = dt::STREAM_OUTPUT.to_be_bytes().to_vec();
-        p.extend_from_slice(&0u16.to_be_bytes());
-        let r = e.handle_aecp(&cmd(aem_cmd::GET_STREAM_INFO, p, id), OUR_MAC, 0);
-        assert_eq!(r.status, aecp_status::NOT_IMPLEMENTED);
-        // Still a response, never silence (ADC-10).
+        let q = |ty: u16, i: u16| {
+            let mut p = ty.to_be_bytes().to_vec();
+            p.extend_from_slice(&i.to_be_bytes());
+            p
+        };
+        for i in 0..n {
+            let r = e.handle_aecp(
+                &cmd(aem_cmd::GET_STREAM_INFO, q(dt::STREAM_OUTPUT, i), id),
+                OUR_MAC,
+                0,
+            );
+            assert_eq!(r.status, aecp_status::SUCCESS);
+            assert_eq!(r.payload.len(), 48);
+            let st = &e.model().streams[usize::from(i)];
+            assert_eq!(r.payload[0..4], q(dt::STREAM_OUTPUT, i)[..]);
+            assert_eq!(r.payload[4..8], OUTPUT_FLAGS.to_be_bytes());
+            assert_eq!(r.payload[8..16], st.format.0.to_be_bytes());
+            assert_eq!(r.payload[16..24], st.stream_id.0.to_be_bytes());
+            assert_eq!(r.payload[24..28], 2_000_000u32.to_be_bytes());
+            assert_eq!(r.payload[28..34], dests[usize::from(i)].0);
+            assert_eq!(r.payload[44..46], 2u16.to_be_bytes());
+        }
+        let r = e.handle_aecp(
+            &cmd(aem_cmd::GET_STREAM_INFO, q(dt::STREAM_OUTPUT, n), id),
+            OUR_MAC,
+            0,
+        );
+        assert_eq!(r.status, aecp_status::NO_SUCH_DESCRIPTOR);
+        let r = e.handle_aecp(
+            &cmd(aem_cmd::GET_STREAM_INFO, q(dt::AUDIO_UNIT, 0), id),
+            OUR_MAC,
+            0,
+        );
+        assert_eq!(r.status, aecp_status::NO_SUCH_DESCRIPTOR);
+
+        assert!(e.model().sink_count() > 0);
+        let r = e.handle_aecp(
+            &cmd(aem_cmd::GET_STREAM_INFO, q(dt::STREAM_INPUT, 0), id),
+            OUR_MAC,
+            0,
+        );
+        assert_eq!(r.status, aecp_status::SUCCESS);
+        assert_eq!(r.payload[4..8], INPUT_UNBOUND_FLAGS.to_be_bytes());
+        assert!(
+            r.payload[16..].iter().all(|&b| b == 0),
+            "unbound: no stream fields"
+        );
+        let sinks = e.model().sink_count();
+        let r = e.handle_aecp(
+            &cmd(aem_cmd::GET_STREAM_INFO, q(dt::STREAM_INPUT, sinks), id),
+            OUR_MAC,
+            0,
+        );
+        assert_eq!(r.status, aecp_status::NO_SUCH_DESCRIPTOR);
+        // Short payload: BAD_ARGUMENTS, still a response.
+        let r = e.handle_aecp(&cmd(aem_cmd::GET_STREAM_INFO, vec![0, 5], id), OUR_MAC, 0);
+        assert_eq!(r.status, aecp_status::BAD_ARGUMENTS);
         assert_eq!(r.message_type, aecp_msg::AEM_RESPONSE);
-        assert_eq!(r.command_type, aem_cmd::GET_STREAM_INFO);
     }
 
     #[test]
