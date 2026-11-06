@@ -6050,6 +6050,27 @@ fn talker_loop(
                     let _ = dext.send(frame.bytes(), false, 0);
                 }
             }
+            // TX-timestamp availability over this period: `slow` counts the
+            // case that used to freeze the audio loop (> 10 ms).
+            let txs = gptp.take_tx_ts_stats();
+            log.log(
+                if txs.slow > 0 || txs.timeouts > 0 {
+                    Level::Warn
+                } else {
+                    Level::Info
+                },
+                "clock",
+                &format!(
+                    "tx timestamps: {} harvested, max {} us, {} slower than {} ms, {} timed out; \
+                     test-dropped Sync/FU/Announce so far: {}",
+                    txs.harvested,
+                    txs.max_ns / 1000,
+                    txs.slow,
+                    crate::gptpsvc::TX_TS_SLOW_NS / 1_000_000,
+                    txs.timeouts,
+                    gptp.dropped_sync,
+                ),
+            );
             let st = gptp.status();
             let c = gptp.counters();
             log.log(

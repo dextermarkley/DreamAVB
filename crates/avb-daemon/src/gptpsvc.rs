@@ -97,6 +97,33 @@ pub struct GptpService {
     hw_hi: u32,
     hw_last_lo: u32,
     hw_seeded: bool,
+    /// When the pending want_ts frame was sent, for TX-timestamp latency.
+    tx_ts_since: Option<MachTicks>,
+    tx_ts_stats: TxTsStats,
+    /// Test hook (`AVB_DEBUG_DROP_SYNC_AFTER_S=<s>`): from this mach time on,
+    /// drop received Sync / Follow_Up / Announce, which is what the 16R did
+    /// when it stopped being grandmaster. Reproduces holdover on demand.
+    drop_sync_from: Option<MachTicks>,
+    pub dropped_sync: u64,
+}
+
+/// The PTP messageType of a received frame (Ethernet, optionally one VLAN
+/// tag), or `None` if it is not an 0x88F7 frame.
+fn ptp_msg_type(frame: &[u8]) -> Option<u8> {
+    let mut off = 12;
+    if frame.get(12..14) == Some(&[0x81, 0x00]) {
+        off = 16;
+    }
+    if frame.get(off..off + 2) != Some(&[0x88, 0xf7]) {
+        return None;
+    }
+    frame.get(off + 2).map(|b| b & 0x0f)
+}
+
+/// Sync (0), Follow_Up (8), Announce (0xB): what a grandmaster that stops
+/// serving time stops sending. Pdelay keeps flowing, as it did on the 16R.
+fn is_gm_message(msg_type: u8) -> bool {
+    matches!(msg_type, 0x0 | 0x8 | 0xB)
 }
 
 impl GptpService {
@@ -146,6 +173,26 @@ impl GptpService {
             hw_hi: 0,
             hw_last_lo: 0,
             hw_seeded: false,
+            tx_ts_since: None,
+            tx_ts_stats: TxTsStats::default(),
+            drop_sync_from: std::env::var("AVB_DEBUG_DROP_SYNC_AFTER_S")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|s| {
+                    log.log(
+                        Level::Warn,
+                        "gptp",
+                        &format!(
+                            "TEST HOOK: dropping received Sync/Follow_Up/Announce after {s} s \
+                             (AVB_DEBUG_DROP_SYNC_AFTER_S) to force holdover"
+                        ),
+                    );
+                    MachTicks(
+                        now.0
+                            .saturating_add(tb.ns_to_ticks(s.saturating_mul(1_000_000_000))),
+                    )
+                }),
+            dropped_sync: 0,
         })
     }
 
@@ -229,6 +276,9 @@ impl GptpService {
 
         // 1) Drain RX control frames into the port.
         for slot in dext.rx_ctl() {
+            if self.test_drops(now_t, &slot.data) {
+                continue;
+            }
             let hw_ts = slot.hw_ts_ns.map(|t| self.virt_ts(t));
             let meta = RxMeta {
                 harvest: now_t,
@@ -258,14 +308,10 @@ impl GptpService {
         now_t: MachTicks,
     ) -> Result<(), Exit> {
         // 2) Harvest a pending TX timestamp and route it to its exchange.
-        match dext.poll_tx_ts() {
-            TxTsResult::Ready { tag, systim_ns } => {
-                let ts = self.virt_ts(systim_ns);
-                self.port.on_tx_timestamp(tag, GTxTs::Ok(ts), now_t);
-            }
-            TxTsResult::Timeout => { /* exchange abandoned; port times it out */ }
-            TxTsResult::Pending | TxTsResult::Idle => {}
-        }
+        //    One non-blocking poll per iteration (the caller runs this about
+        //    every millisecond). The latched value is the hardware's, so WHEN
+        //    we read it does not change t1/t3.
+        self.poll_tx_ts_once(dext, now_t);
 
         // 3) Poll the port for frames to send, draining any held frame first.
         let now = Now::mach_only(now_t);
@@ -288,11 +334,19 @@ impl GptpService {
             match dext.send(frame.bytes(), frame.want_ts, frame.tag) {
                 SendResult::Ok => {
                     self.port.on_frame_sent(frame.tag, now_t);
-                    // Harvest this frame's TX hardware timestamp right away:
-                    // the dext holds only ONE pending TX timestamp, so the
-                    // next want_ts send would overwrite it.
+                    // One immediate, non-blocking look for the timestamp; a
+                    // later iteration picks it up otherwise. This used to
+                    // sleep up to 20 x 500 us here, on the talker's thread:
+                    // when the Broadcom's latch was slow (after the 16R
+                    // stopped sending Sync) it froze the audio loop ~10.6 ms
+                    // once per Pdelay_Req and tore a hole in every stream.
+                    // Nothing is lost by not waiting: both dexts refuse a
+                    // second want_ts send while one is pending (Busy, so the
+                    // frame is held below), so a timestamp cannot be
+                    // overwritten before it is harvested.
                     if frame.want_ts {
-                        self.harvest_tx_ts(dext);
+                        self.tx_ts_since = Some(now_t);
+                        self.poll_tx_ts_once(dext, now_t);
                     }
                     self.held = self.out.pop();
                 }
@@ -390,6 +444,9 @@ impl GptpService {
     /// Feed one already-drained control frame to the port. Used by a loop that
     /// owns the control-ring drain itself (see [`GptpService::service_no_rx`]).
     pub fn handle_rx(&mut self, now_t: MachTicks, slot: &crate::dextio::RxSlot) {
+        if self.test_drops(now_t, &slot.data) {
+            return;
+        }
         let hw_ts = slot.hw_ts_ns.map(|t| self.virt_ts(t));
         let meta = RxMeta {
             harvest: now_t,
@@ -402,26 +459,69 @@ impl GptpService {
         let _ = self.port.handle_rx(Now::mach_only(now_t), &slot.data, meta);
     }
 
-    /// Poll briefly for the TX timestamp of the frame just sent. Bounded at
-    /// ~10 ms; the I210 latches within a few ms.
-    ///
-    /// This must run immediately after the send, not on the next iteration:
-    /// the dext holds exactly ONE pending TX timestamp, so a second want_ts
-    /// send overwrites it and the first exchange silently loses its t1.
-    fn harvest_tx_ts(&mut self, dext: &mut RealDext) {
-        for _ in 0..20 {
-            match dext.poll_tx_ts() {
-                TxTsResult::Ready { tag, systim_ns } => {
-                    let now = MachTicks(unsafe { mach2::mach_time::mach_absolute_time() });
-                    let ts = self.virt_ts(systim_ns);
-                    self.port.on_tx_timestamp(tag, GTxTs::Ok(ts), now);
-                    return;
+    /// The forced-holdover test hook: true if this frame is to be dropped.
+    fn test_drops(&mut self, now_t: MachTicks, frame: &[u8]) -> bool {
+        let Some(from) = self.drop_sync_from else {
+            return false;
+        };
+        if now_t.0 < from.0 || !ptp_msg_type(frame).is_some_and(is_gm_message) {
+            return false;
+        }
+        self.dropped_sync += 1;
+        true
+    }
+
+    /// One non-blocking look for the pending TX timestamp. Never sleeps: this
+    /// runs on the talker's thread, where any wait is audio not sent.
+    fn poll_tx_ts_once(&mut self, dext: &mut RealDext, now_t: MachTicks) {
+        match dext.poll_tx_ts() {
+            TxTsResult::Ready { tag, systim_ns } => {
+                if let Some(t0) = self.tx_ts_since.take() {
+                    let ns = self.tb.ticks_to_ns(now_t.ticks_since(t0));
+                    self.tx_ts_stats.record(ns);
                 }
-                TxTsResult::Timeout | TxTsResult::Idle => return,
-                TxTsResult::Pending => {
-                    std::thread::sleep(std::time::Duration::from_micros(500));
+                let ts = self.virt_ts(systim_ns);
+                self.port.on_tx_timestamp(tag, GTxTs::Ok(ts), now_t);
+            }
+            TxTsResult::Timeout => {
+                // Exchange abandoned; the port times it out itself.
+                if self.tx_ts_since.take().is_some() {
+                    self.tx_ts_stats.timeouts += 1;
                 }
             }
+            TxTsResult::Pending | TxTsResult::Idle => {}
+        }
+    }
+
+    /// How long TX timestamps took to become readable since the last call,
+    /// and reset. For the periodic clock line.
+    pub fn take_tx_ts_stats(&mut self) -> TxTsStats {
+        std::mem::take(&mut self.tx_ts_stats)
+    }
+}
+
+/// TX-timestamp availability since the last report: from the send of a
+/// want_ts frame to the poll that found its timestamp.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxTsStats {
+    pub harvested: u32,
+    pub max_ns: u64,
+    /// Harvested later than [`TX_TS_SLOW_NS`].
+    pub slow: u32,
+    /// The dext gave up on the latch.
+    pub timeouts: u32,
+}
+
+/// The old blocking harvest gave up at ~10 ms; a timestamp later than this
+/// is the case that used to freeze the audio loop.
+pub const TX_TS_SLOW_NS: u64 = 10_000_000;
+
+impl TxTsStats {
+    fn record(&mut self, ns: u64) {
+        self.harvested = self.harvested.saturating_add(1);
+        self.max_ns = self.max_ns.max(ns);
+        if ns > TX_TS_SLOW_NS {
+            self.slow = self.slow.saturating_add(1);
         }
     }
 }
@@ -429,6 +529,46 @@ impl GptpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The test hook drops exactly the grandmaster's messages, tagged or not,
+    /// and never Pdelay (which the 16R kept sending when it stopped serving
+    /// time).
+    #[test]
+    fn test_hook_drops_only_sync_follow_up_and_announce() {
+        let frame = |vlan: bool, msg: u8| {
+            let mut f = vec![0u8; 12];
+            if vlan {
+                f.extend_from_slice(&[0x81, 0x00, 0x00, 0x02]);
+            }
+            f.extend_from_slice(&[0x88, 0xf7, 0x10 | msg, 0x02]);
+            f
+        };
+        for vlan in [false, true] {
+            for (msg, gm) in [
+                (0x0, true),
+                (0x8, true),
+                (0xB, true),
+                (0x2, false),
+                (0x3, false),
+                (0xA, false),
+            ] {
+                assert_eq!(ptp_msg_type(&frame(vlan, msg)), Some(msg));
+                assert_eq!(is_gm_message(msg), gm, "msg 0x{msg:x}");
+            }
+        }
+        let mut avdecc = vec![0u8; 12];
+        avdecc.extend_from_slice(&[0x22, 0xf0, 0xfa]);
+        assert_eq!(ptp_msg_type(&avdecc), None);
+        assert_eq!(ptp_msg_type(&[0u8; 5]), None);
+    }
+
+    #[test]
+    fn tx_ts_stats_count_slow_harvests() {
+        let mut s = TxTsStats::default();
+        s.record(400_000);
+        s.record(TX_TS_SLOW_NS + 1);
+        assert_eq!((s.harvested, s.slow, s.max_ns), (2, 1, TX_TS_SLOW_NS + 1));
+    }
 
     /// Apple Silicon: 125/3 ns per tick (24 MHz).
     const TB: Timebase = Timebase {
