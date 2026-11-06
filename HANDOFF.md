@@ -905,6 +905,20 @@ TMPDIR=/Users/dexter/AVB-Audio/.agents/tmp/ make -C /Users/dexter/AVB-Audio/driv
 /Users/dexter/AVB-Audio/scripts/package.sh          # signed; --adhoc for an unsigned build check
 ```
 
+The companion app has its own crate: `cargo test --manifest-path
+/Users/dexter/AVB-Audio/apps/dreamavb-companion/src-tauri/Cargo.toml --locked`,
+built with `scripts/build-companion.sh`.
+
+## Test hooks (environment variables)
+
+Each logs a `TEST HOOK` warning when it takes effect. None belongs in a normal run.
+
+| Variable | Read by | Effect |
+|---|---|---|
+| `AVB_DEBUG_DROP_SYNC_AFTER_S=<s>` | avb-daemon (`gptpsvc.rs`) | After `<s>` seconds, drop received Sync, Follow_Up and Announce. Forces holdover on demand, as when the 16R stops being grandmaster. |
+| `AVB_DEBUG_NO_AUDIO_TX=1` | avb-daemon (`stack.rs`) | Run everything (entity, MSRP Talker Advertise, ACMP, gPTP, inbound) but put no audio frame on the wire. Separates "the 16R reacts to our audio" from "the 16R reacts to our control traffic". |
+| `AVB_SKIP_STAMPER=1` | avb-probe `datapath up` (BCM) | Leave the stock RX-CPU in place instead of loading the stamping firmware. Isolates TX-timestamp effects from the firmware. |
+
 ## Repo map
 
 - `driver/AVBShared.h`: the C++ ABI (v3), mirrored in `crates/avb-dext/src/abi.rs` with offset tests.

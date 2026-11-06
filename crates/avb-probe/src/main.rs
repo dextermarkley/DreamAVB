@@ -37,8 +37,10 @@ use avb_probe::stats::{self, ClockStats, Timebase};
     about = "Phase 0 probe for the AVB dexts (NIC clock, frequency adjust, RX/TX PTP timestamps)"
 )]
 struct Cli {
-    /// Which dext to talk to: auto (AVBI210Driver, then AVBBcmDriver), i210 or bcm.
-    #[arg(long, global = true, default_value = "auto", value_parser = ["auto", "i210", "bcm"])]
+    /// Which dext to talk to: auto (AVBI210Driver, then AVBBcmDriver), i210 or
+    /// bcm (alias bcm57762, the installer/companion id).
+    #[arg(long, global = true, default_value = "auto",
+          value_parser = ["auto", "i210", "bcm", "bcm57762"])]
     nic: String,
     /// Append machine-readable results to this JSON file.
     #[arg(long, global = true)]
@@ -1591,8 +1593,10 @@ fn main() -> Result<()> {
     install_sigint();
     let sel = match cli.nic.as_str() {
         "i210" => NicSelect::I210,
-        "bcm" => NicSelect::Bcm,
-        _ => NicSelect::Auto,
+        // "bcm57762" is the companion/installer id; accept it like the daemon.
+        "bcm" | "bcm57762" => NicSelect::Bcm,
+        "auto" => NicSelect::Auto,
+        other => bail!("unknown --nic {other:?} (i210, bcm, bcm57762, auto)"),
     };
     let dev = Device::open(sel)?;
     let json = cli.json.as_deref();

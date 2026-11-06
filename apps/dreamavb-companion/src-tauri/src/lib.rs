@@ -40,19 +40,13 @@ pub enum NicKind {
 impl NicKind {
     pub const ALL: [NicKind; 2] = [NicKind::I210, NicKind::Bcm57762];
 
-    /// Stable id: the dropdown value and the `avb-installer --dext` argument.
+    /// Stable id, one of `avb_config::NIC_IDS`: the dropdown value, the
+    /// `active_nic` setting, the `avb-installer --dext` argument, and the
+    /// `avb-daemon --nic` / `avb-probe --nic` value (both accept "bcm57762").
     pub fn id(self) -> &'static str {
         match self {
-            NicKind::I210 => "i210",
-            NicKind::Bcm57762 => "bcm57762",
-        }
-    }
-
-    /// `avb-daemon --nic` / `avb-probe --nic` value.
-    fn tool_arg(self) -> &'static str {
-        match self {
-            NicKind::I210 => "i210",
-            NicKind::Bcm57762 => "bcm",
+            NicKind::I210 => avb_config::NIC_IDS[0],
+            NicKind::Bcm57762 => avb_config::NIC_IDS[1],
         }
     }
 
@@ -429,19 +423,20 @@ async fn enable_driver(nic_id: String) -> Result<Status, String> {
             )
         })?;
     set_release_requested(None);
-    // Remember the choice first: with two adapters attached it is what makes
-    // the status (and the daemon's --nic) follow this one.
-    let (mut cfg, _warnings) = Config::load();
-    cfg.active_nic = Some(kind.id());
-    cfg.save()
-        .map_err(|e| format!("could not save settings: {e}"))?;
     // Already enabled and attached (switching between two plugged-in NICs):
-    // nothing to activate, the recorded choice is the whole change.
+    // nothing to activate, recording the choice is the whole change.
     let already =
         classify_sysext(&sysext_listing(), kind) == DextSysextState::Enabled && dext_owns(kind);
     if !already {
         run_installer(&["activate", "--dext", kind.id()])?;
     }
+    // Record the choice only once the installer accepted it. Saved earlier, a
+    // failed or cancelled activation left the status (and the daemon's --nic)
+    // following a NIC DreamAVB never took over.
+    let (mut cfg, _warnings) = Config::load();
+    cfg.active_nic = Some(kind.id());
+    cfg.save()
+        .map_err(|e| format!("could not save settings: {e}"))?;
     // A running daemon is bound to the NIC it was started on; move it.
     let running = {
         let mut guard = match AUDIO.lock() {
@@ -464,19 +459,21 @@ async fn enable_driver(nic_id: String) -> Result<Status, String> {
 /// detached an always-matched dext; wait for the observed handoff and surface
 /// the required physical/reboot follow-up when macOS defers it.
 ///
-/// Releases the NIC DreamAVB is active on; with none active, every dext that
-/// is installed at all, so "off" never leaves one behind.
+/// Releases every dext that is installed at all, the active NIC's first, so
+/// "off" never leaves one behind. It used to release only the active NIC's,
+/// which left the other adapter's dext enabled and holding its device.
 #[tauri::command]
 async fn disable_driver() -> Result<Status, String> {
     let _ = stop_audio().await?;
     let listing = sysext_listing();
-    let kinds: Vec<NicKind> = match current_status().nic.and_then(|n| n.kind) {
-        Some(k) => vec![k],
-        None => NicKind::ALL
-            .into_iter()
-            .filter(|&k| classify_sysext(&listing, k) != DextSysextState::Absent)
-            .collect(),
-    };
+    let installed: Vec<(NicKind, bool)> = NicKind::ALL
+        .into_iter()
+        .map(|k| {
+            let present = classify_sysext(&listing, k) != DextSysextState::Absent || dext_owns(k);
+            (k, present)
+        })
+        .collect();
+    let kinds = kinds_to_release(current_status().nic.and_then(|n| n.kind), &installed);
     for &k in &kinds {
         run_installer(&["deactivate", "--dext", k.id()])?;
     }
@@ -484,6 +481,19 @@ async fn disable_driver() -> Result<Status, String> {
         set_release_requested(Some(k));
     }
     wait_for_driver_release(&kinds)
+}
+
+/// Which dexts `disable_driver` deactivates: the active one (always, even if
+/// the listing missed it), then every other kind that is installed or
+/// attached. Pure, so the order and coverage are testable.
+fn kinds_to_release(active: Option<NicKind>, installed: &[(NicKind, bool)]) -> Vec<NicKind> {
+    let mut out: Vec<NicKind> = active.into_iter().collect();
+    for &(k, present) in installed {
+        if present && !out.contains(&k) {
+            out.push(k);
+        }
+    }
+    out
 }
 
 const DRIVER_RELEASE_WAIT: Duration = Duration::from_secs(6);
@@ -738,7 +748,7 @@ fn parse_fault_code(stdout: &str) -> Option<u32> {
 fn probe_fault(kind: NicKind) -> bool {
     match Command::new(helper_path("avb-probe"))
         .arg("--nic")
-        .arg(kind.tool_arg())
+        .arg(kind.id())
         .arg("info")
         .output()
     {
@@ -1705,48 +1715,12 @@ async fn start_audio() -> Result<AudioStatus, String> {
     // The driver must own the NIC first. Starting the daemon against the OS
     // default driver fails in a way that reads like a daemon bug, so say the
     // real thing instead.
-    let st = current_status();
-    let kind =
-        match (&st.state, st.nic.as_ref().and_then(|n| n.kind)) {
-            (DriverState::Active, Some(k)) => k,
-            _ => return Err(
-                "turn DreamAVB on for the network interface first — the audio daemon needs the \
-                 driver to own the device"
-                    .to_string(),
-            ),
-        };
-
-    let bin = helper_path("avb-daemon");
-    let log = audio_log_path().ok_or_else(|| "HOME is not set".to_string())?;
-    if let Some(dir) = log.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    // Append rather than truncate: the previous run's failure is usually what
-    // explains the current one.
-    let out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .map_err(|e| format!("could not open {}: {e}", log.display()))?;
-    let err = out
-        .try_clone()
-        .map_err(|e| format!("could not open {}: {e}", log.display()))?;
-
-    // No --seconds: run until we stop it.
-    // --nic names the dext the driver is active on: the daemon's own default
-    // is the I210, so without it a Broadcom session started on nothing.
-    let child = Command::new(&bin)
-        .arg("--nic")
-        .arg(kind.tool_arg())
-        .arg("duplex")
-        .arg("--log-level")
-        .arg("info")
-        .stdout(out)
-        .stderr(err)
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("could not start {}: {e}", bin.display()))?;
-    *guard = Some(child);
+    let kind = active_kind().ok_or_else(|| {
+        "turn DreamAVB on for the network interface first — the audio daemon needs the \
+         driver to own the device"
+            .to_string()
+    })?;
+    *guard = Some(spawn_daemon(kind)?);
     // The user asked for audio ON. Record that, so the supervisor restarts the
     // daemon if it dies on its own but NOT if they turn it off.
     AUDIO_WANTED.store(true, Ordering::SeqCst);
@@ -1890,17 +1864,44 @@ fn supervisor_loop() {
 
 /// Spawn a replacement daemon. Shares `start_audio`'s preconditions: the
 /// driver must still own the NIC, or there is nothing to stream through.
+///
+/// Holds the AUDIO lock across the check and the spawn, and re-reads
+/// AUDIO_WANTED under it: `stop_audio` clears the intent under the same lock,
+/// so a stop that lands while this runs can no longer be followed by a daemon
+/// nobody wants.
 fn respawn_daemon() -> Result<(), String> {
-    let st = current_status();
-    let kind = match (&st.state, st.nic.as_ref().and_then(|n| n.kind)) {
-        (DriverState::Active, Some(k)) => k,
-        _ => return Err("the driver no longer owns the interface".into()),
+    let mut guard = match AUDIO.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
     };
+    if !AUDIO_WANTED.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let kind =
+        active_kind().ok_or_else(|| "the driver no longer owns the interface".to_string())?;
+    *guard = Some(spawn_daemon(kind)?);
+    Ok(())
+}
+
+/// The NIC the driver is Active on, or `None` when nothing can stream.
+fn active_kind() -> Option<NicKind> {
+    let st = current_status();
+    match (&st.state, st.nic.as_ref().and_then(|n| n.kind)) {
+        (DriverState::Active, Some(k)) => Some(k),
+        _ => None,
+    }
+}
+
+/// Spawn `avb-daemon duplex` on `kind`, logging to the audio log. No
+/// --seconds: it runs until stopped.
+fn spawn_daemon(kind: NicKind) -> Result<std::process::Child, String> {
     let bin = helper_path("avb-daemon");
     let log = audio_log_path().ok_or_else(|| "HOME is not set".to_string())?;
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    // Append rather than truncate: the previous run's failure is usually what
+    // explains the current one.
     let out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1911,9 +1912,9 @@ fn respawn_daemon() -> Result<(), String> {
         .map_err(|e| format!("could not open {}: {e}", log.display()))?;
     // --nic names the dext the driver is active on: the daemon's own default
     // is the I210, so without it a Broadcom session started on nothing.
-    let child = Command::new(&bin)
+    Command::new(&bin)
         .arg("--nic")
-        .arg(kind.tool_arg())
+        .arg(kind.id())
         .arg("duplex")
         .arg("--log-level")
         .arg("info")
@@ -1921,13 +1922,7 @@ fn respawn_daemon() -> Result<(), String> {
         .stderr(err)
         .stdin(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| format!("could not start {}: {e}", bin.display()))?;
-    let mut guard = match AUDIO.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    *guard = Some(child);
-    Ok(())
+        .map_err(|e| format!("could not start {}: {e}", bin.display()))
 }
 
 #[tauri::command]
@@ -2288,6 +2283,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nic_kind_ids_are_the_config_ids() {
+        let ids: Vec<&str> = NicKind::ALL.iter().map(|k| k.id()).collect();
+        assert_eq!(ids, avb_config::NIC_IDS);
+    }
+
+    #[test]
+    fn disable_releases_every_installed_dext_active_first() {
+        use NicKind::*;
+        // Active BCM plus an installed I210: both go, BCM first.
+        assert_eq!(
+            kinds_to_release(Some(Bcm57762), &[(I210, true), (Bcm57762, true)]),
+            vec![Bcm57762, I210]
+        );
+        // The active one is released even if the listing missed it.
+        assert_eq!(
+            kinds_to_release(Some(I210), &[(I210, false), (Bcm57762, false)]),
+            vec![I210]
+        );
+        // Nothing active: only what is installed.
+        assert_eq!(
+            kinds_to_release(None, &[(I210, false), (Bcm57762, true)]),
+            vec![Bcm57762]
+        );
+        assert!(kinds_to_release(None, &[(I210, false), (Bcm57762, false)]).is_empty());
+    }
+
+    #[test]
     fn headroom_info_reports_range_and_latency() {
         let h = headroom_info(2_000, Some(2_000));
         assert_eq!((h.min_us, h.max_us, h.default_us), (1_000, 5_000, 2_000));
@@ -2571,8 +2593,6 @@ mod tests {
         // the bundle ids are other programs' contracts, so pin them literally.
         assert_eq!(NicKind::I210.id(), "i210");
         assert_eq!(NicKind::Bcm57762.id(), "bcm57762");
-        assert_eq!(NicKind::I210.tool_arg(), "i210");
-        assert_eq!(NicKind::Bcm57762.tool_arg(), "bcm");
         assert_eq!(
             NicKind::Bcm57762.bundle_id(),
             "com.avbaudio.installer.bcm57762"
