@@ -241,6 +241,25 @@ mod tests {
     }
 
     #[test]
+    fn lagging_stream_gap_counted_once_not_per_commit() {
+        use crate::layout::counter;
+        use crate::producer::{Producer, SampleFormat};
+        let r = AudioRing::new_anonymous(&test_config(256)).unwrap();
+        // Two streams; stream 1 never delivers, so it lags stream 0.
+        let mut p = Producer::new(&r, &[(0, 4, 24), (4, 4, 24)], 4, 192);
+        let data = vec![0u8; 2 * 4 * 4];
+        for i in 0..40u64 {
+            p.place(0, (i * 2) as i128, 2, SampleFormat::Int32, &data);
+            p.commit(false, None);
+        }
+        assert_eq!(r.write_frame(), 80);
+        // Stream 1 missed frames 0..80: 80 gap frames, once each. Counting
+        // its whole lag on every commit summed to ~1600 here (and 2.5e14 in a
+        // 10-minute hardware run).
+        assert_eq!(r.counter(counter::GAP_FRAMES_TOTAL), 80);
+    }
+
+    #[test]
     fn negative_frame_is_dropped_not_wrapped() {
         use crate::layout::counter;
         use crate::producer::{Producer, SampleFormat};

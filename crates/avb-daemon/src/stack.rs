@@ -4112,6 +4112,10 @@ fn talker_loop(
     // is still alive when its gPTP or streams fail.
     let mut peer_adp_rx: u64 = 0;
     let mut peer_aem_resp_rx: u64 = 0;
+    let mut peer_was_alive = false;
+    // Flight-recorder dumps written this run (each silence episode, capped).
+    const FLIGHT_DUMPS_MAX: u32 = 3;
+    let mut flight_dumps: u32 = 0;
     // CLOCK_DOMAIN LOCKED/UNLOCKED are EVENT counts, not a state: they count
     // transitions of the media clock acquiring and losing a disciplined
     // basis. `Decision.basis` is Some exactly when the sample clock is
@@ -6370,6 +6374,53 @@ fn talker_loop(
                     ns_since(start) as f64 / 1e9
                 ),
             );
+            // A peer that WAS talking went silent: save what it last received
+            // from us and what it last sent, before the buffer rolls over.
+            if peer_adp_rx == 0 && peer_was_alive && flight_dumps < FLIGHT_DUMPS_MAX {
+                flight_dumps += 1;
+                match flight_recorder_path(flight_dumps) {
+                    Some(path) => match dext.recorder.write_pcap(&path) {
+                        Ok(()) => log.log(
+                            Level::Warn,
+                            "peer",
+                            &format!(
+                                "device control traffic stopped: wrote the last {} control \
+                                 frames (both directions) to {}",
+                                dext.recorder.len(),
+                                path.display()
+                            ),
+                        ),
+                        Err(e) => log.log(
+                            Level::Warn,
+                            "peer",
+                            &format!("could not write the flight recorder: {e}"),
+                        ),
+                    },
+                    None => log.log(
+                        Level::Warn,
+                        "peer",
+                        "could not write the flight recorder: HOME is not set",
+                    ),
+                }
+            }
+            peer_was_alive = peer_adp_rx > 0;
+            // How long the dext calls took: a slow call is time the talker
+            // spent waiting on the dext's dispatch queue.
+            let calls = dext.take_call_stats();
+            log.log(
+                if calls.slow.iter().any(|&s| s > 0) {
+                    Level::Warn
+                } else {
+                    Level::Info
+                },
+                "dext",
+                &format!(
+                    "calls in the last {} s (slow > {} us): {}",
+                    ROLE_LOG_PERIOD_NS / 1_000_000_000,
+                    crate::realdext::SLOW_CALL_NS / 1000,
+                    calls.summary()
+                ),
+            );
             peer_adp_rx = 0;
             peer_aem_resp_rx = 0;
             // Each device's own view of its link to the switch.
@@ -7589,6 +7640,17 @@ const MAX_CATCHUP_INTERVALS: u64 = avb_audioring::TALKER_PRESENTATION_OFFSET_NS 
 
 /// [`MAX_CATCHUP_INTERVALS`] for a configured presentation offset: three
 /// quarters of it, so a caught-up PDU keeps a quarter of the headroom.
+/// `~/Library/Logs/DreamAVB-flightrec-<unix s>-<n>.pcap`, beside the daemon log.
+fn flight_recorder_path(n: u32) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    let secs = crate::flightrec::unix_now_ns() / 1_000_000_000;
+    Some(
+        std::path::PathBuf::from(home)
+            .join("Library/Logs")
+            .join(format!("DreamAVB-flightrec-{secs}-{n}.pcap")),
+    )
+}
+
 /// One output's AVTP timestamp: the shared grid's timestamp `base` (stamped
 /// at `shared_ns` past now) moved to that output's own presentation time
 /// offset `stream_ns`. AVTP timestamps are gPTP ns mod 2^32, so the shift

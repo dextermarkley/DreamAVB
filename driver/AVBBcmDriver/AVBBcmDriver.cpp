@@ -330,6 +330,12 @@ static uint64_t nsToMach(IV * v, uint64_t ns)
     return v->tb.numer == 0 ? ns : ns * v->tb.denom / v->tb.numer;
 }
 
+static uint64_t machToUs(IV * v, uint64_t ticks)
+{
+    const uint64_t ns = v->tb.denom == 0 ? ticks : ticks * v->tb.numer / v->tb.denom;
+    return ns / 1000;
+}
+
 // A config-space indirect access in the ~13 us after a TX doorbell corrupts
 // the MAC's TX_TSTAMP latch (measured on this part, see drainReturnRing). The
 // old guard covered only a doorbell for a TIMESTAMPED frame; at 8 audio
@@ -1118,6 +1124,7 @@ static void resetStampCache(IV * v)
 // for an event message. Each word is a ~145 us config-window access.
 static void refreshStampCache(IV * v)
 {
+    v->ctr.c[kAvbCtrStampRefreshes]++;
     RxCpuStampCache & c = v->stampCache;
     const uint32_t prod = readScratch(v, rxcpu::kProd);
     if (prod < c.seen) {
@@ -2068,8 +2075,18 @@ IMPL(AVBBcmDriver, TimerFired)
         return;
     }
     v->ctr.c[kAvbCtrHarvestTicks]++;
+    // Timed: this runs on the queue that also serves SendFrames, so a long
+    // harvest is time a talker's batch spends waiting.
+    const uint64_t t0 = mach_absolute_time();
     harvestRx(v);
     checkTx(v);
+    const uint64_t us = machToUs(v, mach_absolute_time() - t0);
+    if (us > 500) {
+        v->ctr.c[kAvbCtrHarvestSlowTicks]++;
+    }
+    if (us > v->ctr.c[kAvbCtrHarvestMaxUs]) {
+        v->ctr.c[kAvbCtrHarvestMaxUs] = us;
+    }
     if (ok(v) && v->stage == kAvbStageDatapath) {
         armTimer(v);
     }
@@ -2257,7 +2274,12 @@ AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOU
         }
         uint64_t accepted = 0;
         uint64_t mach = 0;
+        const uint64_t t0 = mach_absolute_time();
         const kern_return_t ret = sendFrames(v, bytes, static_cast<uint32_t>(len), &accepted, &mach);
+        const uint64_t us = machToUs(v, mach_absolute_time() - t0);
+        if (us > v->ctr.c[kAvbCtrSendBatchMaxUs]) {
+            v->ctr.c[kAvbCtrSendBatchMaxUs] = us;
+        }
         a->scalarOutput[0] = accepted;
         a->scalarOutput[1] = mach;
         return ret;

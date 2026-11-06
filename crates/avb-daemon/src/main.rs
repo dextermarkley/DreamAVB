@@ -21,6 +21,7 @@ mod audio;
 mod clocksrc;
 mod dextio;
 mod exit;
+mod flightrec;
 mod gptpsvc;
 mod listenerrx;
 mod log;

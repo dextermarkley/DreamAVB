@@ -47,6 +47,103 @@ pub struct RealDext {
     /// the next boot. Calling a selector it does not implement would fail
     /// every send in that window.
     send_frames: bool,
+    /// `AVB_TXCAP`, read once: an environment lookup takes a process-wide
+    /// lock, and `send`/`send_batch` run on the real-time talker thread.
+    txcap: Option<String>,
+    /// The last control frames sent and received (see `flightrec`).
+    pub recorder: crate::flightrec::FlightRecorder,
+    /// How long each kind of dext call took since the last `take_call_stats`.
+    calls: CallStats,
+}
+
+/// The dext user-client calls the talker loop makes, for [`CallStats`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DextCall {
+    Send = 0,
+    SendBatch = 1,
+    PollTxTs = 2,
+    ReadClock = 3,
+    Other = 4,
+}
+
+impl DextCall {
+    pub const ALL: [DextCall; 5] = [
+        DextCall::Send,
+        DextCall::SendBatch,
+        DextCall::PollTxTs,
+        DextCall::ReadClock,
+        DextCall::Other,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            DextCall::Send => "send",
+            DextCall::SendBatch => "send_batch",
+            DextCall::PollTxTs => "poll_tx_ts",
+            DextCall::ReadClock => "read_clock",
+            DextCall::Other => "other",
+        }
+    }
+}
+
+/// A call longer than this is counted as slow: one class-A interval would be
+/// 125 us, and 500 us already costs the talker several of them.
+pub const SLOW_CALL_NS: u64 = 500_000;
+
+/// Per-call-kind duration statistics. Each user-client call is a round trip
+/// to the dext's single dispatch queue, which also runs the 1 ms RX harvest,
+/// so a call that waits behind a long harvest is how the dext stalls the
+/// talker. Pure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallStats {
+    pub calls: [u64; 5],
+    pub max_ns: [u64; 5],
+    pub slow: [u64; 5],
+}
+
+impl CallStats {
+    pub fn record(&mut self, call: DextCall, ns: u64) {
+        let i = call as usize;
+        if let (Some(c), Some(m), Some(s)) = (
+            self.calls.get_mut(i),
+            self.max_ns.get_mut(i),
+            self.slow.get_mut(i),
+        ) {
+            *c += 1;
+            *m = (*m).max(ns);
+            if ns > SLOW_CALL_NS {
+                *s += 1;
+            }
+        }
+    }
+
+    /// One log fragment, e.g. `send_batch n=80000 max=4115us slow=12`, for
+    /// every kind that was called.
+    pub fn summary(&self) -> String {
+        DextCall::ALL
+            .iter()
+            .filter_map(|&k| {
+                let i = k as usize;
+                let n = *self.calls.get(i)?;
+                (n > 0).then(|| {
+                    format!(
+                        "{} n={n} max={}us slow={}",
+                        k.name(),
+                        self.max_ns.get(i).copied().unwrap_or(0) / 1000,
+                        self.slow.get(i).copied().unwrap_or(0)
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Time `f` as one `call` into `stats`.
+fn timed<T>(stats: &mut CallStats, call: DextCall, f: impl FnOnce() -> T) -> T {
+    let t0 = std::time::Instant::now();
+    let r = f();
+    stats.record(call, t0.elapsed().as_nanos() as u64);
+    r
 }
 
 impl RealDext {
@@ -72,7 +169,15 @@ impl RealDext {
             consumer_map: None,
             shm_generation: 0,
             send_frames,
+            txcap: std::env::var("AVB_TXCAP").ok(),
+            recorder: crate::flightrec::FlightRecorder::default(),
+            calls: CallStats::default(),
         }
+    }
+
+    /// The call statistics since the last take, resetting them.
+    pub fn take_call_stats(&mut self) -> CallStats {
+        std::mem::take(&mut self.calls)
     }
 
     /// Map the RX memory (read-only) and the consumer tails (read-write) and
@@ -131,10 +236,14 @@ impl DextPort for RealDext {
         // we transmit to a pcap (link-type EN10MB), so our on-wire bytes can
         // be byte-diffed against a known-good capture. The I210 cannot be
         // tcpdump'd while our dext owns it, so this is our only TX visibility.
-        if let Ok(path) = std::env::var("AVB_TXCAP") {
-            append_pcap(&path, frame);
+        if let Some(path) = &self.txcap {
+            append_pcap(path, frame);
         }
-        match self.dev.send_frame(frame, want_ts) {
+        self.recorder.record(crate::flightrec::unix_now_ns(), frame);
+        let dev = &self.dev;
+        match timed(&mut self.calls, DextCall::Send, || {
+            dev.send_frame(frame, want_ts)
+        }) {
             Ok((seq, _)) => {
                 if want_ts {
                     // Keep the hw sequence to query GetTxTimestamp, and the
@@ -175,12 +284,15 @@ impl DextPort for RealDext {
                 stopped_by: None,
             };
         }
-        if let Ok(path) = std::env::var("AVB_TXCAP") {
+        if let Some(path) = &self.txcap {
             for f in frames {
-                append_pcap(&path, f);
+                append_pcap(path, f);
             }
         }
-        match self.dev.send_frames(frames) {
+        let dev = &self.dev;
+        match timed(&mut self.calls, DextCall::SendBatch, || {
+            dev.send_frames(frames)
+        }) {
             Ok((accepted, _)) => BatchResult {
                 accepted: accepted as usize,
                 stopped_by: None,
@@ -214,7 +326,10 @@ impl DextPort for RealDext {
         let Some((seq, tag)) = self.pending_ts else {
             return TxTsResult::Idle;
         };
-        match self.dev.get_tx_timestamp(seq) {
+        let dev = &self.dev;
+        match timed(&mut self.calls, DextCall::PollTxTs, || {
+            dev.get_tx_timestamp(seq)
+        }) {
             Ok((status, systim_ns, _)) => match status {
                 avb_dext::abi::TX_TS_OK => {
                     self.pending_ts = None;
@@ -235,7 +350,8 @@ impl DextPort for RealDext {
     }
 
     fn read_clock(&mut self) -> (MachTicks, u64) {
-        match self.dev.read_clock(1) {
+        let dev = &self.dev;
+        match timed(&mut self.calls, DextCall::ReadClock, || dev.read_clock(1)) {
             Ok(samples) => match samples.first() {
                 // mach_before/mach_after bracket the SYSTIM read; use the
                 // midpoint as the mach instant of eav_ns.
@@ -258,7 +374,8 @@ impl DextPort for RealDext {
     }
 
     fn adj_freq(&mut self, ppb: i64) {
-        let _ = self.dev.adj_freq(ppb);
+        let dev = &self.dev;
+        let _ = timed(&mut self.calls, DextCall::Other, || dev.adj_freq(ppb));
     }
 
     fn set_filter(&mut self, streams: &[(u64, [u8; 6], u16)]) {
@@ -290,6 +407,8 @@ impl DextPort for RealDext {
             let mut out = Vec::new();
             rings.drain(Ring::Ctl, avb_dext::abi::RX_BATCH_MAX, |slot| {
                 if let Ok(s) = slot {
+                    self.recorder
+                        .record(crate::flightrec::unix_now_ns(), s.data());
                     out.push(RxSlot {
                         cls: s.cls() as u8,
                         data: s.data().to_vec(),

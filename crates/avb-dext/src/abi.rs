@@ -613,12 +613,20 @@ pub mod ctr {
     pub const STOP_BLOCK_TIMEOUTS: usize = 40;
     /// BCM: config-window access delayed to clear a recent TX doorbell.
     pub const DOORBELL_GUARD_WAITS: usize = 41;
+    /// BCM: timer harvests longer than 500 us.
+    pub const HARVEST_SLOW_TICKS: usize = 42;
+    /// BCM: longest timer harvest, us (a maximum).
+    pub const HARVEST_MAX_US: usize = 43;
+    /// BCM: stamp-ring refreshes (config-window reads).
+    pub const STAMP_REFRESHES: usize = 44;
+    /// BCM: longest SendFrames inside the dext, us (a maximum).
+    pub const SEND_BATCH_MAX_US: usize = 45;
     pub const COUNT: usize = 64;
 }
 
 /// Every defined counter index with its stable name, ascending. Index 7 is
 /// reserved and has no name.
-pub const COUNTER_NAMES: [(usize, &str); 41] = [
+pub const COUNTER_NAMES: [(usize, &str); 45] = [
     (ctr::RX_FRAMES, "rx_frames"),
     (1, "rx_gptp"),
     (2, "rx_msrp"),
@@ -660,6 +668,10 @@ pub const COUNTER_NAMES: [(usize, &str); 41] = [
     (ctr::STAMP_SKIPPED, "stamp_skipped"),
     (ctr::STOP_BLOCK_TIMEOUTS, "stop_block_timeouts"),
     (ctr::DOORBELL_GUARD_WAITS, "doorbell_guard_waits"),
+    (ctr::HARVEST_SLOW_TICKS, "harvest_slow_ticks"),
+    (ctr::HARVEST_MAX_US, "harvest_max_us"),
+    (ctr::STAMP_REFRESHES, "stamp_refreshes"),
+    (ctr::SEND_BATCH_MAX_US, "send_batch_max_us"),
 ];
 
 pub fn counter_name(index: usize) -> Option<&'static str> {
@@ -682,7 +694,7 @@ const _: () = assert!(
     ctr::RX_CLASS_BASE + RX_CLASS_COUNT as usize == ctr::RX_DROP_OTHER,
     "class counters 1..7"
 );
-const _: () = assert!(ctr::DOORBELL_GUARD_WAITS < ctr::COUNT, "counter space");
+const _: () = assert!(ctr::SEND_BATCH_MAX_US < ctr::COUNT, "counter space");
 const _: () = assert!(RX_MEM_SIZE == 17_842_176, "rx mem size");
 const _: () = assert!(
     RX_CTL_SLOTS.is_power_of_two() && RX_AUDIO_SLOTS.is_power_of_two(),
@@ -1025,6 +1037,7 @@ mod tests {
         assert_eq!(ctr::STAMP_HIT, 37);
         assert_eq!(ctr::STOP_BLOCK_TIMEOUTS, 40);
         assert_eq!(ctr::DOORBELL_GUARD_WAITS, 41);
+        assert_eq!(ctr::SEND_BATCH_MAX_US, 45);
         assert_eq!(ctr::COUNT, 64);
         assert_eq!(class_counter_index(RxClass::Gptp), 1);
         assert_eq!(class_counter_index(RxClass::Msrp), 2);
@@ -1034,9 +1047,7 @@ mod tests {
         assert_eq!(class_counter_index(RxClass::Stream), 6);
         // Names: every index 0..=40 except the reserved 7, ascending, unique.
         let idx: Vec<usize> = COUNTER_NAMES.iter().map(|(i, _)| *i).collect();
-        let want: Vec<usize> = (0..=ctr::DOORBELL_GUARD_WAITS)
-            .filter(|i| *i != 7)
-            .collect();
+        let want: Vec<usize> = (0..=ctr::SEND_BATCH_MAX_US).filter(|i| *i != 7).collect();
         assert_eq!(idx, want);
         let mut names: Vec<&str> = COUNTER_NAMES.iter().map(|(_, n)| *n).collect();
         names.sort_unstable();

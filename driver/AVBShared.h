@@ -346,6 +346,10 @@ enum AvbCounterIndex : uint32_t {
     kAvbCtrStampSkipped = 39,       // event frame delivered unstamped: TX latch pending or epoch unseeded
     kAvbCtrStopBlockTimeouts = 40,  // shutdown found a block that would not stop (logged, not a fault)
     kAvbCtrDoorbellGuardWaits = 41, // BCM: config-window access delayed to clear a recent TX doorbell
+    kAvbCtrHarvestSlowTicks = 42,   // BCM: timer harvest that ran longer than 500 us
+    kAvbCtrHarvestMaxUs = 43,       // BCM: longest timer harvest, us (a maximum, not a count)
+    kAvbCtrStampRefreshes = 44,     // BCM: stamp-ring refreshes (each reads config-window words)
+    kAvbCtrSendBatchMaxUs = 45,     // BCM: longest SendFrames call inside the dext, us (a maximum)
     kAvbCtrCount = 64,
 };
 struct AvbCounters { uint64_t c[kAvbCtrCount]; };   // 512 B
@@ -413,7 +417,7 @@ static_assert((AVB_RX_CTL_SLOTS & (AVB_RX_CTL_SLOTS - 1)) == 0 &&
 static_assert(kAvbCtrRxOversize < kAvbCtrCount, "counter space");
 static_assert(kAvbCtrTxBatchRejected < kAvbCtrCount, "batch counter space");
 static_assert(kAvbCtrStopBlockTimeouts < kAvbCtrCount, "stamp counter space");
-static_assert(kAvbCtrDoorbellGuardWaits < kAvbCtrCount, "guard counter space");
+static_assert(kAvbCtrSendBatchMaxUs < kAvbCtrCount, "timing counter space");
 static_assert(kAvbCtrRxClassBase + AVB_RX_CLASS_COUNT == kAvbCtrRxDropOther, "class counters 1..7");
 // (uint32_t cast: C++20 deprecates arithmetic between two enumeration types.)
 static_assert(uint32_t(kAvbCtrRxClassBase) + kAvbRxGptp - 1 == 1 &&

@@ -42,6 +42,9 @@ struct StreamState {
     /// Highest absolute frame written +1 for this stream.
     written_upto: u64,
     active: bool,
+    /// Highest frame of this stream's lagging span already counted as a gap,
+    /// so a stream that stays behind is not re-counted on every commit.
+    gap_counted_upto: u64,
 }
 
 /// The ring producer. Holds `&AudioRing` plus per-stream frontier state and
@@ -79,6 +82,7 @@ impl<'a> Producer<'a> {
                 channels,
                 written_upto: 0,
                 active: true,
+                gap_counted_upto: 0,
             })
             .collect();
         Self {
@@ -238,16 +242,30 @@ impl<'a> Producer<'a> {
             .unwrap_or(self.committed);
         // Minimum over active streams, treating a lagging stream as gapped.
         let mut frontier = furthest;
-        for (i, s) in self.streams.iter().enumerate() {
+        let mut gaps: [(u64, u64); layout::MAX_STREAMS] = [(0, 0); layout::MAX_STREAMS];
+        for (i, s) in self.streams.iter_mut().enumerate() {
             if !s.active {
                 continue;
             }
             if furthest.saturating_sub(s.written_upto) > self.lag_frames {
-                // Lagging: it is passed, its span logged as a gap.
-                let gap = furthest.saturating_sub(s.written_upto);
-                self.log_gap(i, s.written_upto, gap, GapReason::LaggingStream);
+                // Lagging: it is passed, its span logged as a gap. Only the
+                // part not counted on an earlier commit: a stream that stays
+                // behind used to add its WHOLE lag every commit, which summed
+                // to 2.5e14 "gap frames" in one 10-minute run.
+                let from = s.written_upto.max(s.gap_counted_upto);
+                if furthest > from {
+                    if let Some(g) = gaps.get_mut(i) {
+                        *g = (from, furthest - from);
+                    }
+                    s.gap_counted_upto = furthest;
+                }
             } else {
                 frontier = frontier.min(s.written_upto);
+            }
+        }
+        for (i, &(from, frames)) in gaps.iter().enumerate() {
+            if frames > 0 {
+                self.log_gap(i, from, frames, GapReason::LaggingStream);
             }
         }
         if frontier > self.committed {
