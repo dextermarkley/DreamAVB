@@ -619,7 +619,7 @@ pub mod ctr {
     pub const HARVEST_MAX_US: usize = 43;
     /// BCM: stamp-ring refreshes (config-window reads).
     pub const STAMP_REFRESHES: usize = 44;
-    /// BCM: longest SendFrames inside the dext, us (a maximum).
+    /// BCM: longest SendFrames inside the dext incl. lock wait, us (a maximum).
     pub const SEND_BATCH_MAX_US: usize = 45;
     pub const COUNT: usize = 64;
 }

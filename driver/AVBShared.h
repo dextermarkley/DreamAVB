@@ -349,7 +349,7 @@ enum AvbCounterIndex : uint32_t {
     kAvbCtrHarvestSlowTicks = 42,   // BCM: timer harvest that ran longer than 500 us
     kAvbCtrHarvestMaxUs = 43,       // BCM: longest timer harvest, us (a maximum, not a count)
     kAvbCtrStampRefreshes = 44,     // BCM: stamp-ring refreshes (each reads config-window words)
-    kAvbCtrSendBatchMaxUs = 45,     // BCM: longest SendFrames call inside the dext, us (a maximum)
+    kAvbCtrSendBatchMaxUs = 45,     // BCM: longest SendFrames inside the dext incl. lock wait, us (a maximum)
     kAvbCtrCount = 64,
 };
 struct AvbCounters { uint64_t c[kAvbCtrCount]; };   // 512 B

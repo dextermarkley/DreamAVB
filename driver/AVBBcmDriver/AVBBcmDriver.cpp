@@ -106,6 +106,12 @@ struct AVBBcmDriver_IVars {
     // access (so no doorbell can land inside or just before one).
     IODispatchQueue * txQueue;
     IOLock * txLock;
+    // Sends waiting for txLock (atomic). A mutex does not hand off in arrival
+    // order, so a multi-word stamp refresh re-took the lock between words and
+    // a waiting SendFrames sat out the whole refresh (measured: 680-1300 us
+    // from the daemon while the dext body took <= 42 us). The harvest yields
+    // to a waiting send before each window word instead.
+    uint32_t txWaiting;
     IOTimerDispatchSource * timer;
     OSAction * timerAction;
     bool timerRunning;
@@ -328,6 +334,20 @@ struct TxGuard {
     TxGuard & operator=(const TxGuard &) = delete;
 };
 
+// Let a send that is waiting for txLock take it before this thread does.
+// Called only from the default queue (window accesses never run on the TX
+// queue), so it cannot wait on itself. Bounded: past kTxYieldMaxUs the
+// harvest proceeds anyway rather than stall the RX path behind a stuck send.
+constexpr uint32_t kTxYieldMaxUs = 2000;
+
+static void yieldToTx(IV * v)
+{
+    for (uint32_t waited = 0;
+         waited < kTxYieldMaxUs && __atomic_load_n(&v->txWaiting, __ATOMIC_ACQUIRE) != 0; waited++) {
+        IODelay(1);
+    }
+}
+
 // Internal memory (RX/TX-CPU scratch at 0x30000/0x34000) through the register
 // indirect window. Matches ThunderGate: write the big-endian-assembled word
 // as-is, byte-swap on read (their htonl), restore the base to 0 after.
@@ -335,6 +355,7 @@ struct TxGuard {
 // one window word, where it used to wait out a whole multi-word refresh.
 static void regWinWrite(IV * v, uint32_t winAddr, uint32_t word)
 {
+    yieldToTx(v);
     TxGuard g(v);
     guardDoorbell(v);
     cfgWr32(v, bcm::kRegWinBase, winAddr);
@@ -350,6 +371,7 @@ static uint32_t regWinRead(IV * v, uint32_t winAddr)
     // it correctly). No byte swap here -- ThunderGate's htonl compensated for
     // its own Python/userclient layer, which DriverKit config access does not
     // impose.
+    yieldToTx(v);
     TxGuard g(v);
     guardDoorbell(v);
     cfgWr32(v, bcm::kRegWinBase, winAddr);
@@ -2207,7 +2229,18 @@ AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOU
     // in short pieces.
     const bool selfLocking = selector == kAvbSelLoadCoreImage || selector == kAvbSelReadCoreMem ||
                              selector == kAvbSelGetTxTimestamp;
+    // A send announces itself before it waits, so the harvest yields the lock
+    // to it between window words (yieldToTx). Timed from here, so the
+    // SendFrames maximum includes any lock wait.
+    const bool txSel = selector == kAvbSelSendFrame || selector == kAvbSelSendFrames;
+    const uint64_t callStart = mach_absolute_time();
+    if (txSel) {
+        __atomic_add_fetch(&v->txWaiting, 1, __ATOMIC_ACQ_REL);
+    }
     TxGuard g(v, !selfLocking);
+    if (txSel) {
+        __atomic_sub_fetch(&v->txWaiting, 1, __ATOMIC_ACQ_REL);
+    }
     if (isOwnerOnly(selector) && v->owner != nullptr && client != v->owner) {
         return kIOReturnExclusiveAccess;
     }
@@ -2350,9 +2383,8 @@ AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOU
         }
         uint64_t accepted = 0;
         uint64_t mach = 0;
-        const uint64_t t0 = mach_absolute_time();
         const kern_return_t ret = sendFrames(v, bytes, static_cast<uint32_t>(len), &accepted, &mach);
-        const uint64_t us = machToUs(v, mach_absolute_time() - t0);
+        const uint64_t us = machToUs(v, mach_absolute_time() - callStart);
         if (us > v->ctr.c[kAvbCtrSendBatchMaxUs]) {
             v->ctr.c[kAvbCtrSendBatchMaxUs] = us;
         }
