@@ -340,6 +340,11 @@ enum AvbCounterIndex : uint32_t {
     kAvbCtrTxBatches = 34,          // kAvbSelSendFrames calls that queued >= 1 frame
     kAvbCtrTxBatchPartial = 35,     // of those, calls where a later frame was refused
     kAvbCtrTxBatchRejected = 36,    // calls refused whole: malformed, or want_ts requested
+    // BCM RX-CPU stamp path (other NICs leave them 0):
+    kAvbCtrStampHit = 37,           // gPTP event frame given its RX timestamp
+    kAvbCtrStampMiss = 38,          // event frame with no matching stamp-ring entry
+    kAvbCtrStampSkipped = 39,       // event frame delivered unstamped: TX latch pending or epoch unseeded
+    kAvbCtrStopBlockTimeouts = 40,  // shutdown found a block that would not stop (logged, not a fault)
     kAvbCtrCount = 64,
 };
 struct AvbCounters { uint64_t c[kAvbCtrCount]; };   // 512 B
@@ -406,6 +411,7 @@ static_assert((AVB_RX_CTL_SLOTS & (AVB_RX_CTL_SLOTS - 1)) == 0 &&
               (AVB_RX_AUDIO_SLOTS & (AVB_RX_AUDIO_SLOTS - 1)) == 0, "pow2");
 static_assert(kAvbCtrRxOversize < kAvbCtrCount, "counter space");
 static_assert(kAvbCtrTxBatchRejected < kAvbCtrCount, "batch counter space");
+static_assert(kAvbCtrStopBlockTimeouts < kAvbCtrCount, "stamp counter space");
 static_assert(kAvbCtrRxClassBase + AVB_RX_CLASS_COUNT == kAvbCtrRxDropOther, "class counters 1..7");
 // (uint32_t cast: C++20 deprecates arithmetic between two enumeration types.)
 static_assert(uint32_t(kAvbCtrRxClassBase) + kAvbRxGptp - 1 == 1 &&

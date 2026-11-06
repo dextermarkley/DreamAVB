@@ -20,7 +20,7 @@
 //   Stage A (Start): host control + MEMARB enable + GRC_MODE |= TIME_SYNC_ENABLE.
 //                    No chip reset, no DMA.
 //   Stage B (kAvbSelInitDatapath): core reset, one std RX ring, one RX return
-//                    ring, one TX ring, RX PTP filter, polled by a 2 ms timer.
+//                    ring, one TX ring, RX PTP filter, polled by a 1 ms timer.
 
 #include <os/log.h>
 
@@ -57,6 +57,9 @@ constexpr uint32_t kRxBufSize     = 2048;   // per RX buffer (DMA size 1536)
 // 64 in flight holds four full 16-frame batches while the status-block TX
 // consumer catches up; the 512-entry TX ring is a multiple of it.
 constexpr uint32_t kTxSlots       = 64;     // TX bounce buffers / max in flight
+// slot = txProd % kTxSlots never aliases an in-flight BD only if the ring is
+// a multiple of the window.
+static_assert(bcm::kTxRingSize % kTxSlots == 0, "TX ring is a multiple of the in-flight window");
 constexpr uint32_t kTxBufSize     = 2048;
 constexpr uint32_t kSwRingSize    = 256;    // software RX ring (power of two)
 constexpr uint64_t kTimerPeriodNs = 1000000;      // 1 ms
@@ -1046,7 +1049,8 @@ constexpr uint32_t kDoneMagic  = 0x444F4E45u;
 constexpr uint32_t kProd       = 0x0800BFF0u;  // ring producer count
 constexpr uint32_t kRingBase   = 0x0800C000u;  // 256 x {eavLo, meta} 8-byte slots
 constexpr uint32_t kRingMask   = 0xffu;        // 256 entries (power of two)
-constexpr uint32_t kScanWindow = 16u;          // newest N slots to search
+constexpr uint32_t kRefreshWindow = 4u;        // max new slots read per refresh
+static_assert(kRefreshWindow <= kRxCpuStampCacheSize, "refresh fits the host cache");
 }  // namespace rxcpu
 
 static uint32_t readScratch(IV * v, uint32_t virt)
@@ -1085,7 +1089,15 @@ static void refreshStampCache(IV * v)
 {
     RxCpuStampCache & c = v->stampCache;
     const uint32_t prod = readScratch(v, rxcpu::kProd);
-    for (uint32_t i = stampReadStart(c.seen, prod, rxcpu::kScanWindow); i != prod; i++) {
+    if (prod < c.seen) {
+        // The firmware restarted its count (reloaded): every cached entry
+        // belongs to the previous run and could match a new frame's key.
+        c.count = 0;
+    }
+    // At most rxcpu::kRefreshWindow new entries per refresh: each costs one
+    // or two ~145 us config-window words on the queue that also serves
+    // SendFrames, and one gPTP event frame normally adds one entry.
+    for (uint32_t i = stampReadStart(c.seen, prod, rxcpu::kRefreshWindow); i != prod; i++) {
         const uint32_t base = rxcpu::kRingBase + (i & rxcpu::kRingMask) * 8u;
         const uint32_t meta = readScratch(v, base + 4u);
         RxCpuStamp s = decodeRxCpuStamp(0, meta);
@@ -1112,6 +1124,13 @@ static void attachRxCpuStamp(IV * v, const uint8_t * frame, uint32_t len, AvbRxE
     if (!rxCpuStampReady(v)) {
         return;
     }
+    // The high 32 bits come only from a TX latch (EAV MSB reads 0 on this
+    // part). Before the first one, a reconstructed time would be in the wrong
+    // epoch: deliver unstamped rather than wrong.
+    if (!v->eavSeeded) {
+        v->ctr.c[kAvbCtrStampSkipped]++;
+        return;
+    }
     uint32_t eavLo = 0;
     bool hit = matchRxCpuStamp(v->stampCache.e, v->stampCache.count, msgType, seq, &eavLo);
     if (!hit && !*refreshed) {
@@ -1122,7 +1141,18 @@ static void attachRxCpuStamp(IV * v, const uint8_t * frame, uint32_t len, AvbRxE
     if (hit) {
         e.hw_ts = reconstructRxTs(v, eavLo);
         e.has_ts = 1;
+        v->ctr.c[kAvbCtrStampHit]++;
+    } else {
+        v->ctr.c[kAvbCtrStampMiss]++;
     }
+}
+
+// An event-message gPTP frame (one that needs an RX timestamp)?
+static bool isGptpEventFrame(const uint8_t * frame, uint32_t len)
+{
+    uint8_t msgType = 0;
+    uint16_t seq = 0;
+    return parseGptpStampKey(frame, len, &msgType, &seq) && isPtpEventMsg(msgType);
 }
 
 // tg3_abort_hw order for a 5705_PLUS part (RCVLSC/DMAC/MBFREE/BUFMGR/MEMARB
@@ -1161,13 +1191,16 @@ static void abortHw(IV * v)
     // so this is benign; latching kAvbFaultStopBlock only wedged the device
     // (all MMIO refused) until a physical replug. Log and move on.
     if (!allStopped) {
+        // Counted, so a chip that keeps refusing to stop stays visible
+        // (avb-probe counters: stop_block_timeouts) without wedging it.
+        v->ctr.c[kAvbCtrStopBlockTimeouts]++;
         LOG("abortHw: a block enable bit did not clear during shutdown "
             "(expected with stamper loaded; chipReset on next InitDatapath clears it)");
     }
 }
 
 // ---------------------------------------------------------------------------
-// Harvest (2 ms timer and start of kAvbSelPollRx)
+// Harvest (1 ms timer and start of kAvbSelPollRx)
 
 static void swPush(IV * v, const AvbRxEntry & e)
 {
@@ -1263,13 +1296,13 @@ static bool drainReturnRing(IV * v, RingTick * tick, const volatile RxBd * ret, 
     uint32_t cons = *consp;
     // Reading the RX-CPU stamp ring goes through the config-space register
     // window, and a config-space indirect access landing in the ~13 us window
-    // after a TX doorbell corrupts the MAC's TX_TSTAMP latch. While a
-    // timestamped TX is outstanding, skip ALL ring reads (short-circuit so not
-    // even the DONE-signature probe runs); the firmware keeps stamping into the
-    // 256-entry ring, so the frame is picked up on a later harvest once the TX
-    // timestamp has latched and tsPending clears.
-    // The DONE probe and ring reads now happen only when a gPTP event frame is
-    // drained (attachRxCpuStamp); they used to run on every 1 ms tick.
+    // after a TX doorbell corrupts the MAC's TX_TSTAMP latch. So no ring read
+    // while a timestamped TX is outstanding. harvestRx runs checkTx first, so
+    // a latch that has already happened (the usual case: the peer's
+    // Pdelay_Resp arrives after our Pdelay_Req went out) clears tsPending
+    // before this; an event frame that still meets a pending TX is delivered
+    // unstamped and counted (kAvbCtrStampSkipped). It is NOT picked up later:
+    // the frame has left the ring by then.
     const bool stampReady = !v->tsPending && v->rxcpuStamp;
     bool stampRefreshed = false;
     while (cons != hwProd && ok(v)) {
@@ -1314,6 +1347,8 @@ static bool drainReturnRing(IV * v, RingTick * tick, const volatile RxBd * ret, 
                 // latch path (neither works on this 57766-class part).
                 if (stampReady) {
                     attachRxCpuStamp(v, frame, flen, e, &stampRefreshed);
+                } else if (v->rxcpuStamp && isGptpEventFrame(frame, flen)) {
+                    v->ctr.c[kAvbCtrStampSkipped]++;
                 }
                 if (tick->ringMode) {
                     deliverRing(v, tick, frame, flen, e);
@@ -1334,8 +1369,14 @@ static bool drainReturnRing(IV * v, RingTick * tick, const volatile RxBd * ret, 
     return reposted;
 }
 
+static void checkTx(IV * v);
+
 static void harvestRx(IV * v)
 {
+    // Resolve a TX timestamp that has already latched BEFORE draining: the
+    // drain skips stamping while tsPending, and the peer's reply to our
+    // timestamped Pdelay_Req is usually in this very batch. BAR reads only.
+    checkTx(v);
     uint8_t sb[0x14];
     readStatusBlock(v, sb);
     bool reposted = false;
@@ -2012,10 +2053,37 @@ static kern_return_t setStructOut(IOUserClientMethodArguments * a, const void * 
     return a->structureOutput != nullptr ? kIOReturnSuccess : kIOReturnNoMemory;
 }
 
+// Selectors that change the device, or touch the config-space window (which
+// can corrupt a pending TX timestamp latch). While a client owns the rings,
+// only that client may issue them: a second connection could otherwise shut
+// the datapath down under the daemon, drain its frames, or load code onto the
+// DMA-capable RX CPU. Same rule as the I210 dext, plus the RX-CPU selectors.
+static bool isOwnerOnly(uint64_t selector)
+{
+    switch (selector) {
+    case kAvbSelSetClock:
+    case kAvbSelAdjFreq:
+    case kAvbSelInitDatapath:
+    case kAvbSelPollRx:
+    case kAvbSelSendFrame:
+    case kAvbSelSendFrames:
+    case kAvbSelGetTxTimestamp:
+    case kAvbSelShutdownDatapath:
+    case kAvbSelLoadCoreImage:
+    case kAvbSelReadCoreMem:
+        return true;
+    default:
+        return false;
+    }
+}
+
 kern_return_t
 AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOUserClientMethodArguments * a)
 {
     IV * v = ivars;
+    if (isOwnerOnly(selector) && v->owner != nullptr && client != v->owner) {
+        return kIOReturnExclusiveAccess;
+    }
     switch (selector) {
     case kAvbSelGetInfo: {
         AvbInfo info{};
@@ -2066,6 +2134,10 @@ AVBBcmDriver::HandleUserMethod(AVBBcmUserClient * client, uint64_t selector, IOU
             return kIOReturnNotReady;
         }
         setClock(v, a->scalarInput[0]);
+        // The software RX high word is only re-learned from a TX latch; after
+        // a clock write it may be in the wrong epoch, so stop stamping until
+        // the next latch reseeds it (attachRxCpuStamp checks eavSeeded).
+        v->eavSeeded = false;
         uint64_t back = 0;
         if (!readTs(v, bcm::kEavRefClkLsb, bcm::kEavRefClkMsb, &back)) {
             return kIOReturnIOError;

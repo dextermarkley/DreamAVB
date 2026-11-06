@@ -602,12 +602,21 @@ pub mod ctr {
     pub const TX_BATCH_PARTIAL: usize = 35;
     /// Calls refused whole: malformed batch, or a timestamp requested.
     pub const TX_BATCH_REJECTED: usize = 36;
+    /// BCM: gPTP event frame given its RX-CPU timestamp.
+    pub const STAMP_HIT: usize = 37;
+    /// BCM: event frame with no matching stamp-ring entry.
+    pub const STAMP_MISS: usize = 38;
+    /// BCM: event frame delivered unstamped (TX latch pending, or the RX
+    /// epoch not yet seeded by a TX latch).
+    pub const STAMP_SKIPPED: usize = 39;
+    /// BCM: shutdown found a block that would not stop (logged, not a fault).
+    pub const STOP_BLOCK_TIMEOUTS: usize = 40;
     pub const COUNT: usize = 64;
 }
 
 /// Every defined counter index with its stable name, ascending. Index 7 is
 /// reserved and has no name.
-pub const COUNTER_NAMES: [(usize, &str); 36] = [
+pub const COUNTER_NAMES: [(usize, &str); 40] = [
     (ctr::RX_FRAMES, "rx_frames"),
     (1, "rx_gptp"),
     (2, "rx_msrp"),
@@ -644,6 +653,10 @@ pub const COUNTER_NAMES: [(usize, &str); 36] = [
     (ctr::TX_BATCHES, "tx_batches"),
     (ctr::TX_BATCH_PARTIAL, "tx_batch_partial"),
     (ctr::TX_BATCH_REJECTED, "tx_batch_rejected"),
+    (ctr::STAMP_HIT, "stamp_hit"),
+    (ctr::STAMP_MISS, "stamp_miss"),
+    (ctr::STAMP_SKIPPED, "stamp_skipped"),
+    (ctr::STOP_BLOCK_TIMEOUTS, "stop_block_timeouts"),
 ];
 
 pub fn counter_name(index: usize) -> Option<&'static str> {
@@ -666,7 +679,7 @@ const _: () = assert!(
     ctr::RX_CLASS_BASE + RX_CLASS_COUNT as usize == ctr::RX_DROP_OTHER,
     "class counters 1..7"
 );
-const _: () = assert!(ctr::TX_BATCH_REJECTED < ctr::COUNT, "counter space");
+const _: () = assert!(ctr::STOP_BLOCK_TIMEOUTS < ctr::COUNT, "counter space");
 const _: () = assert!(RX_MEM_SIZE == 17_842_176, "rx mem size");
 const _: () = assert!(
     RX_CTL_SLOTS.is_power_of_two() && RX_AUDIO_SLOTS.is_power_of_two(),
@@ -1006,6 +1019,8 @@ mod tests {
         assert_eq!(ctr::TX_BATCHES, 34);
         assert_eq!(ctr::TX_BATCH_PARTIAL, 35);
         assert_eq!(ctr::TX_BATCH_REJECTED, 36);
+        assert_eq!(ctr::STAMP_HIT, 37);
+        assert_eq!(ctr::STOP_BLOCK_TIMEOUTS, 40);
         assert_eq!(ctr::COUNT, 64);
         assert_eq!(class_counter_index(RxClass::Gptp), 1);
         assert_eq!(class_counter_index(RxClass::Msrp), 2);
@@ -1013,9 +1028,9 @@ mod tests {
         assert_eq!(class_counter_index(RxClass::Avdecc), 4);
         assert_eq!(class_counter_index(RxClass::Maap), 5);
         assert_eq!(class_counter_index(RxClass::Stream), 6);
-        // Names: every index 0..=36 except the reserved 7, ascending, unique.
+        // Names: every index 0..=40 except the reserved 7, ascending, unique.
         let idx: Vec<usize> = COUNTER_NAMES.iter().map(|(i, _)| *i).collect();
-        let want: Vec<usize> = (0..=ctr::TX_BATCH_REJECTED).filter(|i| *i != 7).collect();
+        let want: Vec<usize> = (0..=ctr::STOP_BLOCK_TIMEOUTS).filter(|i| *i != 7).collect();
         assert_eq!(idx, want);
         let mut names: Vec<&str> = COUNTER_NAMES.iter().map(|(_, n)| *n).collect();
         names.sort_unstable();

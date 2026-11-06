@@ -49,7 +49,7 @@ public:
     void
     ClientGone(AVBBcmUserClient * client) LOCALONLY;
 
-    // 2 ms poll timer: harvests the RX return ring and the pending TX timestamp.
+    // 1 ms poll timer: harvests the RX return ring and the pending TX timestamp.
     virtual void
     TimerFired(OSAction * action, uint64_t time) TYPE(IOTimerDispatchSource::TimerOccurred);
 };
