@@ -93,16 +93,21 @@ impl LatencyProfile {
         rx_ns: 448,
     };
 
-    /// BCM57762 at 1000 Mb/s with our RX-CPU stamping firmware. Empirical fit
-    /// (docs/bcm-firmware-shim-design.md): the raw Pdelay one-way delay on a
-    /// direct cable to the 16R measured ~1372 ns (sd ~49). The RX timestamp is
-    /// taken when the firmware services the RDIQ, not at the MDI, so rx_ns
-    /// carries that (dominant) service latency; tx_ns is the MAC-TX-to-MDI
-    /// estimate. The sum centres the compensated delay near the physical
-    /// minimum; the split is estimated and wants a reference measurement.
+    /// BCM57762 at 1000 Mb/s with our RX-CPU stamping firmware. The RX
+    /// timestamp is taken when the firmware services the RDIQ, not at the
+    /// MDI, so rx_ns carries that (dominant) service latency; tx_ns is the
+    /// MAC-TX-to-MDI estimate; the split is estimated.
+    ///
+    /// The sum was first fitted on a direct cable to the 16R alone (2644 ns),
+    /// which put the compensated delay ~125 ns BELOW the I210's on the same
+    /// partner: 16R direct I210 +147 / BCM +23 ns, MOTU switch I210 +5 / BCM
+    /// −121 ns (2026-11-06). The 16R itself reads ~140 ns high, which hid it;
+    /// the MOTU computes a negative delay from our timestamps and sends the
+    /// port no Sync. Recalibrated against the I210 (the reference): the sum
+    /// drops by 2 x 125 ns, all taken from rx_ns.
     pub const BCM57762_1000: LatencyProfile = LatencyProfile {
         tx_ns: 200,
-        rx_ns: 2444,
+        rx_ns: 2194,
     };
 
     pub const fn tx_c(self, raw: u64) -> u64 {
