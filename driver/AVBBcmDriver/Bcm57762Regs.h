@@ -339,6 +339,11 @@ constexpr uint32_t kMiiBmcr             = 0x00;
 constexpr uint16_t  kBmcrAnRestart      = 0x0200;
 constexpr uint16_t  kBmcrAnEnable       = 0x1000;
 constexpr uint32_t kMiiBmsr             = 0x01;
+// IEEE 802.3 22.2.4 / 40.5.1.1: 1000BASE-T control. Bit 12 enables manual
+// MASTER-SLAVE configuration, bit 11 picks MASTER when it is set.
+constexpr uint32_t kMiiCtrl1000         = 0x09;
+constexpr uint16_t kCtrl1000MsManual    = 1u << 12;
+constexpr uint16_t kCtrl1000MsMaster    = 1u << 11;
 constexpr uint16_t  kBmsrLinkStatus     = 0x0004;
 constexpr uint16_t  kBmsrAnComplete     = 0x0020;
 constexpr uint32_t kMiiAuxStat          = 0x19;

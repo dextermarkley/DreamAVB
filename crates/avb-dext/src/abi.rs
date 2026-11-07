@@ -138,6 +138,10 @@ pub const INIT_FLAG_AVB_RX_RULES: u64 = 1 << 2;
 /// BCM only: load the RX-CPU stamping firmware and attach its per-frame EAV
 /// timestamp to harvested gPTP frames (`AVB_INIT_FLAG_RXCPU_STAMP`).
 pub const INIT_FLAG_RXCPU_STAMP: u64 = 1 << 3;
+/// BCM only, test: force the PHY to 1000BASE-T MASTER (IEEE 802.3 register
+/// 9 manual MASTER-SLAVE config); without it a manual setting is cleared
+/// (`AVB_INIT_FLAG_PHY_MASTER`).
+pub const INIT_FLAG_PHY_MASTER: u64 = 1 << 4;
 
 /// BCM RX-CPU scratch pad (M1 core bring-up): the core's virtual base address
 /// and its size. Images load here and the PC is set to a address within it.

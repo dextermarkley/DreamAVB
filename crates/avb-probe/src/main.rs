@@ -999,10 +999,11 @@ fn decode_phy(r: &[u16; 32]) -> Vec<String> {
             b(aner, 3)
         ),
         format!(
-            "1000BASE-T ctrl 0x{ctrl1000:04x}  we advertise 1000H {} 1000F {}, master/slave manual {}",
+            "1000BASE-T ctrl 0x{ctrl1000:04x}  we advertise 1000H {} 1000F {}, master/slave manual {} (manual value MASTER {})",
             b(ctrl1000, 8),
             b(ctrl1000, 9),
-            b(ctrl1000, 12)
+            b(ctrl1000, 12),
+            b(ctrl1000, 11)
         ),
         format!(
             "1000BASE-T stat 0x{stat1000:04x}  partner 1000H {} 1000F {}, we are {}, idle errors {}",
@@ -1012,6 +1013,25 @@ fn decode_phy(r: &[u16; 32]) -> Vec<String> {
             stat1000 & 0xff
         ),
         format!("ext status 0x{estat:04x}       1000T-F {} 1000T-H {}", b(estat, 13), b(estat, 12)),
+        // 1000BASE-T status 13/12: local / remote receiver OK; 15:
+        // MASTER-SLAVE configuration fault (IEEE 802.3 22.2.4.3.8).
+        format!(
+            "1000BASE-T rx    local_rx_ok {} remote_rx_ok {} ms_fault {}",
+            b(stat1000, 13),
+            b(stat1000, 12),
+            b(stat1000, 15)
+        ),
+        // Broadcom PHY counters (public BCM54xx-family PHY datasheets): 0x12
+        // receive errors, 0x13 false carrier sense, 0x14 receiver NOT_OK
+        // (local high byte, remote low byte). They count what THIS PHY
+        // receives: the link partner -> us direction.
+        format!(
+            "counters         rx_errors {} false_carrier {} rx_not_ok local {} remote {}",
+            r.get(0x12).copied().unwrap_or(0),
+            r.get(0x13).copied().unwrap_or(0),
+            r.get(0x14).copied().unwrap_or(0) >> 8,
+            r.get(0x14).copied().unwrap_or(0) & 0xff
+        ),
     ]
 }
 

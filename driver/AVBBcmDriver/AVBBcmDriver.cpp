@@ -750,8 +750,34 @@ static void eeeMacLpiOff(IV * v)
     LOG("eee: CPMU 0x36B0 0x%08x -> 0x%08x (LPI_ENABLE, LPI_IN_TX cleared)", mode, rd(v, kCpmuEeeMode));
 }
 
+// 1000BASE-T MASTER-SLAVE (IEEE 802.3 22.2.4.3.7, 40.5.1.1), a link test:
+// with `master` force manual MASTER; without it, clear a manual setting an
+// earlier run left so resolution is automatic again. Register 9 is read
+// first and every change logged. Returns whether it changed (autoneg must
+// restart for the new setting to take effect).
+static bool phyMasterSlave(IV * v, bool master)
+{
+    uint16_t c = 0;
+    if (!miRead(v, bcm::kMiiCtrl1000, &c)) {
+        LOG("phy: reg 9 read failed; MASTER-SLAVE left as is");
+        return false;
+    }
+    const uint16_t ms = bcm::kCtrl1000MsManual | bcm::kCtrl1000MsMaster;
+    const uint16_t want = master ? static_cast<uint16_t>(c | ms) : static_cast<uint16_t>(c & ~ms);
+    if (want == c) {
+        LOG("phy: reg 9 0x%04x, MASTER-SLAVE %s already", c, master ? "manual MASTER" : "automatic");
+        return false;
+    }
+    const bool wrote = miWrite(v, bcm::kMiiCtrl1000, want);
+    uint16_t back = 0xffff;
+    (void)miRead(v, bcm::kMiiCtrl1000, &back);
+    LOG("phy: reg 9 0x%04x -> 0x%04x (%s; write %d, reads back 0x%04x)", c, want,
+        master ? "force MASTER" : "automatic MASTER-SLAVE", wrote, back);
+    return wrote;
+}
+
 // Autonegotiate if needed (no PHY reset), wait for link, set MAC port mode.
-static void setupLink(IV * v)
+static void setupLink(IV * v, bool phyMaster)
 {
     v->flags &= ~(AVB_FLAG_LINK_UP | AVB_FLAG_1000FD);
     uint16_t bmcr = 0;
@@ -760,9 +786,11 @@ static void setupLink(IV * v)
         LOG("datapath: BMCR read failed");
         return;
     }
-    if (eeeAdvertOff(v)) {
-        // Renegotiate so the 16R sees no EEE ability and LPI stays off.
-        LOG("eee: restarting autoneg (BMCR 0x%04x)", bmcr);
+    const bool msChanged = phyMasterSlave(v, phyMaster);
+    if (eeeAdvertOff(v) || msChanged) {
+        // Renegotiate so the 16R sees no EEE ability (LPI stays off) and the
+        // MASTER-SLAVE setting takes effect.
+        LOG("phy: restarting autoneg (BMCR 0x%04x)", bmcr);
         if (!miWrite(v, bcm::kMiiBmcr, static_cast<uint16_t>(bmcr | bcm::kBmcrAnEnable | bcm::kBmcrAnRestart))) {
             return;
         }
@@ -1053,7 +1081,7 @@ static bool resetHw(IV * v, uint64_t initFlags)
     IODelay(10);
     wrFlush(v, bcm::kMacLowWmarkMaxRx, 1);  // 57765_CLASS
 
-    setupLink(v);
+    setupLink(v, (initFlags & AVB_INIT_FLAG_PHY_MASTER) != 0);
     if (!ok(v)) {
         return false;
     }

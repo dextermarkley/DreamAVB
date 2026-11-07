@@ -92,6 +92,10 @@ enum AvbMemType : uint64_t {
 // messageType + sequenceId). This is our own RX-timestamp path, independent of
 // the (non-functional on this part) MAC RX_TSTAMP latch.
 #define AVB_INIT_FLAG_RXCPU_STAMP  (1u << 3)
+// BCM only, test: force the PHY to 1000BASE-T MASTER (IEEE 802.3 clause 22
+// register 9, MASTER-SLAVE manual config) before autonegotiation. Without the
+// flag, a manual setting left by an earlier run is cleared back to automatic.
+#define AVB_INIT_FLAG_PHY_MASTER   (1u << 4)
 
 // AvbInfo.stage
 enum AvbStage : uint32_t {

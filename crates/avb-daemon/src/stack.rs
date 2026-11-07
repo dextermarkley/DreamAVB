@@ -124,6 +124,22 @@ fn bring_up(opts: &GlobalOpts, log: &Logger) -> Result<RealDext, Exit> {
     // from our RX-CPU stamping firmware, enabled by RXCPU_STAMP and loaded
     // below. The I210 ignores the flag.
     let mut init_flags = avb_dext::abi::INIT_FLAG_PROMISC | avb_dext::abi::INIT_FLAG_RX_PTP_V2_L2;
+    // Test hook (AVB_DEBUG_PHY_MASTER=1, BCM only): force the PHY to
+    // 1000BASE-T MASTER. Without it the dext restores automatic resolution,
+    // so a forced setting never outlives the run that asked for it.
+    // InitDatapath is a no-op on a datapath that is already up, so the hook
+    // takes it down first; the PHY setting is applied only at link setup.
+    if is_bcm && std::env::var_os("AVB_DEBUG_PHY_MASTER").is_some() {
+        init_flags |= avb_dext::abi::INIT_FLAG_PHY_MASTER;
+        log.log(
+            Level::Warn,
+            "dext",
+            "TEST HOOK: AVB_DEBUG_PHY_MASTER — PHY forced to 1000BASE-T MASTER",
+        );
+        if info.stage == avb_dext::abi::STAGE_DATAPATH {
+            shutdown_for_recovery(&dev, log)?;
+        }
+    }
     if is_bcm {
         init_flags |= avb_dext::abi::INIT_FLAG_RXCPU_STAMP;
     }
