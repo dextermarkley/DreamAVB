@@ -13,7 +13,33 @@ gap blocks this connection.
 
 Read this file first, then `AGENTS.md` (rules) and the docs it points to.
 
-## Resume point (2026-11-06, branch `fix/driver-deactivation`)
+## Resume point (2026-11-07, branch `fix/driver-deactivation`, HEAD after `a699b52`)
+
+**Open problem: on the Broadcom (BCM57762) path, 8-stream audio TX to the 16R
+over a direct cable kills the 16R's control plane after 30–545 s.** The I210
+with the same daemon survives, and the Broadcom survives through the MOTU
+switch. The full record (every run, measurement, ruled-out cause, tool,
+Apple-driver disassembly and next steps) is
+`docs/bcm-16r-control-plane-investigation.md`. Read it first.
+
+Hardware state at the pause:
+- Broadcom dext 310.6.51 is loaded (CDHash `953f11a1…`): doorbell pacing
+  reverted, EEE off, `AVB_INIT_FLAG_PHY_MASTER` supported. Its datapath is up.
+- Daemon in `build/AVBInstaller.app` is at `a699b52` (NRR fix).
+- The Thunderbolt adapter is cabled directly to the 16R. The I210 is idle.
+- The 16R may be in its dead state from the last run; power-cycle it first
+  (Kasa, `10.0.0.92`, see the investigation doc).
+
+Next (the user chooses): observe Apple's driver with AVB on (needs approval:
+deactivates our dext), or enable the realtime send ring 1 in our dext from the
+disassembly, or chase the Broadcom's inbound 8-frame drops.
+
+Scratch analysis scripts used by the investigation live in the gitignored
+`.agents/tmp/` (`clock_compare.py`, `pdelay_analyze.py`, `ctl_rate.py`,
+`aem_burst.py`, `wire_analyze.py`, `stamp_analyze.py`, `phy_poll.sh`,
+`re_syms.py`, `re_func.py`, `re_bcm.py`; capstone is in `.agents/tmp/re-venv`).
+
+## Earlier resume point (2026-11-06, branch `fix/driver-deactivation`)
 
 Full duplex audio works over the Apple Thunderbolt Ethernet adapter (BCM57762
 dext + our RX-CPU timestamping firmware); the user confirmed audio both ways.
@@ -941,7 +967,8 @@ Each logs a `TEST HOOK` warning when it takes effect. None belongs in a normal r
 | `AVB_DEBUG_DROP_SYNC_AFTER_S=<s>` | avb-daemon (`gptpsvc.rs`) | After `<s>` seconds, drop received Sync, Follow_Up and Announce. Forces holdover on demand, as when the 16R stops being grandmaster. |
 | `AVB_DEBUG_NO_AUDIO_TX=1` | avb-daemon (`stack.rs`) | Run everything (entity, MSRP Talker Advertise, ACMP, gPTP, inbound) but put no audio frame on the wire. Separates "the 16R reacts to our audio" from "the 16R reacts to our control traffic". |
 | `AVB_DEBUG_TX_STREAMS=<n>` | avb-daemon (`stack.rs`) | Transmit audio on output streams 0..n only; the rest stay declared and bound but silent. Bisects frame rate from frame content. |
-| `AVB_DEBUG_TX_SPLIT=<k>` | avb-daemon (`stack.rs`) | Send each 125 us interval as k sub-bursts spaced interval/k apart instead of one back-to-back burst. Same rate, shorter trains. |
+| `AVB_DEBUG_TX_SPLIT=<k>` | avb-daemon (`stack.rs`) | Send each 125 us interval as k sub-bursts spaced interval/k apart instead of one back-to-back burst. The first goes out at once, the rest from later loop passes (no spin-wait). Costs ~3% missed intervals. |
+| `AVB_DEBUG_PHY_MASTER=1` | avb-daemon (`stack.rs`) → BCM dext | Force the Broadcom PHY to 1000BASE-T MASTER (MII reg 9). Shuts an up datapath down first so the setting applies. Without it the dext restores automatic MASTER/SLAVE. |
 | `AVB_SKIP_STAMPER=1` | avb-probe `datapath up` (BCM) | Leave the stock RX-CPU in place instead of loading the stamping firmware. Isolates TX-timestamp effects from the firmware. |
 
 ## Repo map

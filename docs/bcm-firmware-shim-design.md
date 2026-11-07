@@ -440,8 +440,11 @@ Complete register map recovered from startAVB / DoAVBGated / receivePackets:
   them the same way.
 - **Enable/control**  `0x3c08` = ivar[0x6bc], `0x3c10` = ivar[0x6c4],
   `0x3c20` = ivar[0x6d4] (saved register values written by DoAVBGated on
-  enable; the disable path writes 1). The 0x3c00 block is the realtime-queue
-  control; exact values must be read from our own chip at init.
+  enable; the disable path writes 1). CORRECTION (2026-11-07): the 0x3c00
+  block is host interrupt coalescing (HOSTCC, named in `Bcm57762Regs.h`), not
+  a realtime-queue control. See `docs/bcm-16r-control-plane-investigation.md`
+  for the realtime send-ring map, and note there that 0xd20/0x5c8 are probably
+  transmit-side.
 - **Classifier routing**  the 0x5608-0x561c block (queue selectors 0xe0/0xe1 at
   0x560c/0x5614, counts 0x25 at 0x5618, 0xe4e3a2 at 0x561c) routes matched
   0x88F7 frames into the realtime queue. Already replayed by the shim.
@@ -915,4 +918,6 @@ reference for the register layout; the clause-45 access is IEEE 802.3 Annex 22D)
 - PHY regs 13/14 (MMD access) are written by every clause-45 access; the
   `ReadPhyMmd` selector restores 13.
 
-Result: pending a 10-minute duplex run after a 16R power cycle.
+Result: EEE was not the cause; the 16R still died ~30 s into the next run.
+EEE stays off. The rest of the investigation is in
+`docs/bcm-16r-control-plane-investigation.md`.
