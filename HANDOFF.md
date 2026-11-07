@@ -941,6 +941,7 @@ Each logs a `TEST HOOK` warning when it takes effect. None belongs in a normal r
 | `AVB_DEBUG_DROP_SYNC_AFTER_S=<s>` | avb-daemon (`gptpsvc.rs`) | After `<s>` seconds, drop received Sync, Follow_Up and Announce. Forces holdover on demand, as when the 16R stops being grandmaster. |
 | `AVB_DEBUG_NO_AUDIO_TX=1` | avb-daemon (`stack.rs`) | Run everything (entity, MSRP Talker Advertise, ACMP, gPTP, inbound) but put no audio frame on the wire. Separates "the 16R reacts to our audio" from "the 16R reacts to our control traffic". |
 | `AVB_DEBUG_TX_STREAMS=<n>` | avb-daemon (`stack.rs`) | Transmit audio on output streams 0..n only; the rest stay declared and bound but silent. Bisects frame rate from frame content. |
+| `AVB_DEBUG_TX_SPLIT=<k>` | avb-daemon (`stack.rs`) | Send each 125 us interval as k sub-bursts spaced interval/k apart instead of one back-to-back burst. Same rate, shorter trains. |
 | `AVB_SKIP_STAMPER=1` | avb-probe `datapath up` (BCM) | Leave the stock RX-CPU in place instead of loading the stamping firmware. Isolates TX-timestamp effects from the firmware. |
 
 ## Repo map

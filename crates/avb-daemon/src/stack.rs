@@ -4222,6 +4222,20 @@ fn talker_loop(
     let tx_streams_max: Option<usize> = std::env::var("AVB_DEBUG_TX_STREAMS")
         .ok()
         .and_then(|s| s.trim().parse().ok());
+    let tx_split: usize = std::env::var("AVB_DEBUG_TX_SPLIT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1);
+    if tx_split > 1 {
+        log.log(
+            Level::Warn,
+            dir,
+            &format!(
+                "TEST HOOK: AVB_DEBUG_TX_SPLIT={tx_split} — each interval goes out as \
+                 {tx_split} sub-bursts spaced evenly"
+            ),
+        );
+    }
     if let Some(n) = tx_streams_max {
         log.log(
             Level::Warn,
@@ -7236,8 +7250,15 @@ fn talker_loop(
             for (slot, f) in batch.iter_mut().zip(tx_staged.iter()).take(n) {
                 *slot = f.bytes();
             }
+            // Test hook (AVB_DEBUG_TX_SPLIT=<k>): send the interval as k
+            // sub-bursts spaced interval/k apart instead of one burst. Same
+            // frame rate, shorter back-to-back trains on the wire.
+            let parts = tx_split.clamp(1, n);
+            let chunk = n.div_ceil(parts);
+            let interval_start = ns_since(start);
             let mut sent = 0usize;
-            let mut r = dext.send_batch(batch.get(..n).unwrap_or(&[]));
+            let mut chunk_end = chunk.min(n);
+            let mut r = dext.send_batch(batch.get(..chunk_end).unwrap_or(&[]));
             // Back-pressure from the dext's token bucket refuses the TAIL of
             // the interval (measured: sinks 4-8 lost packets while 1-3 did
             // not, after catch-up bursts drained the bucket). Tokens refill
@@ -7265,8 +7286,18 @@ fn talker_loop(
                 if sent >= n || !retryable || ns_since(start) >= retry_deadline {
                     break;
                 }
-                std::hint::spin_loop();
-                r = dext.send_batch(batch.get(sent..n).unwrap_or(&[]));
+                if sent >= chunk_end {
+                    // Next sub-burst: wait for its slot in the interval.
+                    let part = (chunk_end / chunk) as u64;
+                    let due = interval_start + part * pdu_interval_ns / parts as u64;
+                    while ns_since(start) < due {
+                        std::hint::spin_loop();
+                    }
+                    chunk_end = (chunk_end + chunk).min(n);
+                } else {
+                    std::hint::spin_loop();
+                }
+                r = dext.send_batch(batch.get(sent..chunk_end).unwrap_or(&[]));
             }
             let refused = n.saturating_sub(sent);
             if refused > 0 {
