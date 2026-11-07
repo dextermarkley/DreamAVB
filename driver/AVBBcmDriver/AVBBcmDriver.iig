@@ -56,12 +56,6 @@ public:
     // 1 ms poll timer: harvests the RX return ring and the pending TX timestamp.
     virtual void
     TimerFired(OSAction * action, uint64_t time) TYPE(IOTimerDispatchSource::TimerOccurred);
-
-    // TX pacing timer: rings the doorbell for the next deferred sub-burst of
-    // a SendFrames batch. On the TX queue, so it never waits behind the
-    // harvest.
-    virtual void
-    TxPaceFired(OSAction * action, uint64_t time) TYPE(IOTimerDispatchSource::TimerOccurred) QUEUENAME(AVBBcmTx);
 };
 
 #endif /* AVBBcmDriver_h */

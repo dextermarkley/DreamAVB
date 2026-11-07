@@ -116,18 +116,6 @@ struct AVBBcmDriver_IVars {
     OSAction * timerAction;
     bool timerRunning;
 
-    // TX pacing (Tg3Logic.hpp txPacePlan): a batch's descriptors are all
-    // written at once, but the doorbell advances one sub-burst at a time.
-    // The timer runs on txQueue; every field here is under txLock.
-    IOTimerDispatchSource * txPaceTimer;
-    OSAction * txPaceAction;
-    uint32_t txBellProd;         // producer index last written to the mailbox
-    uint32_t txPaceEnd;          // txProd at the end of the paced batch
-    uint32_t txPaceChunk;        // frames per deferred sub-burst
-    uint64_t txPaceDueMach;      // when the next deferred doorbell is due
-    uint64_t txPaceStepMach;     // spacing between sub-bursts
-    bool txPacePending;          // txBellProd < txPaceEnd
-
     // Datapath (Stage B)
     DmaBuf status;
     DmaBuf stdRing;
@@ -934,8 +922,6 @@ static bool resetHw(IV * v, uint64_t initFlags)
     v->retCons1 = 0;
     v->txProd = 0;
     v->txCons = 0;
-    v->txBellProd = 0;
-    v->txPacePending = false;
     for (uint32_t i = 0; i < kRxPosted; i++) {
         postStdBuffer(v, i);
     }
@@ -1684,7 +1670,6 @@ static void shutdownDatapath(IV * v)
     setCommandBits(v, 0, bcm::kCmdBusMaster);
     dmaFreeAll(v);
     v->tsPending = false;
-    v->txPacePending = false;
     v->flags &= ~(AVB_FLAG_LINK_UP | AVB_FLAG_1000FD);
     v->stage = kAvbStageTimeSync;
     LOG("datapath down (stage 1)");
@@ -1761,20 +1746,6 @@ static kern_return_t initDatapath(IV * v, uint64_t initFlags)
     return ok(v) ? kIOReturnSuccess : kIOReturnIOError;
 }
 
-// The TX producer mailbox write. Every doorbell goes through here so the
-// pacing state and the config-window guard always see it. A doorbell at the
-// full producer index releases any deferred sub-burst with it.
-static void ringTxBell(IV * v, uint32_t prod)
-{
-    if (v->txPacePending && prod == v->txProd) {
-        v->txPacePending = false;
-        v->ctr.c[kAvbCtrTxPaceFlushed]++;
-    }
-    wrFlush(v, bcm::kMboxTxHostProd0, prod);
-    v->txBellProd = prod;
-    v->lastDoorbellMach = mach_absolute_time();
-}
-
 static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool wantTs,
                                uint64_t * seqOut, uint64_t * machOut)
 {
@@ -1812,7 +1783,8 @@ static kern_return_t sendFrame(IV * v, const uint8_t * frame, uint32_t len, bool
     OSSynchronizeIO();
 
     const uint64_t mach = mach_absolute_time();
-    ringTxBell(v, v->txProd);
+    wrFlush(v, bcm::kMboxTxHostProd0, v->txProd);
+    v->lastDoorbellMach = mach_absolute_time();
 
     const uint64_t seq = ++v->txSeq;
     v->ctr.c[kAvbCtrTxFrames]++;
@@ -1854,7 +1826,6 @@ static kern_return_t sendFrames(IV * v, const uint8_t * in, uint32_t inLen, uint
     }
     checkTxLocked(v);
     auto * ring = reinterpret_cast<TxBd *>(v->txRing.va);
-    const uint32_t batchStart = v->txProd;
     uint32_t accepted = 0;
     bool refused = false;
     for (uint32_t i = 0; i < plan.count; i++) {
@@ -1882,25 +1853,8 @@ static kern_return_t sendFrames(IV * v, const uint8_t * in, uint32_t inLen, uint
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     OSSynchronizeIO();
     const uint64_t mach = mach_absolute_time();
-    // Pace the batch (Tg3Logic.hpp txPacePlan): ring the first sub-burst now
-    // and leave the rest to TxPaceFired. A sub-burst still owed from the
-    // previous batch is older than these frames, so this doorbell releases it
-    // first; ringTxBell counts that only when it reaches the full producer.
-    const TxPacePlan pace = txPacePlan(accepted, kTxBurstMax, kClassAIntervalNs);
-    if (pace.parts > 1 && v->txPaceTimer != nullptr) {
-        if (v->txPacePending) {
-            v->ctr.c[kAvbCtrTxPaceFlushed]++;
-        }
-        v->txPacePending = true;
-        v->txPaceEnd = v->txProd;
-        v->txPaceChunk = pace.chunk;
-        v->txPaceStepMach = nsToMach(v, pace.stepNs);
-        v->txPaceDueMach = mach + v->txPaceStepMach;
-        ringTxBell(v, ringAdd(batchStart, pace.chunk, bcm::kTxRingSize));
-        v->txPaceTimer->WakeAtTime(kIOTimerClockMachAbsoluteTime, v->txPaceDueMach, 0);
-    } else {
-        ringTxBell(v, v->txProd);
-    }
+    wrFlush(v, bcm::kMboxTxHostProd0, v->txProd);
+    v->lastDoorbellMach = mach_absolute_time();
 
     v->txSeq += accepted;
     v->ctr.c[kAvbCtrTxFrames] += accepted;
@@ -2151,8 +2105,6 @@ AVBBcmDriver::free()
 {
     if (ivars != nullptr) {
         dmaFreeAll(ivars);
-        OSSafeReleaseNULL(ivars->txPaceAction);
-        OSSafeReleaseNULL(ivars->txPaceTimer);
         OSSafeReleaseNULL(ivars->timerAction);
         OSSafeReleaseNULL(ivars->timer);
         OSSafeReleaseNULL(ivars->queue);
@@ -2227,23 +2179,6 @@ IMPL(AVBBcmDriver, Start)
     if (ret == kIOReturnSuccess) {
         ret = v->timer->SetHandler(v->timerAction);
     }
-    // The pacing timer and its handler live on the TX queue (QUEUENAME in
-    // the .iig), serialised with SendFrames.
-    if (ret == kIOReturnSuccess) {
-        ret = SetDispatchQueue("AVBBcmTx", v->txQueue);
-    }
-    if (ret == kIOReturnSuccess) {
-        ret = IOTimerDispatchSource::Create(v->txQueue, &v->txPaceTimer);
-    }
-    if (ret == kIOReturnSuccess) {
-        ret = CreateActionTxPaceFired(0, &v->txPaceAction);
-    }
-    if (ret == kIOReturnSuccess) {
-        ret = v->txPaceTimer->SetHandler(v->txPaceAction);
-    }
-    if (ret == kIOReturnSuccess) {
-        ret = v->txPaceTimer->SetEnable(true);
-    }
     if (ret != kIOReturnSuccess) {
         LOG("timer setup failed 0x%x", ret);
         v->pci->Close(this, 0);
@@ -2272,9 +2207,6 @@ IMPL(AVBBcmDriver, Stop)
     if (v->timer != nullptr) {
         v->timer->SetEnable(false);
     }
-    if (v->txPaceTimer != nullptr) {
-        v->txPaceTimer->SetEnable(false);
-    }
     v->timerRunning = false;
     if (v->opened) {
         TxGuard g(v);
@@ -2302,37 +2234,6 @@ IMPL(AVBBcmDriver, NewUserClient)
         return kIOReturnError;
     }
     return kIOReturnSuccess;
-}
-
-void
-IMPL(AVBBcmDriver, TxPaceFired)
-{
-    (void)action;
-    (void)time;
-    IV * v = ivars;
-    TxGuard g(v);
-    if (!v->txPacePending || v->stage != kAvbStageDatapath || !ok(v)) {
-        return;
-    }
-    const uint64_t now = mach_absolute_time();
-    if (now > v->txPaceDueMach) {
-        const uint64_t late = machToUs(v, now - v->txPaceDueMach);
-        if (late > v->ctr.c[kAvbCtrTxPaceLateMaxUs]) {
-            v->ctr.c[kAvbCtrTxPaceLateMaxUs] = late;
-        }
-    }
-    uint32_t next = v->txPaceEnd;
-    if (ringDistance(v->txBellProd, v->txPaceEnd, bcm::kTxRingSize) > v->txPaceChunk) {
-        next = ringAdd(v->txBellProd, v->txPaceChunk, bcm::kTxRingSize);
-    } else {
-        v->txPacePending = false;  // last sub-burst: not an early release
-    }
-    ringTxBell(v, next);
-    v->ctr.c[kAvbCtrTxPaceDoorbells]++;
-    if (v->txPacePending) {
-        v->txPaceDueMach += v->txPaceStepMach;
-        v->txPaceTimer->WakeAtTime(kIOTimerClockMachAbsoluteTime, v->txPaceDueMach, 0);
-    }
 }
 
 void

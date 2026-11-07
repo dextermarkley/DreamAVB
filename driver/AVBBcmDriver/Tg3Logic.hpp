@@ -69,39 +69,6 @@ constexpr uint32_t ringDistance(uint32_t from, uint32_t to, uint32_t size) {
 }
 
 // ---------------------------------------------------------------------------
-// TX pacing. One SendFrames batch carries a whole class-A interval: one frame
-// per stream. Rung as one doorbell, the MAC sends them back to back at line
-// rate, and over a direct cable (no bridge to re-space them) the 16R's
-// control plane died under 8-frame trains while it survived the same rate as
-// 4-frame trains half an interval apart (measured 2026-11-06). So the dext
-// writes every descriptor at once but rings the doorbell in sub-bursts of at
-// most kTxBurstMax frames, spread evenly across the class-A interval.
-//
-// The interval is IEEE 802.1Q's class-A measurement interval (125 us), a
-// property of the traffic class, not of the stream format. kTxBurstMax is
-// the measured limit.
-constexpr uint32_t kTxBurstMax = 4;
-constexpr uint64_t kClassAIntervalNs = 125000;
-
-struct TxPacePlan {
-    uint32_t parts;   // sub-bursts; 0 for an empty batch
-    uint32_t chunk;   // frames per sub-burst (the last may be shorter)
-    uint64_t stepNs;  // spacing between sub-burst doorbells; 0 when parts <= 1
-};
-
-// Even split: 8 frames -> 2 x 4, 62.5 us apart; 5 -> 3 + 2; 16 -> 4 x 4,
-// 31.25 us apart. The last sub-burst always starts inside the interval.
-constexpr TxPacePlan txPacePlan(uint32_t count, uint32_t burstMax, uint64_t intervalNs) {
-    if (count == 0) {
-        return {0, 0, 0};
-    }
-    const uint32_t cap = burstMax == 0 ? count : burstMax;
-    const uint32_t parts = (count + cap - 1) / cap;
-    const uint32_t chunk = (count + parts - 1) / parts;
-    return {parts, chunk, parts > 1 ? intervalNs / parts : 0};
-}
-
-// ---------------------------------------------------------------------------
 // Descriptors (host memory, little-endian 32-bit words).
 
 struct TxBd {
