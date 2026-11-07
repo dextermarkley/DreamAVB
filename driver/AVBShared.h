@@ -353,6 +353,9 @@ enum AvbCounterIndex : uint32_t {
     kAvbCtrHarvestMaxUs = 43,       // BCM: longest timer harvest, us (a maximum, not a count)
     kAvbCtrStampRefreshes = 44,     // BCM: stamp-ring refreshes (each reads config-window words)
     kAvbCtrSendBatchMaxUs = 45,     // BCM: longest SendFrames inside the dext incl. lock wait, us (a maximum)
+    kAvbCtrTxPaceDoorbells = 46,    // BCM: deferred TX sub-burst doorbells rung by the pacing timer
+    kAvbCtrTxPaceFlushed = 47,      // BCM: deferred sub-bursts released early by the next send
+    kAvbCtrTxPaceLateMaxUs = 48,    // BCM: latest pacing-timer doorbell past its due time, us (a maximum)
     kAvbCtrCount = 64,
 };
 struct AvbCounters { uint64_t c[kAvbCtrCount]; };   // 512 B
@@ -421,6 +424,7 @@ static_assert(kAvbCtrRxOversize < kAvbCtrCount, "counter space");
 static_assert(kAvbCtrTxBatchRejected < kAvbCtrCount, "batch counter space");
 static_assert(kAvbCtrStopBlockTimeouts < kAvbCtrCount, "stamp counter space");
 static_assert(kAvbCtrSendBatchMaxUs < kAvbCtrCount, "timing counter space");
+static_assert(kAvbCtrTxPaceLateMaxUs < kAvbCtrCount, "pacing counter space");
 static_assert(kAvbCtrRxClassBase + AVB_RX_CLASS_COUNT == kAvbCtrRxDropOther, "class counters 1..7");
 // (uint32_t cast: C++20 deprecates arithmetic between two enumeration types.)
 static_assert(uint32_t(kAvbCtrRxClassBase) + kAvbRxGptp - 1 == 1 &&

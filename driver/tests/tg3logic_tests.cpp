@@ -351,7 +351,31 @@ static void testReconstructEavTs() {
     std::printf("pass: EAV 64-bit timestamp reconstruction\n");
 }
 
+static void testTxPacePlan() {
+    // The measured case: 8 streams -> 2 x 4, half an interval apart.
+    constexpr TxPacePlan p8 = txPacePlan(8, kTxBurstMax, kClassAIntervalNs);
+    CHECK(p8.parts == 2 && p8.chunk == 4 && p8.stepNs == 62500);
+    // At or under the cap: one doorbell, no deferral.
+    CHECK(txPacePlan(4, 4, 125000).parts == 1 && txPacePlan(4, 4, 125000).stepNs == 0);
+    CHECK(txPacePlan(1, 4, 125000).parts == 1 && txPacePlan(1, 4, 125000).chunk == 1);
+    // Uneven: 5 -> 3 + 2, never more than the cap per sub-burst.
+    CHECK(txPacePlan(5, 4, 125000).parts == 2 && txPacePlan(5, 4, 125000).chunk == 3);
+    // The batch maximum: 16 -> 4 x 4, 31.25 us apart.
+    constexpr TxPacePlan p16 = txPacePlan(AVB_TX_BATCH_MAX, kTxBurstMax, kClassAIntervalNs);
+    CHECK(p16.parts == 4 && p16.chunk == 4 && p16.stepNs == 31250);
+    // Every frame is covered and the last sub-burst starts inside the interval.
+    for (uint32_t n = 1; n <= AVB_TX_BATCH_MAX; n++) {
+        const TxPacePlan p = txPacePlan(n, kTxBurstMax, kClassAIntervalNs);
+        CHECK(p.chunk <= kTxBurstMax && p.parts * p.chunk >= n && (p.parts - 1) * p.chunk < n);
+        CHECK((p.parts - 1) * p.stepNs < kClassAIntervalNs);
+    }
+    CHECK(txPacePlan(0, 4, 125000).parts == 0);
+    CHECK(txPacePlan(7, 0, 125000).parts == 1);  // cap 0 = no pacing
+    std::printf("pass: TX pacing plan\n");
+}
+
 int main() {
+    testTxPacePlan();
     testSnapshot();
     testAvbRxRules();
     testRxCpuStamp();

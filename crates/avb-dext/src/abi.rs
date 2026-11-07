@@ -625,12 +625,18 @@ pub mod ctr {
     pub const STAMP_REFRESHES: usize = 44;
     /// BCM: longest SendFrames inside the dext incl. lock wait, us (a maximum).
     pub const SEND_BATCH_MAX_US: usize = 45;
+    /// BCM: deferred TX sub-burst doorbells rung by the pacing timer.
+    pub const TX_PACE_DOORBELLS: usize = 46;
+    /// BCM: deferred sub-bursts released early by the next send.
+    pub const TX_PACE_FLUSHED: usize = 47;
+    /// BCM: latest pacing-timer doorbell past its due time, us (a maximum).
+    pub const TX_PACE_LATE_MAX_US: usize = 48;
     pub const COUNT: usize = 64;
 }
 
 /// Every defined counter index with its stable name, ascending. Index 7 is
 /// reserved and has no name.
-pub const COUNTER_NAMES: [(usize, &str); 45] = [
+pub const COUNTER_NAMES: [(usize, &str); 48] = [
     (ctr::RX_FRAMES, "rx_frames"),
     (1, "rx_gptp"),
     (2, "rx_msrp"),
@@ -676,6 +682,9 @@ pub const COUNTER_NAMES: [(usize, &str); 45] = [
     (ctr::HARVEST_MAX_US, "harvest_max_us"),
     (ctr::STAMP_REFRESHES, "stamp_refreshes"),
     (ctr::SEND_BATCH_MAX_US, "send_batch_max_us"),
+    (ctr::TX_PACE_DOORBELLS, "tx_pace_doorbells"),
+    (ctr::TX_PACE_FLUSHED, "tx_pace_flushed"),
+    (ctr::TX_PACE_LATE_MAX_US, "tx_pace_late_max_us"),
 ];
 
 pub fn counter_name(index: usize) -> Option<&'static str> {
@@ -698,7 +707,7 @@ const _: () = assert!(
     ctr::RX_CLASS_BASE + RX_CLASS_COUNT as usize == ctr::RX_DROP_OTHER,
     "class counters 1..7"
 );
-const _: () = assert!(ctr::SEND_BATCH_MAX_US < ctr::COUNT, "counter space");
+const _: () = assert!(ctr::TX_PACE_LATE_MAX_US < ctr::COUNT, "counter space");
 const _: () = assert!(RX_MEM_SIZE == 17_842_176, "rx mem size");
 const _: () = assert!(
     RX_CTL_SLOTS.is_power_of_two() && RX_AUDIO_SLOTS.is_power_of_two(),
@@ -1042,6 +1051,7 @@ mod tests {
         assert_eq!(ctr::STOP_BLOCK_TIMEOUTS, 40);
         assert_eq!(ctr::DOORBELL_GUARD_WAITS, 41);
         assert_eq!(ctr::SEND_BATCH_MAX_US, 45);
+        assert_eq!(ctr::TX_PACE_LATE_MAX_US, 48);
         assert_eq!(ctr::COUNT, 64);
         assert_eq!(class_counter_index(RxClass::Gptp), 1);
         assert_eq!(class_counter_index(RxClass::Msrp), 2);
@@ -1051,7 +1061,7 @@ mod tests {
         assert_eq!(class_counter_index(RxClass::Stream), 6);
         // Names: every index 0..=40 except the reserved 7, ascending, unique.
         let idx: Vec<usize> = COUNTER_NAMES.iter().map(|(i, _)| *i).collect();
-        let want: Vec<usize> = (0..=ctr::SEND_BATCH_MAX_US).filter(|i| *i != 7).collect();
+        let want: Vec<usize> = (0..=ctr::TX_PACE_LATE_MAX_US).filter(|i| *i != 7).collect();
         assert_eq!(idx, want);
         let mut names: Vec<&str> = COUNTER_NAMES.iter().map(|(_, n)| *n).collect();
         names.sort_unstable();
