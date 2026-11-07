@@ -176,6 +176,26 @@ enum Cmd {
         dest_base: String,
         #[arg(long, default_value_t = 2)]
         vid: u16,
+        /// Send untagged gPTP-ethertype frames (PTP Sync header, a unique
+        /// sequenceId per frame) to 01:80:c2:00:00:0e instead, so a BCM57762
+        /// receiver's RX-CPU stamper timestamps each one (`stamp-ring`).
+        #[arg(long)]
+        ptp: bool,
+        /// With --ptp: frame lengths in bytes, cycled across a batch (e.g.
+        /// 234,1000). Mixed lengths make back-to-back arrival recognisable
+        /// from the spacing alone. Default: the AAF frame's length.
+        #[arg(long, value_delimiter = ',')]
+        lens: Vec<usize>,
+    },
+    /// BCM only: record the RX-CPU stamper's ring (one EAV timestamp per gPTP
+    /// frame, with messageType and sequenceId) for `seconds`, reading each
+    /// new entry once, and write `seq,msg_type,eav_lo` lines to `out`. The
+    /// stamper must be loaded (`datapath up`). Read-only on the NIC.
+    StampRing {
+        #[arg(long)]
+        seconds: f64,
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Load the NIC clock through the dext's SetClock sequence (stop, write,
     /// resume), then sample it twice to confirm it advances.
@@ -1339,32 +1359,65 @@ fn txburst_frame(
     f
 }
 
-fn cmd_tx_burst(
-    dev: &Device,
+/// An untagged gPTP-ethertype frame for the BCM stamper: dst 01:80:c2:00:00:0e,
+/// ethertype 0x88F7, a PTP common header (transportSpecific 1, messageType 0
+/// Sync, version 2) with `seq` as sequenceId at PTP offset 30, zero-padded to
+/// `len` bytes. Only the stamper's match key matters; no PTP stack decodes it.
+fn txburst_ptp_frame(src: [u8; 6], seq: u16, len: usize) -> Vec<u8> {
+    let mut f = Vec::with_capacity(len.max(60));
+    f.extend_from_slice(&[0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e]);
+    f.extend_from_slice(&src);
+    f.extend_from_slice(&[0x88, 0xf7]);
+    f.extend_from_slice(&[0x10, 0x02]);
+    f.extend_from_slice(&44u16.to_be_bytes());
+    f.resize(14 + 30, 0);
+    f.extend_from_slice(&seq.to_be_bytes());
+    f.resize(len.max(60), 0);
+    f
+}
+
+struct TxBurstOpts<'a> {
     frames: usize,
     sdl: usize,
     interval_us: u64,
     seconds: f64,
-    dest_base: &str,
+    dest_base: &'a str,
     vid: u16,
-) -> Result<()> {
+    ptp: bool,
+    lens: &'a [usize],
+}
+
+fn cmd_tx_burst(dev: &Device, o: &TxBurstOpts<'_>) -> Result<()> {
     let info = dev.info()?;
     if info.stage != abi::STAGE_DATAPATH {
         bail!("datapath is not up; run `avb-probe datapath up` first");
     }
-    if frames == 0 || frames > abi::tx_batch::MAX {
+    if o.frames == 0 || o.frames > abi::tx_batch::MAX {
         bail!("--frames must be 1..={}", abi::tx_batch::MAX);
     }
-    if !(1..=4094).contains(&vid) || interval_us == 0 {
+    if !(1..=4094).contains(&o.vid) || o.interval_us == 0 {
         bail!("--vid must be 1..=4094 and --interval-us > 0");
     }
-    let base = parse_mac(dest_base)?;
+    let aaf_len = 14 + 4 + 24 + o.sdl;
+    let lens: Vec<usize> = if o.lens.is_empty() {
+        vec![aaf_len]
+    } else {
+        o.lens.to_vec()
+    };
+    if lens
+        .iter()
+        .any(|&l| !(60..=abi::FRAME_MAX_LEN).contains(&l))
+    {
+        bail!("--lens must each be 60..={}", abi::FRAME_MAX_LEN);
+    }
+    let base = parse_mac(o.dest_base)?;
     let src = info.mac;
     let sid_base = u64::from_be_bytes([src[0], src[1], src[2], src[3], src[4], src[5], 0, 0]);
-    let mut seq = vec![0u8; frames];
-    let interval = Duration::from_micros(interval_us);
+    let mut seq = vec![0u8; o.frames];
+    let mut ptp_seq: u16 = 0;
+    let interval = Duration::from_micros(o.interval_us);
     let start = Instant::now();
-    let end = start + Duration::from_secs_f64(seconds);
+    let end = start + Duration::from_secs_f64(o.seconds);
     let mut next = start;
     let (mut batches, mut sent, mut refused, mut late) = (0u64, 0u64, 0u64, 0u64);
     while Instant::now() < end && !interrupted() {
@@ -1373,25 +1426,30 @@ fn cmd_tx_burst(
         while Instant::now() < next {
             std::hint::spin_loop();
         }
-        let built: Vec<Vec<u8>> = (0..frames)
+        let built: Vec<Vec<u8>> = (0..o.frames)
             .map(|k| {
-                let mut d = base;
-                d[5] = d[5].wrapping_add(k as u8);
-                let ts = (batches as u32).wrapping_mul(interval_us as u32 * 1000);
-                txburst_frame(d, src, vid, sid_base + k as u64, seq[k], ts, sdl)
+                if o.ptp {
+                    txburst_ptp_frame(src, ptp_seq.wrapping_add(k as u16), lens[k % lens.len()])
+                } else {
+                    let mut d = base;
+                    d[5] = d[5].wrapping_add(k as u8);
+                    let ts = (batches as u32).wrapping_mul(o.interval_us as u32 * 1000);
+                    txburst_frame(d, src, o.vid, sid_base + k as u64, seq[k], ts, o.sdl)
+                }
             })
             .collect();
         let refs: Vec<&[u8]> = built.iter().map(Vec::as_slice).collect();
         match dev.send_frames(&refs) {
             Ok((n, _mach)) => {
                 sent += u64::from(n);
-                refused += (frames as u64).saturating_sub(u64::from(n));
+                refused += (o.frames as u64).saturating_sub(u64::from(n));
                 for s in seq.iter_mut().take(n as usize) {
                     *s = s.wrapping_add(1);
                 }
             }
             Err(e) => bail!("send_frames failed after {batches} batches: {e}"),
         }
+        ptp_seq = ptp_seq.wrapping_add(o.frames as u16);
         batches += 1;
         next += interval;
         if Instant::now() > next + interval {
@@ -1402,9 +1460,51 @@ fn cmd_tx_burst(
     }
     let secs = start.elapsed().as_secs_f64();
     println!(
-        "txburst: {batches} batches of {frames} x {} B frames over {secs:.1} s: {sent} sent ({:.0}/s), {refused} refused, {late} resyncs after a late batch",
-        14 + 4 + 24 + sdl,
+        "txburst: {batches} batches of {} {} frames ({:?} B) over {secs:.1} s: {sent} sent ({:.0}/s), {refused} refused, {late} resyncs after a late batch",
+        o.frames,
+        if o.ptp { "gPTP-ethertype" } else { "AAF" },
+        if o.ptp { lens.clone() } else { vec![aaf_len] },
         sent as f64 / secs
+    );
+    Ok(())
+}
+
+fn cmd_stamp_ring(dev: &Device, seconds: f64, out: &Path) -> Result<()> {
+    use std::io::Write;
+    let info = dev.info()?;
+    if info.nic_kind != abi::NIC_BCM57762 || info.stage != abi::STAGE_DATAPATH {
+        bail!("BCM only, datapath up with the stamper loaded");
+    }
+    // driver/bcm-fw/regs.h: producer count, then 256 x {eav_lo, meta}.
+    const TS_PROD: u32 = 0x0800_BFF0;
+    const TS_RING: u32 = 0x0800_C000;
+    const RING: u32 = 256;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(out)?);
+    writeln!(w, "seq,msg_type,eav_lo")?;
+    let mut seen = dev.read_core_mem(TS_PROD)?;
+    let (mut got, mut lost) = (0u64, 0u64);
+    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    while Instant::now() < end && !interrupted() {
+        let prod = dev.read_core_mem(TS_PROD)?;
+        if prod.wrapping_sub(seen) > RING {
+            // Fell a whole ring behind: those entries are overwritten.
+            lost += u64::from(prod.wrapping_sub(seen) - RING);
+            seen = prod.wrapping_sub(RING);
+        }
+        while seen != prod {
+            let slot = seen & (RING - 1);
+            let ts = dev.read_core_mem(TS_RING + slot * 8)?;
+            let meta = dev.read_core_mem(TS_RING + slot * 8 + 4)?;
+            writeln!(w, "{},{},{ts}", meta & 0xffff, (meta >> 16) & 0xf)?;
+            seen = seen.wrapping_add(1);
+            got += 1;
+        }
+        nap(Duration::from_millis(5));
+    }
+    w.flush()?;
+    println!(
+        "stamp-ring: {got} entries to {} ({lost} overwritten before they were read)",
+        out.display()
     );
     Ok(())
 }
@@ -1914,7 +2014,22 @@ fn main() -> Result<()> {
             seconds,
             ref dest_base,
             vid,
-        } => cmd_tx_burst(&dev, frames, sdl, interval_us, seconds, dest_base, vid),
+            ptp,
+            ref lens,
+        } => cmd_tx_burst(
+            &dev,
+            &TxBurstOpts {
+                frames,
+                sdl,
+                interval_us,
+                seconds,
+                dest_base,
+                vid,
+                ptp,
+                lens,
+            },
+        ),
+        Cmd::StampRing { seconds, ref out } => cmd_stamp_ring(&dev, seconds, out),
         Cmd::SetClock { ns } => {
             let back = dev.set_clock(ns)?;
             let a = dev.read_clock(1)?[0];
