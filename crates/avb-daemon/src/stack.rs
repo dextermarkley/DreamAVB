@@ -2505,14 +2505,63 @@ pub fn record(
     )
 }
 
-pub fn capture(opts: &GlobalOpts, _seconds: u64, out: &Path) -> Result<(), Exit> {
+/// Passive capture: bring the datapath up (promiscuous), transmit nothing, and
+/// write every control-ring frame (gPTP, MSRP, MVRP, AVDECC, MAAP — whatever
+/// the dext classifies as control) to a nanosecond pcap with wall-clock
+/// timestamps, for `seconds` or until SIGINT/SIGTERM. Sends no ADP, so the
+/// network never sees an entity here. Stream frames are not captured.
+pub fn capture(opts: &GlobalOpts, seconds: u64, out: &Path) -> Result<(), Exit> {
+    use crate::dextio::DextPort;
+    use std::io::Write;
     install_signal_handlers();
     let log = Logger::new(opts.level);
-    let _dext = bring_up(opts, &log)?;
+    let mut dext = bring_up(opts, &log)?;
+    let file = std::fs::File::create(out).map_err(|e| {
+        log.log(
+            Level::Error,
+            "capture",
+            &format!("cannot create {}: {e}", out.display()),
+        );
+        Exit::DiskOrPath
+    })?;
+    let mut w = std::io::BufWriter::new(file);
+    w.write_all(&crate::pcap::global_header(65535))
+        .map_err(|_| Exit::DiskOrPath)?;
     log.log(
         Level::Info,
-        "dext",
-        &format!("capture -> {}", out.display()),
+        "capture",
+        &format!(
+            "capturing control frames for {seconds} s -> {}",
+            out.display()
+        ),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut frames: u64 = 0;
+    let mut last_flush = std::time::Instant::now();
+    while std::time::Instant::now() < deadline && !shutdown_requested() {
+        let slots = dext.rx_ctl();
+        if slots.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for s in slots {
+            let ts = crate::flightrec::unix_now_ns();
+            w.write_all(&crate::pcap::record_header(ts, s.data.len() as u32))
+                .and_then(|()| w.write_all(&s.data))
+                .map_err(|_| Exit::DiskOrPath)?;
+            frames += 1;
+        }
+        // Flush about once a second, so a capture cut short still holds
+        // everything up to then.
+        if last_flush.elapsed() >= std::time::Duration::from_secs(1) {
+            w.flush().map_err(|_| Exit::DiskOrPath)?;
+            last_flush = std::time::Instant::now();
+        }
+    }
+    w.flush().map_err(|_| Exit::DiskOrPath)?;
+    log.log(
+        Level::Info,
+        "capture",
+        &format!("captured {frames} control frame(s) to {}", out.display()),
     );
     Ok(())
 }

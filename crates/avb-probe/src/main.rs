@@ -115,9 +115,6 @@ enum Cmd {
         #[arg(long, default_value_t = 10.0)]
         seconds: f64,
     },
-    /// Dump a range of NIC SRAM (default the send/return-ring RCB region
-    /// 0x100-0x300) via the memory window. For capturing Apple's realtime-queue
-    /// ring control blocks.
     /// BCM only: dump the internal PHY's clause-22 registers 0..=31 over MDIO
     /// and decode autonegotiation, pause and link-partner abilities.
     /// Read-only.
@@ -127,6 +124,9 @@ enum Cmd {
     /// resolution status 7.0x803E, PCS status 3.1 (LPI indications), and the
     /// MAC's CPMU EEE registers. Writes only PHY regs 13/14 (MMD access).
     Eee,
+    /// Dump a range of NIC SRAM (default the send/return-ring RCB region
+    /// 0x100-0x300) via the memory window. For capturing Apple's realtime-queue
+    /// ring control blocks.
     SramDump {
         #[arg(long, default_value_t = 0x100)]
         start: u32,
