@@ -384,7 +384,11 @@ impl GptpService {
                 Action::StepClock { delta_ns } | Action::SetClock { delta_ns } if self.sw_clock => {
                     self.gm_offset_ns += i128::from(delta_ns);
                     self.anchor = None;
-                    self.port.on_clock_stepped(now_t, 0);
+                    // Not on_clock_stepped: the BCM's generation never
+                    // changes (it stays 0), so that returned early and left
+                    // the NRR window straddling the shift. Measured: the NRR
+                    // stayed at one value for whole 600 s runs.
+                    self.port.on_soft_step(now_t);
                 }
                 Action::StepClock { delta_ns } => {
                     dext.step(delta_ns);

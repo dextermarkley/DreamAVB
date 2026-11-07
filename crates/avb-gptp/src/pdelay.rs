@@ -47,7 +47,17 @@ struct NrrPoint {
 pub struct NrrWindow {
     pts: std::collections::VecDeque<NrrPoint>,
     held: Option<f64>,
+    /// Exchanges rejected in a row against the window's oldest point.
+    rejected_run: u32,
 }
+
+/// Consecutive rejections after which the window is restarted from the new
+/// exchange. Each exchange is checked against the OLDEST point, so a single
+/// discontinuity in either timebase (a timestamp epoch slip) would otherwise
+/// reject every later exchange forever and freeze the NRR at its last value.
+/// One bad exchange is still rejected; three in a row mean the old points are
+/// the ones that are wrong.
+pub const NRR_REJECT_RESTART: u32 = 3;
 
 /// Result of offering an exchange to the window.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -62,14 +72,22 @@ impl NrrWindow {
     pub fn add(&mut self, t3_scaled: i128, t4: u64) -> NrrAdd {
         let p = NrrPoint { t3: t3_scaled, t4 };
         if let Some(old) = self.pts.front() {
-            if let Some(r) = ratio(*old, p) {
-                if (r - 1.0).abs() > NRR_MAX_DEV {
+            let bad = match ratio(*old, p) {
+                Some(r) if (r - 1.0).abs() <= NRR_MAX_DEV => None,
+                Some(r) => Some(r),
+                None => Some(f64::NAN),
+            };
+            if let Some(r) = bad {
+                self.rejected_run += 1;
+                if self.rejected_run < NRR_REJECT_RESTART {
                     return NrrAdd::Rejected(r);
                 }
-            } else {
-                return NrrAdd::Rejected(f64::NAN);
+                // The old points no longer agree with the stream of new
+                // exchanges: keep the current value as held and start over.
+                self.on_gen_change();
             }
         }
+        self.rejected_run = 0;
         if self.pts.len() >= NRR_WINDOW {
             self.pts.pop_front();
         }
@@ -114,6 +132,7 @@ impl NrrWindow {
             self.held = Some(r);
         }
         self.pts.clear();
+        self.rejected_run = 0;
     }
 }
 
@@ -251,6 +270,15 @@ impl PdelayInitiator {
     /// one included once it has seen one).
     pub fn multi_responder(&self) -> bool {
         self.multi.iter().any(|&m| m) || self.cur.is_some_and(|x| x.multiple())
+    }
+
+    /// Drop the exchange in flight: its timestamps straddle a clock shift.
+    pub(crate) fn discard_current(&mut self) {
+        if let Some(x) = self.cur.as_mut() {
+            if !x.done {
+                x.discarded = true;
+            }
+        }
     }
 
     /// The compensated delay the port uses (mean of the last 8).
@@ -427,6 +455,53 @@ mod tests {
         assert!((ini.delay().unwrap() - 142.6).abs() < 1e-9);
         assert_eq!(c.lost_responses, 0);
         assert!((ini.nrr.nrr().unwrap() - 1.0).abs() < 1e-12);
+    }
+
+    /// A timebase slip (here our t4 jumps by 2^32 ns, an EAV high-word
+    /// re-alignment) must not freeze the NRR: one bad exchange is rejected,
+    /// but after NRR_REJECT_RESTART in a row the window restarts and tracks
+    /// the real ratio again.
+    #[test]
+    fn nrr_window_recovers_from_a_timebase_slip() {
+        let s = |ns: i128| ns * SCALE as i128;
+        let ppm = 1e-6;
+        let mut w = NrrWindow::default();
+        // Peer clock 1 ppm fast relative to ours.
+        for i in 0..4u64 {
+            let t4 = 10_000_000_000 + i * 1_000_000_000;
+            let t3 = s(i128::from(t4) + (i as i128) * 1_000);
+            assert_eq!(w.add(t3, t4), NrrAdd::Added);
+        }
+        let before = w.nrr().unwrap();
+        assert!((before - (1.0 + ppm)).abs() < 1e-9);
+        // From here our t4 is 2^32 ns later than it should be, and the peer
+        // is now 3 ppm fast.
+        let slip = 1u64 << 32;
+        let mut last = NrrAdd::Added;
+        let mut rejects = 0;
+        for i in 4..20u64 {
+            let t4 = 10_000_000_000 + i * 1_000_000_000 + slip;
+            let t3 = s(i128::from(10_000_000_000 + i * 1_000_000_000) + (i as i128) * 3_000);
+            last = w.add(t3, t4);
+            if matches!(last, NrrAdd::Rejected(_)) {
+                rejects += 1;
+            }
+        }
+        assert_eq!(
+            rejects,
+            NRR_REJECT_RESTART - 1,
+            "only the run before the restart is rejected"
+        );
+        assert_eq!(last, NrrAdd::Added);
+        assert!(
+            (w.nrr().unwrap() - (1.0 + 3.0 * ppm)).abs() < 1e-9,
+            "tracks the new ratio"
+        );
+        // A single outlier afterwards is still rejected and does not restart.
+        let len = w.len();
+        let t4 = 10_000_000_000 + 20 * 1_000_000_000 + slip;
+        assert!(matches!(w.add(s(1), t4), NrrAdd::Rejected(_)));
+        assert_eq!(w.len(), len);
     }
 
     #[test]

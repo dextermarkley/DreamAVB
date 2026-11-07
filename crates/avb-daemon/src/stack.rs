@@ -6690,7 +6690,7 @@ fn talker_loop(
                 "clock",
                 &format!(
                     "role={} servo={} gm={} (ours={}) btca(won={} lost={}) mastertx(ann={} sync={} fu={} ts_lost={}) \
-                     link(asCapable={} delay_raw={:?} delay_comp={:?} rtt={:?} peer_turnaround={:?} nrr={:?} our_turnaround={:?} max={:?} \
+                     link(asCapable={} delay_raw={:?} delay_comp={:?} rtt={:?} peer_turnaround={:?} nrr={:?} nrr_win={} nrr_held={} nrr_rejected={} step_discards={} gen_changes={} our_turnaround={:?} max={:?} \
                      req_rx={} resp_tx={} fu_tx={} resp_ts_fail={} lost={} sync_rx={} ann_rx={} sig_rx={} sig_tx={} multi_resp={} ascap_edges={}) \
                      talker(pdus={} underruns={} missed={} discarded={} reanchors={} trims={} \
                      trimmed={} unlocked={} rate_limited={} refused={}){}",
@@ -6710,6 +6710,11 @@ fn talker_loop(
                     st.pdelay_rtt_ns.last.map(|v| v.round() as i64),
                     st.peer_turnaround_ns.last.map(|v| v.round() as i64),
                     st.nrr_systim,
+                    st.nrr_window_len,
+                    st.nrr_held,
+                    c.nrr_out_of_range,
+                    c.pdelay_step_discard,
+                    c.step_gen_changes,
                     st.responder_turnaround_ns.mean.map(|v| v.round() as i64),
                     st.responder_turnaround_max_ns.map(|v| v.round() as i64),
                     c.pdelay_req_rx,

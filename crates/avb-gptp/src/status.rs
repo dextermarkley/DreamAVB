@@ -241,6 +241,10 @@ pub struct GptpStatus {
     /// The peer's reported Pdelay turnaround t3 − t2, ns.
     pub peer_turnaround_ns: Stat,
     pub nrr_systim: Option<f64>,
+    /// Exchanges in the NRR window, and whether `nrr_systim` is the value
+    /// held across a step-generation change rather than the window's own.
+    pub nrr_window_len: usize,
+    pub nrr_held: bool,
     pub nrr_free: Option<f64>,
     pub cumulative_rate_ratio: Option<f64>,
     pub applied_ppb: f64,

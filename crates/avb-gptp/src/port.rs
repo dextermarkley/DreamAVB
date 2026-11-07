@@ -1459,6 +1459,23 @@ impl Port {
         self.model.reset();
     }
 
+    /// A software clock step: the caller shifted the offset it adds to every
+    /// timestamp (NICs whose hardware clock cannot be stepped), so there is no
+    /// hardware step generation to change. Everything a generation change
+    /// would invalidate is still invalid: the NRR window (its points straddle
+    /// the shift, so every later exchange would fail the 1000 ppm check and
+    /// the NRR would freeze for the rest of the run), the exchange in flight
+    /// (t1 before the shift, t4 after) and the clock model.
+    pub fn on_soft_step(&mut self, now: MachTicks) {
+        self.hold.on_step_done();
+        self.issued = None;
+        self.note(now, "software clock step".into());
+        self.c.step_gen_changes += 1;
+        self.ini.nrr.on_gen_change();
+        self.ini.discard_current();
+        self.model.reset();
+    }
+
     /// The issued step was rejected (StepClock BadArgument → retried as SetClock).
     pub fn on_step_failed(&mut self, now: MachTicks) {
         self.hold.on_step_done();
@@ -1509,6 +1526,8 @@ impl Port {
             pdelay_rtt_ns: self.ini.rtt.summary(),
             peer_turnaround_ns: self.ini.peer_turnaround.summary(),
             nrr_systim: nrr,
+            nrr_window_len: self.ini.nrr.len(),
+            nrr_held: self.ini.nrr.len() < 2 && self.ini.nrr.held().is_some(),
             nrr_free: nrr.map(|n| n * (1.0 + self.servo.f_applied() * 1e-9)),
             cumulative_rate_ratio: self.last_rate_ratio,
             applied_ppb: self.servo.f_applied(),

@@ -958,6 +958,32 @@ fn multiple_responders_drop_ascapable() {
     assert!(s.run_until(5 * S, |s| s.port.as_capable()));
 }
 
+/// A software clock step (the BCM path shifts its timestamp offset instead of
+/// stepping hardware) restarts the NRR window, holding the last value until
+/// new exchanges rebuild it. Before this the window kept points from before
+/// the shift and the NRR stayed frozen for the whole run.
+#[test]
+fn soft_step_restarts_the_nrr_window() {
+    let mut s = locked(SimCfg::default());
+    s.run_for(10 * S);
+    let st = s.port.status();
+    assert!(st.nrr_window_len >= 2 && !st.nrr_held);
+    let n0 = st.nrr_systim.unwrap();
+    let gen_changes = s.port.counters().step_gen_changes;
+    let rejected = s.port.counters().nrr_out_of_range;
+    s.port.on_soft_step(MachTicks(s.tau));
+    let st = s.port.status();
+    assert_eq!(st.nrr_window_len, 0);
+    assert!(st.nrr_held);
+    assert_eq!(st.nrr_systim, Some(n0), "held across the shift");
+    assert_eq!(s.port.counters().step_gen_changes, gen_changes + 1);
+    assert!(s.run_until(5 * S, |s| s.port.status().nrr_window_len >= 2));
+    let st = s.port.status();
+    assert!(!st.nrr_held);
+    assert!((st.nrr_systim.unwrap() - 1.0).abs() < 0.1e-6);
+    assert_eq!(s.port.counters().nrr_out_of_range, rejected);
+}
+
 #[test]
 fn nrr_out_of_range_exchange_is_rejected() {
     // GM at +1200 ppm vs our free-running clock: every NRR candidate is out
