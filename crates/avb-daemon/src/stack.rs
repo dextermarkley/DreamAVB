@@ -2505,17 +2505,98 @@ pub fn record(
     )
 }
 
+/// Which stream frames `capture` records besides the control ring: `count`
+/// consecutive destination MACs from `dest_base`, on VLAN `vid`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureStreams {
+    pub count: usize,
+    pub dest_base: [u8; 6],
+    pub vid: u16,
+}
+
+impl CaptureStreams {
+    pub fn parse(count: usize, dest_base: &str, vid: u16) -> Result<Self, String> {
+        if count > avb_dext::abi::MAX_STREAMS as usize {
+            return Err(format!(
+                "--streams must be 0..={}",
+                avb_dext::abi::MAX_STREAMS
+            ));
+        }
+        if !(1..=4094).contains(&vid) {
+            return Err("--stream-vid must be 1..=4094".into());
+        }
+        let parts: Vec<u8> = dest_base
+            .split(':')
+            .map(|h| u8::from_str_radix(h, 16))
+            .collect::<Result<_, _>>()
+            .map_err(|_| format!("bad --stream-dest-base {dest_base:?}"))?;
+        let dest_base: [u8; 6] = parts
+            .try_into()
+            .map_err(|_| format!("bad --stream-dest-base {dest_base:?}"))?;
+        if dest_base[0] & 1 == 0 {
+            return Err("--stream-dest-base must be a multicast MAC".into());
+        }
+        Ok(Self {
+            count,
+            dest_base,
+            vid,
+        })
+    }
+
+    /// The dext filter entries: one per destination MAC.
+    pub fn filter(&self) -> Vec<(u64, [u8; 6], u16)> {
+        (0..self.count)
+            .map(|k| {
+                let mut d = self.dest_base;
+                d[5] = d[5].wrapping_add(k as u8);
+                (0, d, self.vid)
+            })
+            .collect()
+    }
+}
+
+/// The frame as it was on the wire: a VLAN tag the NIC stripped into the
+/// descriptor goes back after the source MAC, so captured bytes compare
+/// one-for-one with what the sender built.
+fn wire_bytes(data: &[u8], desc_vlan_tci: Option<u16>) -> Vec<u8> {
+    match desc_vlan_tci {
+        Some(tci) if data.len() >= 12 && data.get(12..14) != Some(&[0x81, 0x00]) => {
+            let mut f = Vec::with_capacity(data.len() + 4);
+            f.extend_from_slice(&data[..12]);
+            f.extend_from_slice(&[0x81, 0x00]);
+            f.extend_from_slice(&tci.to_be_bytes());
+            f.extend_from_slice(&data[12..]);
+            f
+        }
+        _ => data.to_vec(),
+    }
+}
+
 /// Passive capture: bring the datapath up (promiscuous), transmit nothing, and
 /// write every control-ring frame (gPTP, MSRP, MVRP, AVDECC, MAAP — whatever
-/// the dext classifies as control) to a nanosecond pcap with wall-clock
-/// timestamps, for `seconds` or until SIGINT/SIGTERM. Sends no ADP, so the
-/// network never sees an entity here. Stream frames are not captured.
-pub fn capture(opts: &GlobalOpts, seconds: u64, out: &Path) -> Result<(), Exit> {
+/// the dext classifies as control) to a nanosecond pcap, for `seconds` or
+/// until SIGINT/SIGTERM. Sends no ADP, so the network never sees an entity
+/// here.
+///
+/// With `streams.count > 0` it also installs a stream filter for those
+/// destinations and records their frames from the audio ring, and every
+/// record is stamped with the NIC's RX hardware timestamp (SYSTIM ns) rather
+/// than the wall clock, so inter-frame spacing is the wire's, not the host's.
+pub fn capture(
+    opts: &GlobalOpts,
+    seconds: u64,
+    out: &Path,
+    streams: &CaptureStreams,
+) -> Result<(), Exit> {
     use crate::dextio::DextPort;
     use std::io::Write;
     install_signal_handlers();
     let log = Logger::new(opts.level);
     let mut dext = bring_up(opts, &log)?;
+    let hw_stamps = streams.count > 0;
+    if hw_stamps {
+        dext.set_filter(&streams.filter());
+    }
     let file = std::fs::File::create(out).map_err(|e| {
         log.log(
             Level::Error,
@@ -2524,31 +2605,59 @@ pub fn capture(opts: &GlobalOpts, seconds: u64, out: &Path) -> Result<(), Exit> 
         );
         Exit::DiskOrPath
     })?;
-    let mut w = std::io::BufWriter::new(file);
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
     w.write_all(&crate::pcap::global_header(65535))
         .map_err(|_| Exit::DiskOrPath)?;
     log.log(
         Level::Info,
         "capture",
         &format!(
-            "capturing control frames for {seconds} s -> {}",
+            "capturing control frames{} for {seconds} s -> {}",
+            if hw_stamps {
+                format!(
+                    " and {} stream destination(s) from {:02x?} vid {} (RX hardware timestamps)",
+                    streams.count, streams.dest_base, streams.vid
+                )
+            } else {
+                String::new()
+            },
             out.display()
         ),
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
-    let mut frames: u64 = 0;
+    let (mut ctl_frames, mut stream_frames, mut no_hw_ts) = (0u64, 0u64, 0u64);
     let mut last_flush = std::time::Instant::now();
     while std::time::Instant::now() < deadline && !shutdown_requested() {
-        let slots = dext.rx_ctl();
-        if slots.is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        let ctl = dext.rx_ctl();
+        let audio = if hw_stamps {
+            dext.rx_audio()
+        } else {
+            Vec::new()
+        };
+        if ctl.is_empty() && audio.is_empty() {
+            // The audio ring holds 8192 slots, ~128 ms at 64k frames/s, so a
+            // short nap never overruns it; the control ring is far quieter.
+            std::thread::sleep(std::time::Duration::from_micros(if hw_stamps {
+                200
+            } else {
+                1000
+            }));
         }
-        for s in slots {
-            let ts = crate::flightrec::unix_now_ns();
-            w.write_all(&crate::pcap::record_header(ts, s.data.len() as u32))
-                .and_then(|()| w.write_all(&s.data))
+        ctl_frames += ctl.len() as u64;
+        stream_frames += audio.len() as u64;
+        for s in ctl.iter().chain(audio.iter()) {
+            let ts = match (hw_stamps, s.hw_ts_ns) {
+                (true, Some(t)) => t,
+                (true, None) => {
+                    no_hw_ts += 1;
+                    0
+                }
+                (false, _) => crate::flightrec::unix_now_ns(),
+            };
+            let bytes = wire_bytes(&s.data, s.desc_vlan_tci);
+            w.write_all(&crate::pcap::record_header(ts, bytes.len() as u32))
+                .and_then(|()| w.write_all(&bytes))
                 .map_err(|_| Exit::DiskOrPath)?;
-            frames += 1;
         }
         // Flush about once a second, so a capture cut short still holds
         // everything up to then.
@@ -2561,7 +2670,15 @@ pub fn capture(opts: &GlobalOpts, seconds: u64, out: &Path) -> Result<(), Exit> 
     log.log(
         Level::Info,
         "capture",
-        &format!("captured {frames} control frame(s) to {}", out.display()),
+        &format!(
+            "captured {ctl_frames} control and {stream_frames} stream frame(s) to {}{}",
+            out.display(),
+            if hw_stamps {
+                format!(" ({no_hw_ts} without an RX hardware timestamp, written with ts 0)")
+            } else {
+                String::new()
+            }
+        ),
     );
     Ok(())
 }
@@ -10333,6 +10450,49 @@ mod talker_tests {
                 "uid {uid} -> {d} still in the rival's block"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::{wire_bytes, CaptureStreams};
+
+    #[test]
+    fn capture_streams_filter_counts_up_from_the_base() {
+        let s = CaptureStreams::parse(3, "91:e0:f0:00:9c:99", 2).unwrap();
+        let f = s.filter();
+        assert_eq!(f.len(), 3);
+        assert_eq!(f[0].1, [0x91, 0xe0, 0xf0, 0x00, 0x9c, 0x99]);
+        assert_eq!(f[2].1, [0x91, 0xe0, 0xf0, 0x00, 0x9c, 0x9b]);
+        assert!(f.iter().all(|e| e.2 == 2));
+        assert!(CaptureStreams::parse(0, "91:e0:f0:00:9c:99", 2)
+            .unwrap()
+            .filter()
+            .is_empty());
+    }
+
+    #[test]
+    fn capture_streams_refuses_bad_input() {
+        assert!(CaptureStreams::parse(17, "91:e0:f0:00:9c:99", 2).is_err());
+        assert!(CaptureStreams::parse(1, "90:e0:f0:00:9c:99", 2).is_err()); // unicast
+        assert!(CaptureStreams::parse(1, "91:e0:f0:00:9c", 2).is_err());
+        assert!(CaptureStreams::parse(1, "91:e0:f0:00:9c:zz", 2).is_err());
+        assert!(CaptureStreams::parse(1, "91:e0:f0:00:9c:99", 0).is_err());
+        assert!(CaptureStreams::parse(1, "91:e0:f0:00:9c:99", 4095).is_err());
+    }
+
+    #[test]
+    fn wire_bytes_puts_a_stripped_vlan_tag_back() {
+        let mut f = vec![0xaa; 12];
+        f.extend_from_slice(&[0x22, 0xf0, 0x02]);
+        let w = wire_bytes(&f, Some(0x6002));
+        assert_eq!(&w[12..18], &[0x81, 0x00, 0x60, 0x02, 0x22, 0xf0]);
+        assert_eq!(w.len(), f.len() + 4);
+        // Tag still in the frame, or none at all: unchanged.
+        let mut tagged = vec![0xaa; 12];
+        tagged.extend_from_slice(&[0x81, 0x00, 0x60, 0x02, 0x22, 0xf0]);
+        assert_eq!(wire_bytes(&tagged, Some(0x6002)), tagged);
+        assert_eq!(wire_bytes(&f, None), f);
     }
 }
 

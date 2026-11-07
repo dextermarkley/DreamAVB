@@ -134,6 +134,16 @@ enum Command {
         seconds: u64,
         #[arg(long)]
         out: PathBuf,
+        /// Also capture stream frames sent to this many consecutive
+        /// destination MACs starting at --stream-dest-base (wire tests with
+        /// `avb-probe tx-burst`). Each record is then stamped with the NIC's
+        /// RX hardware timestamp instead of the wall clock.
+        #[arg(long, default_value_t = 0)]
+        streams: usize,
+        #[arg(long, default_value = "91:e0:f0:00:9c:99")]
+        stream_dest_base: String,
+        #[arg(long, default_value_t = 2)]
+        stream_vid: u16,
     },
     /// Full stack + TALKER: play audio OUT to the 16R from the output ring
     /// (Phase 1b-2). The CoreAudio plug-in's output stream fills the ring; this
@@ -324,10 +334,21 @@ fn run() -> Result<(), Exit> {
                 summary_out,
             )
         }
-        Command::Capture { seconds, out } => {
+        Command::Capture {
+            seconds,
+            out,
+            streams,
+            stream_dest_base,
+            stream_vid,
+        } => {
             validate::validate_seconds(seconds)?;
             validate::validate_out_path(&out)?;
-            stack::capture(&opts, seconds, &out)
+            let streams = stack::CaptureStreams::parse(streams, &stream_dest_base, stream_vid)
+                .map_err(|e| {
+                    eprintln!("avb-daemon: {e}");
+                    Exit::Usage
+                })?;
+            stack::capture(&opts, seconds, &out, &streams)
         }
         Command::Play {
             seconds,

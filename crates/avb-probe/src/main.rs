@@ -156,6 +156,27 @@ enum Cmd {
         #[arg(long, default_value_t = 3.0)]
         seconds: f64,
     },
+    /// Wire test: send `frames` AVTP AAF-shaped stream frames per batch, one
+    /// SendFrames call every `interval-us`, for `seconds`. Frame k goes to
+    /// `dest-base` + k on VLAN `vid` (PCP 3) with stream id = our MAC + k and
+    /// a per-stream sequence number, so a capture on the far end can check
+    /// bytes, order and spacing. Payload is `sdl` zero bytes. Datapath must
+    /// be up. Pass the shape the 16R's AEM gave the daemon; nothing is
+    /// assumed here.
+    TxBurst {
+        #[arg(long)]
+        frames: usize,
+        #[arg(long)]
+        sdl: usize,
+        #[arg(long)]
+        interval_us: u64,
+        #[arg(long)]
+        seconds: f64,
+        #[arg(long, default_value = "91:e0:f0:00:9c:99")]
+        dest_base: String,
+        #[arg(long, default_value_t = 2)]
+        vid: u16,
+    },
     /// Load the NIC clock through the dext's SetClock sequence (stop, write,
     /// resume), then sample it twice to confirm it advances.
     SetClock {
@@ -1289,6 +1310,105 @@ fn cmd_aecp_ping(dev: &Device, target: &str, seconds: f64) -> Result<()> {
     Ok(())
 }
 
+/// One AAF-shaped stream frame: Ethernet + 802.1Q (PCP 3) + 24-byte AVTP
+/// stream header + `sdl` zero bytes. Header fields as IEEE 1722 §7: subtype
+/// AAF 0x02, sv=1 tv=1, the sequence number, the stream id, a timestamp, and
+/// stream_data_length. The format word is left 0: no listener decodes these.
+fn txburst_frame(
+    dst: [u8; 6],
+    src: [u8; 6],
+    vid: u16,
+    stream_id: u64,
+    seq: u8,
+    avtp_ts: u32,
+    sdl: usize,
+) -> Vec<u8> {
+    let mut f = Vec::with_capacity(14 + 4 + 24 + sdl);
+    f.extend_from_slice(&dst);
+    f.extend_from_slice(&src);
+    f.extend_from_slice(&[0x81, 0x00]);
+    f.extend_from_slice(&((3u16 << 13) | (vid & 0x0fff)).to_be_bytes());
+    f.extend_from_slice(&[0x22, 0xf0]);
+    f.extend_from_slice(&[0x02, 0x81, seq, 0x00]);
+    f.extend_from_slice(&stream_id.to_be_bytes());
+    f.extend_from_slice(&avtp_ts.to_be_bytes());
+    f.extend_from_slice(&[0, 0, 0, 0]);
+    f.extend_from_slice(&(sdl as u16).to_be_bytes());
+    f.extend_from_slice(&[0, 0]);
+    f.resize(14 + 4 + 24 + sdl, 0);
+    f
+}
+
+fn cmd_tx_burst(
+    dev: &Device,
+    frames: usize,
+    sdl: usize,
+    interval_us: u64,
+    seconds: f64,
+    dest_base: &str,
+    vid: u16,
+) -> Result<()> {
+    let info = dev.info()?;
+    if info.stage != abi::STAGE_DATAPATH {
+        bail!("datapath is not up; run `avb-probe datapath up` first");
+    }
+    if frames == 0 || frames > abi::tx_batch::MAX {
+        bail!("--frames must be 1..={}", abi::tx_batch::MAX);
+    }
+    if !(1..=4094).contains(&vid) || interval_us == 0 {
+        bail!("--vid must be 1..=4094 and --interval-us > 0");
+    }
+    let base = parse_mac(dest_base)?;
+    let src = info.mac;
+    let sid_base = u64::from_be_bytes([src[0], src[1], src[2], src[3], src[4], src[5], 0, 0]);
+    let mut seq = vec![0u8; frames];
+    let interval = Duration::from_micros(interval_us);
+    let start = Instant::now();
+    let end = start + Duration::from_secs_f64(seconds);
+    let mut next = start;
+    let (mut batches, mut sent, mut refused, mut late) = (0u64, 0u64, 0u64, 0u64);
+    while Instant::now() < end && !interrupted() {
+        // Spin to the batch's slot: this tool measures the NIC, so the
+        // sender's own timing should be as tight as the host allows.
+        while Instant::now() < next {
+            std::hint::spin_loop();
+        }
+        let built: Vec<Vec<u8>> = (0..frames)
+            .map(|k| {
+                let mut d = base;
+                d[5] = d[5].wrapping_add(k as u8);
+                let ts = (batches as u32).wrapping_mul(interval_us as u32 * 1000);
+                txburst_frame(d, src, vid, sid_base + k as u64, seq[k], ts, sdl)
+            })
+            .collect();
+        let refs: Vec<&[u8]> = built.iter().map(Vec::as_slice).collect();
+        match dev.send_frames(&refs) {
+            Ok((n, _mach)) => {
+                sent += u64::from(n);
+                refused += (frames as u64).saturating_sub(u64::from(n));
+                for s in seq.iter_mut().take(n as usize) {
+                    *s = s.wrapping_add(1);
+                }
+            }
+            Err(e) => bail!("send_frames failed after {batches} batches: {e}"),
+        }
+        batches += 1;
+        next += interval;
+        if Instant::now() > next + interval {
+            // Fell more than an interval behind: resync rather than burst.
+            late += 1;
+            next = Instant::now() + interval;
+        }
+    }
+    let secs = start.elapsed().as_secs_f64();
+    println!(
+        "txburst: {batches} batches of {frames} x {} B frames over {secs:.1} s: {sent} sent ({:.0}/s), {refused} refused, {late} resyncs after a late batch",
+        14 + 4 + 24 + sdl,
+        sent as f64 / secs
+    );
+    Ok(())
+}
+
 fn cmd_rx_tstamp_poll(dev: &Device, json: Option<&Path>, seconds: f64) -> Result<()> {
     let info = dev.info()?;
     if info.stage != abi::STAGE_DATAPATH {
@@ -1787,6 +1907,14 @@ fn main() -> Result<()> {
         Cmd::Peek { ref offsets } => cmd_peek(&dev, json, offsets),
         Cmd::WinTiming { n } => cmd_win_timing(&dev, json, n),
         Cmd::AecpPing { target, seconds } => cmd_aecp_ping(&dev, &target, seconds),
+        Cmd::TxBurst {
+            frames,
+            sdl,
+            interval_us,
+            seconds,
+            ref dest_base,
+            vid,
+        } => cmd_tx_burst(&dev, frames, sdl, interval_us, seconds, dest_base, vid),
         Cmd::SetClock { ns } => {
             let back = dev.set_clock(ns)?;
             let a = dev.read_clock(1)?[0];
