@@ -3840,6 +3840,11 @@ fn talker_loop(
     // a total divided by the stream count.
     let mut tx_staged_owner: Vec<usize> = vec![0; out_streams.len()];
     let mut frames_tx_per_stream: Vec<u64> = vec![0; out_streams.len()];
+    // AVB_DEBUG_TX_SPLIT: the staged frames still owed to later sub-bursts
+    // of the current interval. Sent from the loop's idle passes when due,
+    // never by spinning inside the send, so the other sub-bursts do not cost
+    // the loop its pacing (the spinning version fell to 46 861 frames/s).
+    let mut tx_tail = TxTail::default();
     let mut stream_starts: Vec<u64> = vec![0; out_streams.len()];
     // STREAM_STOP stays zero for the life of a run, and that is a real
     // reading rather than a missing one: `armed` is set once and never
@@ -6922,6 +6927,24 @@ fn talker_loop(
             }
         }
 
+        // AVB_DEBUG_TX_SPLIT: a later sub-burst of the last interval is due.
+        if tx_tail.is_pending() && ns_since(start) >= tx_tail.due_ns {
+            flush_tx_tail(
+                dext,
+                &mut tx_tail,
+                &tx_staged,
+                &tx_staged_owner,
+                &mut frames_tx_per_stream,
+                pdu_interval_ns,
+                &mut TxTotals {
+                    pdus: &mut tx_pdus,
+                    rate_limited: &mut tx_rate_limited,
+                    rejected: &mut tx_rejected,
+                    last_err: &mut last_send_err,
+                },
+            );
+        }
+
         // Minimum spacing between intervals on the wire (on the Mac clock), so
         // catching up after a late wake never becomes a burst.
         if elapsed < next_pdu_ns {
@@ -7094,6 +7117,25 @@ fn talker_loop(
         // token bucket granting every one of them (0 rate-limited) and 30% of
         // intervals missed. So the interval is STAGED here and handed to the
         // dext in a single `send_batch` call below.
+        //
+        // Staging overwrites `tx_staged`, so any sub-burst still owed from the
+        // previous interval goes out first, late rather than lost.
+        while tx_tail.is_pending() {
+            flush_tx_tail(
+                dext,
+                &mut tx_tail,
+                &tx_staged,
+                &tx_staged_owner,
+                &mut frames_tx_per_stream,
+                pdu_interval_ns,
+                &mut TxTotals {
+                    pdus: &mut tx_pdus,
+                    rate_limited: &mut tx_rate_limited,
+                    rejected: &mut tx_rejected,
+                    last_err: &mut last_send_err,
+                },
+            );
+        }
         let mut tx_staged_len = 0usize;
         for i in 0..out_streams.len() {
             let (first_ch, dst) = match out_streams.get(i) {
@@ -7253,11 +7295,13 @@ fn talker_loop(
             // Test hook (AVB_DEBUG_TX_SPLIT=<k>): send the interval as k
             // sub-bursts spaced interval/k apart instead of one burst. Same
             // frame rate, shorter back-to-back trains on the wire.
+            // Only the first sub-burst is sent here; the rest are left in
+            // `tx_tail` for the loop's later passes.
             let parts = tx_split.clamp(1, n);
             let chunk = n.div_ceil(parts);
             let interval_start = ns_since(start);
             let mut sent = 0usize;
-            let mut chunk_end = chunk.min(n);
+            let chunk_end = chunk.min(n);
             let mut r = dext.send_batch(batch.get(..chunk_end).unwrap_or(&[]));
             // Back-pressure from the dext's token bucket refuses the TAIL of
             // the interval (measured: sinks 4-8 lost packets while 1-3 did
@@ -7283,23 +7327,28 @@ fn talker_loop(
                     r.stopped_by,
                     None | Some(SendResult::NoResources) | Some(SendResult::Busy)
                 );
-                if sent >= n || !retryable || ns_since(start) >= retry_deadline {
+                if sent >= chunk_end || !retryable || ns_since(start) >= retry_deadline {
                     break;
                 }
-                if sent >= chunk_end {
-                    // Next sub-burst: wait for its slot in the interval.
-                    let part = (chunk_end / chunk) as u64;
-                    let due = interval_start + part * pdu_interval_ns / parts as u64;
-                    while ns_since(start) < due {
-                        std::hint::spin_loop();
-                    }
-                    chunk_end = (chunk_end + chunk).min(n);
-                } else {
-                    std::hint::spin_loop();
-                }
+                std::hint::spin_loop();
                 r = dext.send_batch(batch.get(sent..chunk_end).unwrap_or(&[]));
             }
-            let refused = n.saturating_sub(sent);
+            if sent >= chunk_end && chunk_end < n {
+                tx_tail = TxTail {
+                    next: chunk_end,
+                    len: n,
+                    chunk,
+                    parts,
+                    part: 1,
+                    interval_start,
+                    due_ns: interval_start + pdu_interval_ns / parts as u64,
+                };
+            }
+            let refused = if sent >= chunk_end {
+                0
+            } else {
+                n.saturating_sub(sent)
+            };
             if refused > 0 {
                 match r.stopped_by {
                     // Back-pressure: the dext's ceiling or a full TX ring.
@@ -7775,6 +7824,83 @@ fn max_catchup_intervals(presentation_offset_ns: u64) -> u64 {
 /// recovers within a few intervals; two PDUs of one stream are never closer
 /// than 50 us, which is still paced, not a burst.
 const MIN_PDU_SPACING_NS: u64 = 50_000;
+
+/// AVB_DEBUG_TX_SPLIT: the later sub-bursts of the current interval, still
+/// waiting in `tx_staged[next..len]`.
+#[derive(Clone, Copy, Debug, Default)]
+struct TxTail {
+    next: usize,
+    len: usize,
+    chunk: usize,
+    parts: usize,
+    part: usize,
+    interval_start: u64,
+    due_ns: u64,
+}
+
+impl TxTail {
+    fn is_pending(&self) -> bool {
+        self.next < self.len
+    }
+}
+
+/// The talker's TX totals, borrowed together for [`flush_tx_tail`].
+struct TxTotals<'a> {
+    pdus: &'a mut u64,
+    rate_limited: &'a mut u64,
+    rejected: &'a mut u64,
+    last_err: &'a mut Option<crate::dextio::SendResult>,
+}
+
+/// Send the next sub-burst owed by `tail`, once, with no waiting. A refusal
+/// drops the rest of the interval and counts it the same way the main send
+/// does: retrying here would turn a refusal back into a spin.
+fn flush_tx_tail(
+    dext: &mut RealDext,
+    tail: &mut TxTail,
+    staged: &[avb_core::TxFrame],
+    owners: &[usize],
+    per_stream: &mut [u64],
+    pdu_interval_ns: u64,
+    totals: &mut TxTotals<'_>,
+) {
+    let from = tail.next;
+    let to = from.saturating_add(tail.chunk.max(1)).min(tail.len);
+    let mut batch: [&[u8]; avb_dext::abi::tx_batch::MAX] = [&[]; avb_dext::abi::tx_batch::MAX];
+    let mut n = 0usize;
+    for (slot, f) in batch.iter_mut().zip(staged.get(from..to).unwrap_or(&[])) {
+        *slot = f.bytes();
+        n += 1;
+    }
+    let r = crate::dextio::DextPort::send_batch(dext, batch.get(..n).unwrap_or(&[]));
+    let accepted = r.accepted.min(n);
+    *totals.pdus += accepted as u64;
+    for &owner in owners.get(from..from + accepted).unwrap_or(&[]) {
+        if let Some(c) = per_stream.get_mut(owner) {
+            *c += 1;
+        }
+    }
+    if accepted < n {
+        let refused = tail.len.saturating_sub(from + accepted) as u64;
+        match r.stopped_by {
+            None
+            | Some(crate::dextio::SendResult::NoResources)
+            | Some(crate::dextio::SendResult::Busy) => {
+                *totals.rate_limited += refused;
+            }
+            Some(other) => {
+                *totals.rejected += refused;
+                *totals.last_err = Some(other);
+            }
+        }
+        *tail = TxTail::default();
+        return;
+    }
+    tail.next = to;
+    tail.part += 1;
+    tail.due_ns =
+        tail.interval_start + tail.part as u64 * pdu_interval_ns / tail.parts.max(1) as u64;
+}
 
 /// How far the grid may sit ahead of now + offset before it is treated as a
 /// gPTP step backwards rather than "not yet time". 1 ms.
